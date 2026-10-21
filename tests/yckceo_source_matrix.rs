@@ -2,6 +2,7 @@
 // 覆盖：反序列化、jsLib 在 rquickjs 沙盒加载、loginUi 解析、loginUrl 各形态识别、
 // 搜索/详情/目录/正文四段规则的字符串提取与 JS 规则语法编译。
 // 不发任何网络请求；jsLib 顶层加载不含 IO 副作用（已逐个人工核对顶层语句）。
+// 默认 #[ignore]：样本不随仓库分发，常规门禁不依赖本地探测数据。
 
 use reader_rust::model::book_source::{book_source_from_value, BookSource};
 use reader_rust::parser::js::{eval_js, take_js_logs, with_source};
@@ -58,6 +59,7 @@ fn load_sources() -> Vec<(String, BookSource)> {
 }
 
 #[test]
+#[ignore = "需要本地 tmp_probe/yck-*.json 样本；放好样本后 cargo test --test yckceo_source_matrix -- --ignored 运行"]
 fn yckceo_sources_deserialize_and_load_jslib() {
     let sources = load_sources();
     assert!(!sources.is_empty(), "tmp_probe/yck-*.json 样本不存在");

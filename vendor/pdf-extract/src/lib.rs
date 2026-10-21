@@ -1709,7 +1709,7 @@ impl<'a> Processor<'a> {
         let mut gs: GraphicsState = GraphicsState {
             ts: TextState {
                 font: None,
-                font_size: std::f64::NAN,
+                font_size: f64::NAN,
                 character_spacing: 0.,
                 word_spacing: 0.,
                 horizontal_scaling: 100. / 100.,

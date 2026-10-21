@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Rust 库（reader-rust）
 
 ```bash
+cargo check --workspace --all-targets -j 4  # 全部目标零诊断（与 IDE Problems 同源）
 cargo test -j 4        # 单测 + 集成测试。必须低并发，见下方「杀软并发竞态」
-cargo test --lib -j 4  # 只跑库单测
+cargo test --lib -j 4  # 只跑库单测；不覆盖 tests/，门禁必须同时跑上面的 check
 cargo build -p reader-desktop -j 4   # 编译桌面壳（debug）
 ```
 
