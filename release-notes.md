@@ -43,10 +43,10 @@ Simple Happy 的第一个正式独立版本 —— 阅读 / 直播 / 音乐 / RS
 
 | 文件 | 说明 |
 |------|------|
-| `Simple Happy_1.5.7_x64-setup.exe` | NSIS 安装包（首次启动自动写入书源种子） |
-| `simple-happy-portable-v1.5.7-win-x64.zip` | 便携包（解压即运行，自带 `data/reader.db` 种子） |
+| `Simple Happy_1.0.0_x64-setup.exe` | NSIS 安装包（首次启动自动写入书源种子） |
+| `simple-happy-portable-v1.0.0-win-x64.zip` | 便携包（解压即运行，自带 `data/reader.db` 种子） |
 
-> 安装版 / 便携包的内部版本号目前仍是 `1.5.7`（Cargo.toml / package.json 的 version 已更新为 `1.0.0`，打包脚本读取的是 Cargo.toml，但 NSIS 文件名由 productName + cargo version 组合；Release tag 我们用 `v1.0.0` 标记）。
+> 从 Release 页面下载时，安装包文件名中的空格会被 GitHub 替换为 `.`（即 `Simple.Happy_1.0.0_x64-setup.exe`），内容不变。
 
 ## 📝 许可与依赖
 
