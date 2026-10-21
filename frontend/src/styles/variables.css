@@ -1,0 +1,190 @@
+/* ─── Design Tokens ─── */
+:root {
+  --app-height: 100vh;
+  --app-width: 100vw;
+  --app-visual-height: 100vh;
+  --app-visual-width: 100vw;
+  --viewport-offset-top: 0px;
+  --viewport-offset-right: 0px;
+  --viewport-offset-bottom: 0px;
+  --viewport-offset-left: 0px;
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
+
+  /* Custom titlebar height. Fixed-position overlays that anchor to the top of
+     the window must start below this, or their header controls get hidden
+     underneath the titlebar. */
+  --titlebar-height: 30px;
+
+  /* Brand */
+  --color-primary: #c56f35;
+  --color-primary-light: #d8945d;
+  --color-primary-dark: #a95725;
+  --color-primary-rgb: 197, 111, 53;
+  --color-primary-bg: rgba(197, 111, 53, 0.09);
+  --color-primary-border: rgba(197, 111, 53, 0.28);
+  /* 选中态: 淡色底 + 主色文字/描边, 取代整块纯主色填充。
+     纯色块在浅色主题里过重, 一片橙会盖掉层次; 淡底既能表达选中,
+     又能保留文字的可读性与界面的通透感。主色实心只留给主操作按钮。 */
+  --color-selected-bg: color-mix(in srgb, var(--color-primary) 13%, transparent);
+  --color-selected-bg-hover: color-mix(in srgb, var(--color-primary) 19%, transparent);
+  --color-selected-border: color-mix(in srgb, var(--color-primary) 42%, transparent);
+
+  /* 主操作/选中按钮的"淡底 + 主色文字"三件套, 取代过去"整块主色填充 + 白字"。
+   * 旧做法白字压 #c56f35 只有约 3.7:1, 不到 WCAG AA; 且一整块高饱和橙在浅色
+   * 面板里分量过重, 会把周围浅色控件的层次压平。
+   * 混合比例 60/40 是算出来的: 浅色主题 #835131 在淡橙底上 5.3:1, 深色主题
+   * #e3bb9f 在暗底上 8.2:1, 两边都过 AA。比例再高会让浅色主题跌破 4.5:1
+   * (80% 只有约 3.8:1), 所以不要往上调。
+   * 注意: 这三个令牌依赖 --color-text, 只适用于**应用主题**下的界面。
+   * 阅读页有自己独立的 9 套主题(且会覆盖 --color-primary), 在那边必须改用
+   * currentColor 派生, 否则应用浅色主题 + 暗夜阅读主题的组合只剩 2.6:1。 */
+  --color-primary-soft-bg: var(--color-selected-bg);
+  --color-primary-soft-bg-hover: var(--color-selected-bg-hover);
+  --color-primary-soft-text: color-mix(in srgb, var(--color-primary) 60%, var(--color-text));
+  --color-primary-soft-border: var(--color-selected-border);
+  /* 阅读页不能复用上面四个: 那边有 9 套独立主题, 且 ReaderView 在 .reader-view
+   * 上覆盖 --color-primary、在容器上挂 color: theme.fontColor。
+   * 自定义属性是在**声明元素**上完成 var() 替换后才继承的 —— 在 :root 声明
+   * 一份派生值, 子树上再改 --color-primary 也不会让它重算。所以阅读页的按钮
+   * 一律就地写 color-mix(in srgb, var(--color-primary) 14%, transparent),
+   * 文字用 currentColor(跟随阅读主题 fontColor)。 */
+
+  /* Accent */
+  --color-accent: #347f92;
+  --color-success: #27815f;
+  --color-warning: #d4972d;
+  --color-danger: #d14949;
+
+  /* Neutrals */
+  --color-bg: #f5f6f7;
+  --color-bg-elevated: #ffffff;
+  --color-bg-sunken: #eceff1;
+  --color-bg-hover: rgba(30, 38, 45, 0.045);
+  --color-bg-active: rgba(30, 38, 45, 0.08);
+  --color-surface: var(--color-bg-elevated);
+
+  /* Text */
+  --color-text: #20252a;
+  --color-text-primary: var(--color-text);
+  --color-text-secondary: #5d666e;
+  --color-text-tertiary: #8a939b;
+  --color-text-inverse: #ffffff;
+
+  /* Borders */
+  --color-border: #dce1e4;
+  --color-border-light: #e8ebed;
+  --color-divider: rgba(31, 39, 45, 0.075);
+
+  /* Shadows */
+  --shadow-xs: 0 1px 2px rgba(27, 34, 40, 0.05);
+  --shadow-sm: 0 3px 10px rgba(27, 34, 40, 0.07);
+  --shadow-md: 0 8px 22px rgba(27, 34, 40, 0.09);
+  --shadow-lg: 0 14px 36px rgba(27, 34, 40, 0.12);
+  --shadow-xl: 0 22px 56px rgba(27, 34, 40, 0.16);
+  --shadow-2xl: 0 28px 72px rgba(27, 34, 40, 0.2);
+  --focus-ring: 0 0 0 3px rgba(197, 111, 53, 0.14);
+
+  /* Spacing (4px grid) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-2xl: 24px;
+  --radius-full: 9999px;
+
+  /* Typography */
+  --font-body: 'Segoe UI Variable Text', 'Microsoft YaHei UI', 'PingFang SC', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-display: 'Segoe UI Variable Display', 'Microsoft YaHei UI', 'PingFang SC', -apple-system, BlinkMacSystemFont, sans-serif;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+  --text-lg: 1.0625rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 1.875rem;
+
+  --leading-tight: 1.3;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.75;
+
+  /* Layout */
+  --header-height: 62px;
+  --tabs-height: 44px;
+  --sidebar-width: 360px;
+  --content-max-width: 880px;
+
+  /* Transitions */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.45, 0, 0.55, 1);
+  --duration-fast: 150ms;
+  --duration-normal: 250ms;
+  --duration-slow: 400ms;
+
+  /* Z-index */
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-overlay: 300;
+  --z-modal: 400;
+  --z-toast: 500;
+}
+
+/* ─── Dark Theme ─── */
+[data-theme='dark'] {
+  --color-primary: #df9a69;
+  --color-primary-light: #e8ad82;
+  --color-primary-dark: #c77b46;
+  --color-primary-rgb: 223, 154, 105;
+  --color-primary-bg: rgba(223, 154, 105, 0.11);
+  --color-primary-border: rgba(223, 154, 105, 0.3);
+  /* 暗色选中态: 底色用**中性提亮**, 而非主色半透明。
+     暗色卡片底是冷蓝灰(#1e2124, 色相 210°), 主色色相 25° —— 两者相距 175°,
+     接近互补。接近互补的色相按 16% 大面积混合会互相抵消饱和度, 得到 #3D342F
+     这种"浑浊褐灰": 既不是干净的灰, 也不是明确的橙, 和周围冷灰调不到一起。
+     浅色主题不存在这个问题(底色 #ffffff 是无彩色, 没有色相可冲突), 所以只在
+     暗色下改动 —— 橙色改由描边与文字承载, 细线条不会被色相冲突拖浑。 */
+  --color-selected-bg: rgba(255, 255, 255, 0.07);
+  --color-selected-bg-hover: rgba(255, 255, 255, 0.11);
+  /* 描边浓度对齐浅色主题: 浅色是主色 42%(在白底上 1.65:1), 用户认可那个强度。
+     暗色底更暗, 同样的 1.65:1 只需要 26% —— 早先写 55%(3.05:1) 在深底上像一圈
+     亮橙环, 还会和行内满强度的橙色复选框抢注意力。选中信号由 复选框 + 文字色
+     共同承担, 描边只需给出轮廓。 */
+  --color-selected-border: color-mix(in srgb, var(--color-primary) 26%, transparent);
+
+  --color-bg: #151719;
+  --color-bg-elevated: #1e2124;
+  --color-bg-sunken: #111315;
+  --color-bg-hover: rgba(255, 255, 255, 0.055);
+  --color-bg-active: rgba(255, 255, 255, 0.09);
+
+  --color-text: #e9ecef;
+  --color-text-secondary: #adb5bc;
+  --color-text-tertiary: #767f87;
+
+  --color-border: #34393d;
+  --color-border-light: #292d31;
+  --color-divider: rgba(255, 255, 255, 0.075);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.35);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.45);
+  --shadow-2xl: 0 28px 72px rgba(0, 0, 0, 0.55);
+  --focus-ring: 0 0 0 3px rgba(223, 154, 105, 0.16);
+}

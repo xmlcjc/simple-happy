@@ -1,0 +1,2681 @@
+import { defineStore } from 'pinia'
+import { ref, computed, reactive, watch } from 'vue'
+import { isTauri } from '@tauri-apps/api/core'
+import { useAppStore } from './app'
+import { useBookshelfStore } from './bookshelf'
+import {
+  getChapterList,
+  getBookInfo,
+  getBookContent,
+  saveBookProgress,
+  setBookSource as apiSetBookSource,
+  type ContentLoadStage,
+} from '../api/bookshelf'
+import { invokeRaw } from '../api/invoke'
+import {
+  getBookmarks,
+  saveBookmark,
+  deleteBookmark as apiDeleteBookmark,
+  deleteBookmarks as apiDeleteBookmarks,
+} from '../api/bookmark'
+import { getReplaceRules } from '../api/replaceRule'
+import type { Book, BookChapter, Bookmark, ReplaceRule } from '../types'
+import { isLocalBook } from '../utils/localBook'
+import { PDF_PAGE_ATTR } from '../utils/pdfPages'
+import { saveRecentReadBook } from '../utils/recentBooks'
+import {
+  DEFAULT_READER_BACKGROUND_OPACITY,
+  DEFAULT_READER_PANEL_OPACITY,
+  normalizeReaderBackgroundOpacity,
+  normalizeReaderPanelOpacity,
+} from '../utils/readerBackground'
+import { normalizeReaderColor } from '../utils/readerColor'
+import {
+  HOTKEY_ACTION_MAP,
+  bindActionToKey,
+  isDefaultHotkeyBindings,
+  listHotkeyConflicts,
+  normalizeHotkeyBindings,
+  unbindActionFromKey,
+  type HotkeyActionId,
+  type HotkeyBindings,
+} from '../utils/readerHotkeys'
+import {
+  DEFAULT_OPENAI_BASE_URL,
+  getSpeechApiFormatOption,
+  inferSpeechApiFormat,
+  requestOpenAISpeechAudio,
+  type SpeechApiFormat,
+  type SpeechAudioFormat,
+} from '../utils/openaiSpeech'
+import {
+  syncLegadoBookProgress,
+  uploadLegadoBookProgress,
+  type LegadoBookProgress,
+} from '../api/webdav'
+import { deleteCustomFont, listCustomFonts, uploadCustomFont, type CustomFontEntry } from '../api/fonts'
+import { readSavedReadingPosition } from '../utils/readingPosition'
+
+const READER_SESSION_KEY = 'reader-last-session'
+const READER_READ_HISTORY_PREFIX = 'reader-read-history:'
+const READER_BACKGROUND_IMAGE_KEY = 'reader-background-image'
+/** 阅读页专属背景图: 与桌面背景图分开, 互不覆盖。 */
+const READER_PAGE_BACKGROUND_IMAGE_KEY = 'reader-page-background-image'
+const SERVER_PROGRESS_SCALE = 10000
+// 目录自动检查: 打开书后台静默检查的节流间隔 / 读到末章再翻页触发的检查节流间隔
+const TOC_OPEN_CHECK_INTERVAL_MS = 30 * 60 * 1000
+export const TOC_END_CHECK_INTERVAL_MS = 60 * 1000
+const TOC_CHECK_TIMES_KEY = 'reader-toc-check-times'
+const TOC_CHECK_TIMES_LIMIT = 200
+
+interface PersistedReaderSession {
+  book: Book
+  chapters: BookChapter[]
+  currentIndex: number
+  chapterScrollProgress: number
+  updatedAt: number
+}
+
+/** 只含阅读进度的轻量快照。
+ *
+ *  背景: `setChapterScrollProgress` 由 handleScroll 在**每次滚动事件**里调用,
+ *  而它过去直接走 saveReaderSession —— 后者每次都把整个 chapters 数组(上千章
+ *  可达 500KB)JSON 序列化并同步写 localStorage。实测 3000 章时单次 ~10ms,
+ *  一次 300ms 的翻页补间(约 18 帧)会因此阻塞主线程 ~180ms, 表现为掉帧与
+ *  上一页残留; 章节越多越明显。
+ *
+ *  进度本身只是个 0~1 的小数与索引, 与「书 + 目录」这种极少变化的结构分开存,
+ *  既避免重复序列化大对象, 也让高频写入的代价可以忽略(实测 0.006ms)。 */
+interface PersistedReaderProgress {
+  bookUrl: string
+  currentIndex: number
+  chapterScrollProgress: number
+  updatedAt: number
+}
+
+const READER_PROGRESS_KEY = 'reader-last-progress'
+
+/* ─── Reading config type ─── */
+export const READER_PAGE_WIDTH_MIN = 400
+export const READER_PAGE_WIDTH_MAX = 2000
+export const READER_PAGE_VERTICAL_PADDING_MAX = 200
+
+export interface ReadConfig {
+  fontSize: number
+  fontWeight: number
+  fontFamily: string
+  lineHeight: number
+  paragraphSpacing: number
+  firstLineIndent: boolean
+  fontColor: string
+  pageWidth: number
+  /** 左右分页时每页正文的上下留白, 像素。 */
+  pageVerticalPadding: number
+  readMethod: '上下滑动' | '左右翻页' | '上下滚动' | '上下滚动2'
+  animateDuration: number
+  /** 自动阅读滚动速度, 像素/秒。 */
+  autoScrollSpeed: number
+  clickAction: 'next' | 'auto' | 'none'
+  selectAction: 'popup' | 'ignore'
+  chineseMode: 'simplified' | 'traditional'
+  enablePreload: boolean
+  /** 桌面指针靠近阅读区边缘时自动展开工具栏/悬浮钮。
+   *  默认关闭: 边缘热区会吃掉正文的点击(左右各 84px), 用户反馈鼠标停在边缘就弹按钮、
+   *  可点区域变少且容易误触(issue #7 问题 1)。需要的人可在「更多」里开启。 */
+  hoverRevealControls: boolean
+  backgroundImage: string
+  backgroundOpacity: number
+  applyBackgroundToReader: boolean
+  /** 阅读页背景色, '' 表示跟随主题。 */
+  readerBackgroundColor: string
+  /** 阅读页专属背景图(dataURL), 与桌面背景图相互独立。 */
+  readerBackgroundImage: string
+  /** 阅读页背景图透明度。 */
+  readerImageOpacity: number
+  /** 阅读页浮层（目录/书签/设置抽屉、右键菜单等）的底板不透明度, 1 为实色。
+   *  阅读页铺了背景图时, 半透明底板能让用户边调设置边看到正文变化。 */
+  panelOpacity: number
+}
+
+const defaultConfig: ReadConfig = {
+  fontSize: 18,
+  fontWeight: 400,
+  fontFamily: 'system',
+  lineHeight: 1.8,
+  paragraphSpacing: 0.2,
+  firstLineIndent: true,
+  fontColor: '',
+  pageWidth: 800,
+  pageVerticalPadding: 24,
+  readMethod: '上下滑动',
+  animateDuration: 300,
+  autoScrollSpeed: 30,
+  clickAction: 'auto',
+  selectAction: 'ignore',
+  chineseMode: 'simplified',
+  enablePreload: true,
+  // 默认关闭: 边缘热区会吃掉正文点击, 用户反馈"可点区域变少、还要小心别误点按钮"
+  // (issue #7 问题 1)。想用悬停呼出的人可在设置「更多」里开启。
+  hoverRevealControls: false,
+  backgroundImage: '',
+  backgroundOpacity: DEFAULT_READER_BACKGROUND_OPACITY,
+  applyBackgroundToReader: true,
+  readerBackgroundColor: '',
+  readerBackgroundImage: '',
+  readerImageOpacity: DEFAULT_READER_BACKGROUND_OPACITY,
+  panelOpacity: DEFAULT_READER_PANEL_OPACITY,
+}
+
+function loadConfig(): ReadConfig {
+  try {
+    const saved = localStorage.getItem('readConfig')
+    if (saved) {
+      const parsed = JSON.parse(saved) as Partial<ReadConfig> & {
+        specialMode?: unknown
+        autoPageMode?: unknown
+        scrollPixel?: number
+        pageSpeed?: number
+      }
+      const {
+        specialMode: _legacySpecialMode,
+        autoPageMode: _legacyAutoPageMode,
+        scrollPixel: legacyScrollPixel,
+        pageSpeed: legacyPageSpeed,
+        ...savedConfig
+      } = parsed
+      // 旧版像素滚动速度 = scrollPixel × pageSpeed/1000 × 0.5 像素/帧(60fps),
+      // 折算成像素/秒 = scrollPixel × pageSpeed × 0.03, 默认组合恰为 30。
+      const legacyAutoScrollSpeed = typeof legacyScrollPixel === 'number' && typeof legacyPageSpeed === 'number'
+        ? legacyScrollPixel * legacyPageSpeed * 0.03
+        : defaultConfig.autoScrollSpeed
+      return {
+        ...defaultConfig,
+        ...savedConfig,
+        pageWidth: typeof savedConfig.pageWidth === 'number'
+          ? Math.min(
+              READER_PAGE_WIDTH_MAX,
+              Math.max(READER_PAGE_WIDTH_MIN, Math.round(savedConfig.pageWidth)),
+            )
+          : defaultConfig.pageWidth,
+        pageVerticalPadding: typeof savedConfig.pageVerticalPadding === 'number'
+          ? Math.min(
+              READER_PAGE_VERTICAL_PADDING_MAX,
+              Math.max(0, Math.round(savedConfig.pageVerticalPadding)),
+            )
+          : defaultConfig.pageVerticalPadding,
+        autoScrollSpeed: typeof savedConfig.autoScrollSpeed === 'number' && savedConfig.autoScrollSpeed > 0
+          ? Math.min(500, Math.max(2, Math.round(savedConfig.autoScrollSpeed)))
+          : Math.min(500, Math.max(2, Math.round(legacyAutoScrollSpeed))),
+        backgroundImage: localStorage.getItem(READER_BACKGROUND_IMAGE_KEY)
+          || (typeof savedConfig.backgroundImage === 'string' ? savedConfig.backgroundImage : ''),
+        backgroundOpacity: normalizeReaderBackgroundOpacity(savedConfig.backgroundOpacity),
+        applyBackgroundToReader: typeof savedConfig.applyBackgroundToReader === 'boolean'
+          ? savedConfig.applyBackgroundToReader
+          : true,
+        // 旧存档没有这个字段时按默认(关闭)处理, 非布尔值也回落默认, 避免脏数据开启悬停。
+        hoverRevealControls: typeof savedConfig.hoverRevealControls === 'boolean'
+          ? savedConfig.hoverRevealControls
+          : defaultConfig.hoverRevealControls,
+        // 自定义配色来自 localStorage, 必须收紧为合法色值再进 style。
+        fontColor: normalizeReaderColor(savedConfig.fontColor),
+        readerBackgroundColor: normalizeReaderColor(savedConfig.readerBackgroundColor),
+        // 阅读页专属背景图与桌面背景图分开存(都是 dataURL, 不进 readConfig)。
+        readerBackgroundImage: localStorage.getItem(READER_PAGE_BACKGROUND_IMAGE_KEY)
+          || (typeof savedConfig.readerBackgroundImage === 'string' ? savedConfig.readerBackgroundImage : ''),
+        readerImageOpacity: normalizeReaderBackgroundOpacity(savedConfig.readerImageOpacity),
+        panelOpacity: normalizeReaderPanelOpacity(savedConfig.panelOpacity),
+      }
+    }
+  } catch { /* ignore */ }
+  return { ...defaultConfig }
+}
+
+/* ─── Theme presets ─── */
+export interface ThemePreset {
+  name: string
+  body: string
+  content: string
+  fontColor: string
+  popup: string
+}
+
+export const themePresets: ThemePreset[] = [
+  { name: '默认', body: '#f5ede4', content: '#fff9f0', fontColor: '#333', popup: '#fff' },
+  { name: '纯白', body: '#ffffff', content: '#ffffff', fontColor: '#333', popup: '#fff' },
+  { name: '琥珀', body: '#f5e6ce', content: '#faf0e4', fontColor: '#5b4636', popup: '#faf0e4' },
+  { name: '薄荷', body: '#e0f0e8', content: '#eaf5ef', fontColor: '#2d4a3e', popup: '#eaf5ef' },
+  { name: '天蓝', body: '#dce8f0', content: '#e8f0f6', fontColor: '#2c3e50', popup: '#e8f0f6' },
+  { name: '粉白', body: '#f5e4e8', content: '#faf0f3', fontColor: '#4a2d36', popup: '#faf0f3' },
+  { name: '浅灰', body: '#eaeaea', content: '#f5f5f5', fontColor: '#333', popup: '#f5f5f5' },
+  { name: '暗灰', body: '#808080', content: '#999', fontColor: '#eee', popup: '#888' },
+  { name: '暗夜', body: '#141414', content: '#16213e', fontColor: '#c8c8c8', popup: '#141414' },
+]
+export const nightThemeIndex = themePresets.length - 1
+
+/* ─── Font presets ─── */
+export const fontPresets = [
+  { label: '系统', value: 'system', family: '' },
+  { label: '黑体', value: 'heiti', family: '"SimHei", "STHeiti", "Heiti SC", sans-serif' },
+  { label: '楷体', value: 'kaiti', family: '"KaiTi", "STKaiti", "BiauKai", serif' },
+  { label: '宋体', value: 'songti', family: '"SimSun", "STSong", "Songti SC", serif' },
+  { label: '仿宋', value: 'fangsong', family: '"FangSong", "STFangsong", serif' },
+]
+
+const CUSTOM_FONT_PREFIX = 'custom:'
+
+interface TTSOptions {
+  onStart?: () => void
+  onProgress?: (progress: number) => void
+  onEnd?: () => void
+  onError?: (event?: SpeechSynthesisErrorEvent | Error) => void
+}
+
+interface PreloadedOpenAIAudio {
+  key: string
+  blob: Blob
+}
+
+const OPENAI_AUDIO_PRELOAD_LIMIT = 8
+
+/** 复用在途预载时的加载动画延迟。命中预载本该是"瞬间换章", 200ms 内返回就完全
+ *  不显示动画; 超过则说明书源确实慢, 亮出动画免得用户以为翻页没反应。 */
+const CHAPTER_LOADING_INDICATOR_DELAY_MS = 200
+
+export type SpeechProvider = 'system' | 'openai'
+export type OpenAISpeechSource = 'browser' | 'server'
+export type OpenAISpeechFormat = SpeechAudioFormat
+export type OpenAISpeechRequestMode = 'chunked' | 'merged'
+
+interface SpeechConfig {
+  provider: SpeechProvider
+  voiceName: string
+  speechRate: number
+  speechPitch: number
+  stopAfterMinutes: number
+  openaiSource: OpenAISpeechSource
+  apiFormat: SpeechApiFormat
+  openaiBaseUrl: string
+  speechProxyUrl: string
+  openaiApiKey: string
+  openaiModel: string
+  openaiVoice: string
+  openaiFormat: OpenAISpeechFormat
+  openaiRequestMode: OpenAISpeechRequestMode
+}
+
+const defaultSpeechConfig: SpeechConfig = {
+  provider: 'system',
+  voiceName: '',
+  speechRate: 1,
+  speechPitch: 1,
+  stopAfterMinutes: 0,
+  openaiSource: 'browser',
+  apiFormat: 'openai',
+  openaiBaseUrl: DEFAULT_OPENAI_BASE_URL,
+  speechProxyUrl: '',
+  openaiApiKey: '',
+  openaiModel: 'qwen-tts',
+  openaiVoice: 'vivian',
+  openaiFormat: 'mp3',
+  openaiRequestMode: 'chunked',
+}
+
+function loadSpeechConfig(): SpeechConfig {
+  try {
+    const saved = localStorage.getItem('reader-speechConfig')
+    if (saved) {
+      const parsed = JSON.parse(saved) as Partial<SpeechConfig>
+      const apiFormat = ['openai', 'fish', 'elevenlabs', 'azure'].includes(parsed.apiFormat || '')
+        ? parsed.apiFormat as SpeechApiFormat
+        : inferSpeechApiFormat(parsed.openaiBaseUrl || defaultSpeechConfig.openaiBaseUrl)
+      return { ...defaultSpeechConfig, ...parsed, apiFormat }
+    }
+  } catch { /* ignore */ }
+  return { ...defaultSpeechConfig }
+}
+
+function isSafariSpeechFallbackMode() {
+  if (typeof navigator === 'undefined') return false
+  const ua = navigator.userAgent || ''
+  const vendor = navigator.vendor || ''
+  const isAppleEngine = /Apple/i.test(vendor) || /iPhone|iPad|iPod/i.test(ua)
+  return isAppleEngine && /Safari/i.test(ua) && !/Chrome|Chromium|CriOS|Edg|EdgiOS|Firefox|FxiOS|OPR|OPT|SamsungBrowser|Android/i.test(ua)
+}
+
+export const useReaderStore = defineStore('reader', () => {
+  type ReaderPanel = 'catalog' | 'settings' | 'bookshelf' | 'source' | 'bookmark' | 'rule' | 'cache' | null
+  const appStore = useAppStore()
+  const shelfStore = useBookshelfStore()
+  const book = ref<Book | null>(null)
+  const chapters = ref<BookChapter[]>([])
+  const currentIndex = ref(0)
+  const content = ref('')
+  const loading = ref(false)
+  /** 当前章节加载到哪一步（空串表示未在加载）；用于显示「正在解析段评」这类长耗时 */
+  const loadStage = ref<ContentLoadStage | ''>('')
+  // 阶段提示的持有者：并发加载（预加载 / 连续模式）时只有最后设置提示的那次调用
+  // 能清掉它，避免旧请求提前清掉新章节的提示、或提示永久卡住。
+  let chapterStageSeq = 0
+  let chapterStageOwner = 0
+  /** 原地刷新当前章(非切章加载)。连续阅读模式据此保留已渲染的章节 DOM。 */
+  const refreshing = ref(false)
+  /** 原地刷新替换正文后自增。阅读页据此在重排后把视口锚回当前章原进度。 */
+  const contentRefreshToken = ref(0)
+  /** 打开书时的入口位置快照(书架记录的章节/进度/时间)。
+   *  位置恢复只能用稳定来源(localStorage + 本快照); 活状态(durChapterPos 等)
+   *  会被初始化滚动等 UI 过程改写, 读它做恢复会拿到清零后的假数据。 */
+  const openPosition = ref<{ index: number; position: number; time: number } | null>(null)
+
+  function snapshotOpenPosition(source: Book) {
+    openPosition.value = {
+      index: source.durChapterIndex ?? 0,
+      position: typeof source.durChapterPos === 'number' ? source.durChapterPos : 0,
+      time: source.durChapterTime ?? 0,
+    }
+  }
+  const chaptersLoading = ref(false)
+  const bookmarks = ref<Bookmark[]>([])
+  const replaceRules = ref<ReplaceRule[]>([])
+  const preloadedContent = ref<Map<number, string>>(new Map()) // index -> content
+  const preloadingContent = new Map<number, Promise<string | null>>()
+  let chapterPreloadGeneration = 0
+  const isAutoScrolling = ref(false)
+  /** 阅读页上/下工具栏是否呼出。由 ReaderView 维护, 标题栏据此决定是否实色
+   *  —— 阅读时标题栏透明(沉浸), 呼出工具栏时转为实色(清晰)。 */
+  const readerControlsVisible = ref(false)
+  const chapterScrollProgress = ref(0)
+  const readChapterKeys = ref<Set<string>>(new Set())
+  const progressDirty = ref(false)
+  const lastServerProgressKey = ref('')
+  const pendingLegadoProgress = ref<{ index: number; position: number } | null>(null)
+  const legadoPositionRestore = ref<{
+    index: number
+    position: number
+    progress: number
+    token: number
+    ready: boolean
+  } | null>(null)
+  const legadoPositionRestoreCompleted = ref<{ index: number; token: number } | null>(null)
+  const restoringLegadoProgress = ref(false)
+  const customFonts = ref<CustomFontEntry[]>([])
+  let chapterLoadRequestId = 0
+  let bookLoadRequestId = 0
+  let legadoPositionRestoreToken = 0
+
+  const currentChapter = computed(() => chapters.value[currentIndex.value] || null)
+  const hasNext = computed(() => currentIndex.value < chapters.value.length - 1)
+  const hasPrev = computed(() => currentIndex.value > 0)
+
+  const readingProgress = computed(() => {
+    if (chapters.value.length === 0) return '0%'
+    const progress = ((currentIndex.value + chapterScrollProgress.value) / chapters.value.length) * 100
+    const normalized = Math.max(0, Math.min(100, progress))
+    return `${normalized < 10 ? normalized.toFixed(1) : Math.round(normalized)}%`
+  })
+
+  /* ─── Reading config ─── */
+  const config = reactive<ReadConfig>(loadConfig())
+
+  function customFontFamily(id: string) {
+    return `ReaderCustom_${id.replace(/[^a-zA-Z0-9_]/g, '')}`
+  }
+
+  async function installCustomFontFace(font: CustomFontEntry) {
+    const family = customFontFamily(font.id)
+    // Load through a blob URL so the font does not depend on the webview's
+    // cross-origin font handling. This also makes malformed files fail before
+    // the font is offered as an active reading option.
+    const response = await fetch(font.url, { cache: 'no-store' })
+    if (!response.ok) throw new Error(`字体资源请求失败（${response.status}）`)
+    const blobUrl = URL.createObjectURL(await response.blob())
+    const face = new FontFace(family, `url("${blobUrl}")`)
+    try {
+      const loaded = await face.load()
+      document.fonts.add(loaded)
+      return true
+    } catch (error) {
+      throw new Error(`字体文件加载失败：${error instanceof Error ? error.message : '格式不受支持'}`)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+  }
+
+  async function fetchCustomFonts() {
+    customFonts.value = await listCustomFonts()
+    const failedIds = new Set<string>()
+    for (const font of customFonts.value) {
+      try {
+        await installCustomFontFace(font)
+      } catch {
+        // Ignore a stale or corrupt font during startup. It remains listed so
+        // the user can remove it from the settings panel.
+        failedIds.add(font.id)
+      }
+    }
+    if (config.fontFamily.startsWith(CUSTOM_FONT_PREFIX)) {
+      const id = config.fontFamily.slice(CUSTOM_FONT_PREFIX.length)
+      if (!customFonts.value.some((font) => font.id === id) || failedIds.has(id)) {
+        updateConfig('fontFamily', 'system')
+      }
+    }
+    return customFonts.value
+  }
+
+  async function importCustomFont(file: File) {
+    const font = await uploadCustomFont(file)
+    try {
+      await installCustomFontFace(font)
+    } catch (error) {
+      await deleteCustomFont(font.id).catch(() => undefined)
+      throw error
+    }
+    customFonts.value.push(font)
+    updateConfig('fontFamily', `${CUSTOM_FONT_PREFIX}${font.id}`)
+    return font
+  }
+
+  async function removeCustomFont(id: string) {
+    await deleteCustomFont(id)
+    customFonts.value = customFonts.value.filter((font) => font.id !== id)
+    if (config.fontFamily === `${CUSTOM_FONT_PREFIX}${id}`) {
+      updateConfig('fontFamily', 'system')
+    }
+  }
+
+  function saveConfig() {
+    const persistedConfig: Partial<ReadConfig> = { ...config }
+    // 两张背景图都是 dataURL, 各自存在独立的 localStorage key 里, 不进 readConfig。
+    delete persistedConfig.backgroundImage
+    delete persistedConfig.readerBackgroundImage
+    localStorage.setItem('readConfig', JSON.stringify(persistedConfig))
+  }
+
+  function updateConfig<K extends keyof ReadConfig>(key: K, value: ReadConfig[K]) {
+    config[key] = value
+    if (key === 'enablePreload' && !value) {
+      preloadedContent.value.clear()
+      preloadingContent.clear()
+      chapterPreloadGeneration += 1
+    }
+    saveConfig()
+  }
+
+  function resetConfig() {
+    // 这些是「阅读页外观」偏好: 与背景图同等对待, 重置排版参数时一并保留,
+    // 否则用户调一次字号就会把刚配好的阅读配色清掉。
+    const backgroundPreferences = {
+      backgroundImage: config.backgroundImage,
+      backgroundOpacity: config.backgroundOpacity,
+      applyBackgroundToReader: config.applyBackgroundToReader,
+      readerBackgroundColor: config.readerBackgroundColor,
+      readerBackgroundImage: config.readerBackgroundImage,
+      readerImageOpacity: config.readerImageOpacity,
+      panelOpacity: config.panelOpacity,
+      fontColor: config.fontColor,
+    }
+    Object.assign(config, defaultConfig)
+    Object.assign(config, backgroundPreferences)
+    saveConfig()
+  }
+
+  /* ─── Hotkeys ─── */
+  const HOTKEY_BINDINGS_KEY = 'reader-hotkeys'
+  const hotkeyBindings = ref<HotkeyBindings>(normalizeHotkeyBindings(readStoredHotkeys()))
+
+  function readStoredHotkeys(): unknown {
+    try {
+      const saved = localStorage.getItem(HOTKEY_BINDINGS_KEY)
+      return saved ? JSON.parse(saved) : null
+    } catch {
+      return null
+    }
+  }
+
+  function saveHotkeyBindings() {
+    localStorage.setItem(HOTKEY_BINDINGS_KEY, JSON.stringify(hotkeyBindings.value))
+  }
+
+  /** 覆写某个按键的绑定(空数组表示该键不执行任何动作)。 */
+  function setHotkeyBinding(keyId: string, actions: HotkeyActionId[]) {
+    const normalized = normalizeHotkeyBindings({ ...hotkeyBindings.value, [keyId]: actions })
+    hotkeyBindings.value = normalized
+    saveHotkeyBindings()
+  }
+
+  /** 「功能→按键」界面的绑定入口: 追加到末尾, 保留已有功能的优先次序。 */
+  function bindHotkeyKey(keyId: string, actionId: HotkeyActionId) {
+    hotkeyBindings.value = bindActionToKey(hotkeyBindings.value, keyId, actionId)
+    saveHotkeyBindings()
+  }
+
+  function unbindHotkeyKey(keyId: string, actionId: HotkeyActionId) {
+    hotkeyBindings.value = unbindActionFromKey(hotkeyBindings.value, keyId, actionId)
+    saveHotkeyBindings()
+  }
+
+  /** 当前所有「同模式多动作」冲突, 供设置界面提示。 */
+  const hotkeyConflicts = computed(() => listHotkeyConflicts(hotkeyBindings.value))
+
+  function resetHotkeyBindings() {
+    hotkeyBindings.value = normalizeHotkeyBindings(null)
+    saveHotkeyBindings()
+  }
+
+  const hotkeysAreDefault = computed(() => isDefaultHotkeyBindings(hotkeyBindings.value))
+
+  /** 设置界面矩阵: 供 UI 直接读取动作元信息。 */
+  const hotkeyActions = HOTKEY_ACTION_MAP
+
+  function setBackgroundImage(dataUrl: string) {
+    try {
+      localStorage.setItem(READER_BACKGROUND_IMAGE_KEY, dataUrl)
+      config.backgroundImage = dataUrl
+    } catch {
+      throw new Error('背景图片保存失败，请选择尺寸更小的图片')
+    }
+  }
+
+  function clearBackgroundImage() {
+    localStorage.removeItem(READER_BACKGROUND_IMAGE_KEY)
+    config.backgroundImage = ''
+  }
+
+  function setReaderBackgroundImage(dataUrl: string) {
+    try {
+      localStorage.setItem(READER_PAGE_BACKGROUND_IMAGE_KEY, dataUrl)
+      config.readerBackgroundImage = dataUrl
+    } catch {
+      throw new Error('阅读页背景图片保存失败，请选择尺寸更小的图片')
+    }
+  }
+
+  function clearReaderBackgroundImage() {
+    localStorage.removeItem(READER_PAGE_BACKGROUND_IMAGE_KEY)
+    config.readerBackgroundImage = ''
+  }
+
+  /** 两个方向的转换函数。以前只加载 traditionalized, 「简体」档因此无从转换 ——
+   *  繁体内容(常见于本地导入的书)选「简体」时毫无变化, 就是 issue #6 第 6 条。 */
+  const chineseConverters = ref<{
+    traditional: (text: string) => string
+    simplified: (text: string) => string
+  } | null>(null)
+  let chineseLoading: Promise<void> | null = null
+
+  async function ensureChineseConverterLoaded() {
+    if (chineseConverters.value || chineseLoading) return chineseLoading || Promise.resolve()
+    chineseLoading = import('../utils/chinese.js')
+      .then((module) => {
+        chineseConverters.value = {
+          traditional: module.traditionalized,
+          simplified: module.simplified,
+        }
+      })
+      .catch(() => {
+        chineseConverters.value = null
+      })
+      .finally(() => {
+        chineseLoading = null
+      })
+    return chineseLoading
+  }
+
+  /* ─── Theme ─── */
+  const storedThemeIndex = Number.parseInt(localStorage.getItem('reader-themeIndex') || '0', 10)
+  const themeIndex = ref(
+    Number.isInteger(storedThemeIndex) && storedThemeIndex >= 0 && storedThemeIndex < nightThemeIndex
+      ? storedThemeIndex
+      : 0,
+  )
+  const isNight = ref(
+    localStorage.getItem('reader-isNight') === 'true' || storedThemeIndex === nightThemeIndex,
+  )
+
+  const currentTheme = computed(() => {
+    if (isNight.value) return themePresets[nightThemeIndex]
+    return themePresets[themeIndex.value] || themePresets[0]
+  })
+  /** 阅读页实际使用的配色: 自定义色覆盖主题预设的同名字段。
+   *  只覆盖阅读页, 弹层等界面仍走 chromeTheme 的主题色。 */
+  const readerTheme = computed<ThemePreset>(() => {
+    const activeTheme = currentTheme.value
+    const backgroundColor = normalizeReaderColor(config.readerBackgroundColor)
+    const color = normalizeReaderColor(config.fontColor)
+    if (!backgroundColor && !color) return activeTheme
+    return {
+      ...activeTheme,
+      body: backgroundColor || activeTheme.body,
+      content: backgroundColor || activeTheme.content,
+      fontColor: color || activeTheme.fontColor,
+      // popup 也要跟着走: 它是阅读页顶栏与工具栏的**实色**背景。若仍用预设的
+      // popup, 设了自定义阅读背景色之后, 呼出工具栏会在正文底色上方贴一条
+      // 预设色的栏, 两截颜色对不上。(与 backgroundColor 同色, 拼成连续一条。)
+      popup: backgroundColor || activeTheme.popup,
+    }
+  })
+  /** 阅读页背景色(已归一化)。空串表示跟随主题 / 让位给桌面背景图。 */
+  const readerBackgroundColor = computed(() => normalizeReaderColor(config.readerBackgroundColor))
+  /** 阅读页浮层底板配色。
+   *  popup 同时是抽屉、右键菜单、划词菜单、搜索面板的底色, 因此这里统一按
+   *  「面板不透明度」合成一次; 100% 时直接返回主题色, 与旧版实色完全一致。 */
+  const chromeTheme = computed<ThemePreset>(() => {
+    const activeTheme = currentTheme.value
+    const opacity = normalizeReaderPanelOpacity(config.panelOpacity)
+    if (opacity >= 1) return activeTheme
+    return {
+      ...activeTheme,
+      popup: `color-mix(in srgb, ${activeTheme.popup} ${Math.round(opacity * 100)}%, transparent)`,
+    }
+  })
+
+  function setThemeIndex(idx: number) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= themePresets.length) return
+    if (idx === nightThemeIndex) {
+      isNight.value = true
+      localStorage.setItem('reader-isNight', 'true')
+      return
+    }
+    themeIndex.value = idx
+    isNight.value = false
+    localStorage.setItem('reader-themeIndex', String(idx))
+    localStorage.setItem('reader-isNight', 'false')
+  }
+
+  function toggleNight() {
+    isNight.value = !isNight.value
+    localStorage.setItem('reader-isNight', String(isNight.value))
+    if (!isNight.value) {
+      localStorage.setItem('reader-themeIndex', String(themeIndex.value))
+    }
+  }
+
+  /* ─── Chinese Conversion (OpenCC) ─── */
+  /* ─── Content Filtering (Replace Rules) ─── */
+  function applyReplaceRules(text: string) {
+    if (!text) return ''
+    let result = text
+    const currentBook = book.value
+    if (currentBook?.readConfig?.useReplaceRule === false) return text
+
+    function matchRuleScope(rule: ReplaceRule) {
+      const scope = (rule.scope || '').trim()
+      if (!scope || scope === '*') return true
+      if (!currentBook) return false
+
+      if (scope.startsWith('source:')) {
+        return scope.slice('source:'.length) === currentBook.origin
+      }
+
+      if (scope.startsWith('book:')) {
+        return scope.slice('book:'.length) === currentBook.bookUrl
+      }
+
+      const scopeParts = scope.split(';')
+      if (scopeParts[0] !== '*' && scopeParts[0] !== currentBook.name) {
+        return false
+      }
+      return scopeParts.length === 1 || scopeParts[1] === currentBook.bookUrl
+    }
+
+    // Sort by order and apply enabled rules
+    const enabledRules = [...replaceRules.value]
+      .filter(r => r.isEnabled && matchRuleScope(r))
+      .sort((a, b) => a.order - b.order)
+
+    for (const rule of enabledRules) {
+      try {
+        if (rule.isRegex) {
+          const re = new RegExp(rule.pattern, 'gm')
+          result = result.replace(re, rule.replacement)
+        } else {
+          result = result.replaceAll(rule.pattern, rule.replacement)
+        }
+      } catch (e) {
+        console.error(`Failed to apply rule: ${rule.name}`, e)
+      }
+    }
+    return result
+  }
+
+  /** 按当前档位转换正文。
+   *
+   *  两档都真正转换(此前「简体」档直接返回原文, 繁体内容因此"无效"):
+   *    'traditional' → 简转繁; 'simplified' → 繁转简。
+   *  已经是目标字形的文本转换后不变, 所以对简体书选「简体」、繁体书选「繁体」
+   *  都不会有副作用。 */
+  function convertContent(text: string) {
+    if (!text || !chineseConverters.value) return text
+    const convert = config.chineseMode === 'traditional'
+      ? chineseConverters.value.traditional
+      : chineseConverters.value.simplified
+    return convert(text)
+  }
+
+  function processContentForDisplay(text: string) {
+    // 本地 PDF 的「正文」是逐页占位元素 (页号写在 data-pdf-page 上), 页面内容
+    // 由 pdf.js 绘制: 简繁转换与净化替换都无从作用于图片, 却可能改写占位标记
+    // 本身, 因此原样返回。
+    if (text.includes(PDF_PAGE_ATTR)) return text
+    // 与手机端 ContentProcessor 一致: 先简繁转换, 再应用净化替换。
+    // 旧顺序会把替换结果再次交给 OpenCC, 例如「串行 → 序列」又会被 twp→cn
+    // 词表改回「串行」, 表现为替换规则怎么设都无效。
+    return applyReplaceRules(convertContent(text))
+  }
+
+  const displayContent = computed(() => {
+    return processContentForDisplay(content.value)
+  })
+
+  // 两个档位都要加载转换器: 「简体」档现在也要真的做繁→简(此前它什么都不做)。
+  watch(
+    () => config.chineseMode,
+    () => {
+      void ensureChineseConverterLoaded()
+    },
+    { immediate: true },
+  )
+
+  function saveReaderSession() {
+    if (!book.value || !chapters.value.length) return
+    const payload: PersistedReaderSession = {
+      book: book.value,
+      chapters: chapters.value,
+      currentIndex: currentIndex.value,
+      chapterScrollProgress: chapterScrollProgress.value,
+      updatedAt: Date.now(),
+    }
+    localStorage.setItem(READER_SESSION_KEY, JSON.stringify(payload))
+    // 全量快照已包含最新进度, 轻量副本同步一次即可 —— 否则下次恢复
+    // 可能读到比全量更旧的进度(两次调用之间存在插值中的中间值)。
+    saveReaderProgress()
+  }
+
+  /** 只写进度: 供 handleScroll 等高频路径使用。
+   *
+   *  必须与 saveReaderSession 分开(见 PersistedReaderProgress 的说明) ——
+   *  把整份目录塞进每次滚动事件是本项目最热的一条路径上最贵的操作。
+   *  恢复时以本快照为**优先**来源(updatedAt 更新), 全量快照仅作兜底:
+   *  章节列表只有全量快照里有, 进度则两者都有, 取新的那个。 */
+  function saveReaderProgress() {
+    if (!book.value) return
+    const payload: PersistedReaderProgress = {
+      bookUrl: book.value.bookUrl,
+      currentIndex: currentIndex.value,
+      chapterScrollProgress: chapterScrollProgress.value,
+      updatedAt: Date.now(),
+    }
+    try {
+      localStorage.setItem(READER_PROGRESS_KEY, JSON.stringify(payload))
+    } catch {
+      // 进度写失败不该中断阅读; 全量快照仍在, 只是可能略旧。
+    }
+  }
+
+  function readReaderProgress(): PersistedReaderProgress | null {
+    try {
+      const raw = localStorage.getItem(READER_PROGRESS_KEY)
+      if (!raw) return null
+      const parsed = JSON.parse(raw) as Partial<PersistedReaderProgress>
+      if (typeof parsed?.bookUrl !== 'string' || typeof parsed?.currentIndex !== 'number') return null
+      return {
+        bookUrl: parsed.bookUrl,
+        currentIndex: parsed.currentIndex,
+        chapterScrollProgress: typeof parsed.chapterScrollProgress === 'number' ? parsed.chapterScrollProgress : 0,
+        updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
+      }
+    } catch {
+      return null
+    }
+  }
+
+  function encodeServerProgress(progress = chapterScrollProgress.value) {
+    return Math.max(
+      0,
+      Math.min(SERVER_PROGRESS_SCALE, Math.round(Math.max(0, Math.min(1, progress)) * SERVER_PROGRESS_SCALE)),
+    )
+  }
+
+  function decodeServerProgress(position?: number | null) {
+    if (typeof position !== 'number' || Number.isNaN(position)) return 0
+    const normalized = position > 1 ? position / SERVER_PROGRESS_SCALE : position
+    return Math.max(0, Math.min(1, normalized))
+  }
+
+  function currentServerProgressPayload(index = currentIndex.value, progress = chapterScrollProgress.value) {
+    if (!book.value) return null
+    return {
+      bookUrl: book.value.bookUrl,
+      index,
+      position: encodeServerProgress(progress),
+    }
+  }
+
+  function markProgressDirty() {
+    progressDirty.value = true
+  }
+
+  function syncLocalBookProgress(progress = chapterScrollProgress.value) {
+    if (!book.value) return
+    const encodedProgress = encodeServerProgress(progress)
+    book.value.durChapterPos = encodedProgress
+    const shelfBook = shelfStore.books.find((item) => item.bookUrl === book.value?.bookUrl)
+    if (shelfBook) {
+      shelfBook.durChapterPos = encodedProgress
+    }
+  }
+
+  function getPersistedReaderSession(): PersistedReaderSession | null {
+    try {
+      const raw = localStorage.getItem(READER_SESSION_KEY)
+      if (!raw) return null
+      return JSON.parse(raw) as PersistedReaderSession
+    } catch {
+      return null
+    }
+  }
+
+  async function restorePersistedSession() {
+    const session = getPersistedReaderSession()
+    if (!session?.book || !session.chapters?.length) return false
+
+    // 进度有两个来源: 全量快照(saveReaderSession, 含目录)与轻量快照
+    // (saveReaderProgress, 每次滚动都写)。两者都可能更新, 取 updatedAt 较新
+    // 的那个, 并且必须是同一本书 —— 否则打开了 A 书却用 B 书的进度。
+    const progress = readReaderProgress()
+    const progressMatchesBook = progress?.bookUrl === session.book.bookUrl
+    const sessionUpdatedAt = typeof session.updatedAt === 'number' ? session.updatedAt : 0
+    const useProgress = Boolean(progressMatchesBook && progress && progress.updatedAt >= sessionUpdatedAt)
+    const savedIndex = useProgress && progress ? progress.currentIndex : (session.currentIndex || 0)
+    const savedScrollProgress = useProgress && progress
+      ? progress.chapterScrollProgress
+      : (session.chapterScrollProgress || 0)
+
+    book.value = session.book
+    snapshotOpenPosition(session.book)
+    chapters.value = session.chapters
+    loadReadChapterHistory(session.book)
+
+    const nextIndex = Math.max(0, Math.min(savedIndex, session.chapters.length - 1))
+    try {
+      const chapterContent = await fetchChapterContent(nextIndex, false, true)
+      if (chapterContent == null) return false
+      cachePreloadedContent(nextIndex, chapterContent)
+      if (config.enablePreload) void preloadAroundChapter(nextIndex)
+      currentIndex.value = nextIndex
+      const savedProgress = Math.max(0, Math.min(1, savedScrollProgress || 0))
+      setActiveChapterState(nextIndex, chapterContent, savedProgress)
+      if (book.value) {
+        book.value.durChapterTime = session.book.durChapterTime || book.value.durChapterTime
+        const shelfBook = shelfStore.books.find((item) => item.bookUrl === book.value?.bookUrl)
+        if (shelfBook) shelfBook.durChapterTime = book.value.durChapterTime
+      }
+      markChapterAsRead(nextIndex)
+      await restoreCurrentBookProgressFromLegado(chapterContent).catch((error) => {
+        appStore.showToast((error as Error).message || '读取网盘阅读进度失败', 'warning')
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  function getReadHistoryStorageKey(currentBook?: Book | null) {
+    if (!currentBook?.bookUrl) return ''
+    return `${READER_READ_HISTORY_PREFIX}${currentBook.bookUrl}`
+  }
+
+  function buildReadChapterKey(index: number, chapter?: BookChapter | null, currentBook?: Book | null) {
+    if (!currentBook?.bookUrl) return ''
+    const sourceKey = currentBook.origin || 'default'
+    if (chapter?.url) {
+      return `${currentBook.bookUrl}::${sourceKey}::${chapter.url}`
+    }
+    return `${currentBook.bookUrl}::${sourceKey}::index:${index}`
+  }
+
+  function loadReadChapterHistory(currentBook?: Book | null) {
+    const storageKey = getReadHistoryStorageKey(currentBook)
+    if (!storageKey) {
+      readChapterKeys.value = new Set()
+      return
+    }
+    try {
+      const raw = localStorage.getItem(storageKey)
+      if (!raw) {
+        readChapterKeys.value = new Set()
+        return
+      }
+      const parsed = JSON.parse(raw)
+      readChapterKeys.value = new Set(Array.isArray(parsed) ? parsed.filter((item) => typeof item === 'string') : [])
+    } catch {
+      readChapterKeys.value = new Set()
+    }
+  }
+
+  function persistReadChapterHistory(currentBook?: Book | null) {
+    const storageKey = getReadHistoryStorageKey(currentBook)
+    if (!storageKey) return
+    localStorage.setItem(storageKey, JSON.stringify(Array.from(readChapterKeys.value)))
+  }
+
+  function markChapterAsRead(index: number) {
+    const key = buildReadChapterKey(index, chapters.value[index], book.value)
+    if (!key || readChapterKeys.value.has(key)) return
+    const next = new Set(readChapterKeys.value)
+    next.add(key)
+    readChapterKeys.value = next
+    persistReadChapterHistory(book.value)
+  }
+
+  function isChapterRead(index: number) {
+    return readChapterKeys.value.has(buildReadChapterKey(index, chapters.value[index], book.value))
+  }
+
+  /* ─── Auto reading ─── */
+  const autoReading = ref(false)
+  const autoReadingTimer = ref<number | null>(null)
+
+  function toggleAutoReading() {
+    isAutoScrolling.value = !isAutoScrolling.value
+    autoReading.value = isAutoScrolling.value
+  }
+
+  function stopAutoReading() {
+    isAutoScrolling.value = false
+    autoReading.value = false
+    if (autoReadingTimer.value) {
+      clearInterval(autoReadingTimer.value)
+      autoReadingTimer.value = null
+    }
+  }
+
+  /* ─── TTS (Text To Speech) ─── */
+  const isSpeaking = ref(false)
+  const isSpeechLoading = ref(false)
+  const isPaused = ref(false)
+  const speechProgress = ref(0)
+  const systemTtsNativeEventsReliable = ref(false)
+  const voiceList = ref<SpeechSynthesisVoice[]>([])
+  const speechConfig = reactive<SpeechConfig>(loadSpeechConfig())
+  const openAISpeechConfigured = computed(() => !!speechConfig.openaiBaseUrl.trim())
+  const speechProviderLabel = computed(() => speechConfig.provider === 'openai' ? 'API 语音' : '系统语音')
+  const speechStopAt = ref(0)
+  let speechStopTimer: number | null = null
+  let synth: SpeechSynthesis | null = typeof window !== 'undefined' ? window.speechSynthesis : null
+  let currentUtterance: SpeechSynthesisUtterance | null = null
+  let currentOpenAIAudio: HTMLAudioElement | null = null
+  let currentOpenAIAudioUrl = ''
+  let currentOpenAIAbortController: AbortController | null = null
+  const preloadedOpenAIAudio = ref<PreloadedOpenAIAudio[]>([])
+  let preloadGeneration = 0
+  const inFlightPreloadKeys = new Set<string>()
+  const inFlightOpenAIAudioRequests = new Map<string, Promise<Blob>>()
+  let currentTTSSessionId = 0
+
+  function logTTS(message: string, payload?: unknown) {
+    void message
+    void payload
+  }
+
+  function captureTTSCaller() {
+    try {
+      const stack = new Error().stack || ''
+      return stack
+        .split('\n')
+        .slice(2, 5)
+        .map((line) => line.trim())
+        .join(' | ')
+    } catch {
+      return ''
+    }
+  }
+
+  function beginTTSSession() {
+    currentTTSSessionId += 1
+    logTTS('begin session', { sessionId: currentTTSSessionId })
+    return currentTTSSessionId
+  }
+
+  function isCurrentTTSSession(sessionId: number) {
+    return sessionId === currentTTSSessionId
+  }
+
+  function saveSpeechConfig() {
+    localStorage.setItem('reader-speechConfig', JSON.stringify(speechConfig))
+  }
+
+  async function syncCurrentBookProgressToLegado(
+    allowUpload = true,
+    contentOverride?: string,
+    expectedBookUrl?: string,
+    expectedBookLoadRequestId?: number,
+    applyRemoteProgress = true,
+  ) {
+    if (!book.value) return null
+    if (loading.value && !restoringLegadoProgress.value) return null
+    if (expectedBookUrl && book.value.bookUrl !== expectedBookUrl) return null
+    if (expectedBookLoadRequestId != null && expectedBookLoadRequestId !== bookLoadRequestId) return null
+    if (!appStore.legadoSyncEnabled) return null
+    const webdav = appStore.legadoWebdavConfig
+    if (!webdav.url || !webdav.account || !webdav.password) return null
+    const plainContentLength = Math.max(1, (contentOverride ?? content.value).replace(/<[^>]+>/g, '').length)
+    const progressPosition = Math.max(0, Math.min(plainContentLength,
+      Math.round(chapterScrollProgress.value * plainContentLength)))
+    const progress: LegadoBookProgress = {
+      name: book.value.name,
+      author: book.value.author,
+      durChapterIndex: currentIndex.value,
+      durChapterPos: progressPosition,
+      durChapterTime: Date.now(),
+      durChapterTitle: currentChapter.value?.title || book.value.durChapterTitle,
+    }
+    const result = await syncLegadoBookProgress(webdav, progress, allowUpload)
+    if (expectedBookUrl && book.value?.bookUrl !== expectedBookUrl) return result
+    if (expectedBookLoadRequestId != null && expectedBookLoadRequestId !== bookLoadRequestId) return result
+    if (!result?.remote) return result
+
+    const remote = result.remote
+    // 与手机端保持一致：只按章节索引和章节内字符位置比较，
+    // 不用电脑打开章节时自动更新的 durChapterTime 覆盖真实阅读进度。
+    const remoteIsNewer = remote.durChapterIndex > progress.durChapterIndex
+      || (remote.durChapterIndex === progress.durChapterIndex
+        && remote.durChapterPos > progress.durChapterPos)
+    if (!remoteIsNewer) return result
+    if (!applyRemoteProgress) return result
+
+    // 手机端直接使用 durChapterIndex。标题只用于显示，不能参与定位，
+    // 否则章节标题重复或书源标题变化时会跳到错误章节。
+    const targetIndex = remote.durChapterIndex
+    if (targetIndex < 0 || targetIndex >= chapters.value.length) return result
+    const title = chapters.value[targetIndex]?.title || remote.durChapterTitle || book.value.durChapterTitle
+    const remoteProgress = targetIndex === currentIndex.value
+      ? Math.max(0, Math.min(1, remote.durChapterPos / plainContentLength))
+      : 0
+    const encodedRemoteProgress = encodeServerProgress(remoteProgress)
+    pendingLegadoProgress.value = { index: targetIndex, position: remote.durChapterPos }
+    legadoPositionRestore.value = {
+      index: targetIndex,
+      position: Math.max(0, remote.durChapterPos),
+      progress: remoteProgress,
+      token: ++legadoPositionRestoreToken,
+      ready: false,
+    }
+    currentIndex.value = targetIndex
+    Object.assign(book.value, {
+      durChapterIndex: targetIndex,
+      durChapterPos: encodedRemoteProgress,
+      durChapterTitle: title,
+      durChapterTime: remote.durChapterTime,
+    })
+    chapterScrollProgress.value = remoteProgress
+    const shelfBook = shelfStore.books.find((item) => item.bookUrl === book.value?.bookUrl)
+    if (shelfBook) Object.assign(shelfBook, {
+      durChapterIndex: targetIndex,
+      durChapterPos: encodedRemoteProgress,
+      durChapterTitle: title,
+      durChapterTime: remote.durChapterTime,
+    })
+    // 跨章时正文还没有加载，先保存章节索引；目标章节正文加载后再按字符位置恢复。
+    snapshotOpenPosition({
+      ...book.value,
+      durChapterPos: encodedRemoteProgress,
+    })
+    saveReaderSession()
+    appStore.showToast('已读取手机端阅读进度', 'success')
+    return result
+  }
+
+  async function uploadCurrentBookProgressToLegado() {
+    if (!book.value || loading.value) return null
+    if (!appStore.legadoSyncEnabled) return null
+    const webdav = appStore.legadoWebdavConfig
+    if (!webdav.url || !webdav.account || !webdav.password) return null
+    const plainContentLength = Math.max(1, content.value.replace(/<[^>]+>/g, '').length)
+    const progressPosition = Math.max(0, Math.min(plainContentLength,
+      Math.round(chapterScrollProgress.value * plainContentLength)))
+    const progress: LegadoBookProgress = {
+      name: book.value.name,
+      author: book.value.author,
+      durChapterIndex: currentIndex.value,
+      durChapterPos: progressPosition,
+      durChapterTime: Date.now(),
+      durChapterTitle: currentChapter.value?.title || book.value.durChapterTitle,
+    }
+    return uploadLegadoBookProgress(webdav, progress)
+  }
+
+  async function restoreCurrentBookProgressFromLegado(
+    contentOverride?: string,
+    expectedBookUrl?: string,
+    expectedBookLoadRequestId?: number,
+  ) {
+    restoringLegadoProgress.value = true
+    try {
+      const result = await syncCurrentBookProgressToLegado(
+        true,
+        contentOverride,
+        expectedBookUrl,
+        expectedBookLoadRequestId,
+      )
+      const isExpectedBook = (!expectedBookUrl || book.value?.bookUrl === expectedBookUrl)
+        && (expectedBookLoadRequestId == null || expectedBookLoadRequestId === bookLoadRequestId)
+      if (isExpectedBook && pendingLegadoProgress.value) {
+        await loadChapter(currentIndex.value)
+      }
+      return result
+    } finally {
+      restoringLegadoProgress.value = false
+    }
+  }
+
+  /**
+   * 离开阅读页时按手机端 uploadBookProgress 的规则执行：
+   * 直接上传当前进度，不读取、不比较远端进度。
+   */
+  async function syncCurrentBookProgressFromLegadoOnExit() {
+    if (!book.value || restoringLegadoProgress.value || loading.value) return null
+    return uploadCurrentBookProgressToLegado()
+  }
+
+  function clearLegadoPositionRestore(token?: number) {
+    if (token != null && legadoPositionRestore.value?.token !== token) return
+    if (legadoPositionRestore.value) {
+      legadoPositionRestoreCompleted.value = {
+        index: legadoPositionRestore.value.index,
+        token: legadoPositionRestore.value.token,
+      }
+    }
+    legadoPositionRestore.value = null
+  }
+
+  function consumeLegadoPositionRestoreCompleted(index: number) {
+    if (legadoPositionRestoreCompleted.value?.index !== index) return false
+    legadoPositionRestoreCompleted.value = null
+    return true
+  }
+
+  const systemSpeechSupported = computed(() => (
+    typeof window !== 'undefined'
+      && typeof window.speechSynthesis !== 'undefined'
+      && typeof SpeechSynthesisUtterance !== 'undefined'
+  ))
+
+  function resolveSpeechSynthesis() {
+    if (!synth && typeof window !== 'undefined') {
+      synth = window.speechSynthesis
+    }
+    return synth
+  }
+
+  function fetchVoices() {
+    const speech = resolveSpeechSynthesis()
+    if (!speech) return
+    voiceList.value = speech.getVoices().slice().sort((a, b) => {
+      const aZh = a.lang.startsWith('zh-')
+      const bZh = b.lang.startsWith('zh-')
+      if (aZh && !bZh) return -1
+      if (!aZh && bZh) return 1
+      return a.lang.localeCompare(b.lang)
+    })
+    if (!speechConfig.voiceName && voiceList.value.length > 0) {
+      const zhVoice = voiceList.value.find((v) => v.lang.startsWith('zh-'))
+      speechConfig.voiceName = (zhVoice || voiceList.value[0]).name
+      saveSpeechConfig()
+    }
+  }
+
+  function setVoiceName(name: string) {
+    speechConfig.voiceName = name
+    saveSpeechConfig()
+  }
+
+  function setSpeechProvider(provider: SpeechProvider) {
+    speechConfig.provider = provider
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setOpenAISpeechBaseUrl(url: string) {
+    speechConfig.openaiBaseUrl = url.trim()
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setSpeechProxyUrl(url: string) {
+    speechConfig.speechProxyUrl = url.trim()
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setSpeechApiFormat(format: SpeechApiFormat) {
+    speechConfig.apiFormat = format
+    const supportedFormats = getSpeechApiFormatOption(format).supportedFormats
+    if (!supportedFormats.includes(speechConfig.openaiFormat)) {
+      speechConfig.openaiFormat = 'mp3'
+    }
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setOpenAISpeechSource(source: OpenAISpeechSource) {
+    speechConfig.openaiSource = source
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setOpenAISpeechApiKey(apiKey: string) {
+    speechConfig.openaiApiKey = apiKey.trim()
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setOpenAISpeechModel(model: string) {
+    speechConfig.openaiModel = model
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setOpenAISpeechVoice(voice: string) {
+    speechConfig.openaiVoice = voice
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setOpenAISpeechFormat(format: OpenAISpeechFormat) {
+    speechConfig.openaiFormat = format
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setOpenAISpeechRequestMode(mode: OpenAISpeechRequestMode) {
+    speechConfig.openaiRequestMode = mode
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setSpeechRate(rate: number) {
+    speechConfig.speechRate = rate
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setSpeechPitch(pitch: number) {
+    speechConfig.speechPitch = pitch
+    saveSpeechConfig()
+  }
+
+  function buildOpenAIAudioCacheKey(rawText: string) {
+    return [
+      speechConfig.apiFormat,
+      speechConfig.openaiBaseUrl.trim(),
+      speechConfig.speechProxyUrl.trim(),
+      speechConfig.openaiApiKey.trim(),
+      speechConfig.openaiModel,
+      speechConfig.openaiVoice,
+      speechConfig.openaiFormat,
+      speechConfig.speechRate.toFixed(1),
+      rawText,
+    ].join('::')
+  }
+
+  async function fetchOpenAIAudioBlob(rawText: string, signal?: AbortSignal) {
+    const request = {
+      apiFormat: speechConfig.apiFormat,
+      baseUrl: speechConfig.openaiBaseUrl,
+      proxyUrl: speechConfig.speechProxyUrl || undefined,
+      apiKey: speechConfig.openaiApiKey || undefined,
+      input: rawText.slice(0, 4096),
+      model: speechConfig.openaiModel,
+      voice: speechConfig.openaiVoice,
+      format: speechConfig.openaiFormat,
+      speed: speechConfig.speechRate,
+      signal,
+    }
+    if (!isTauri()) {
+      return requestOpenAISpeechAudio(request)
+    }
+
+    const payload = await invokeRaw<ArrayBuffer | Uint8Array | number[]>('request_speech_audio', {
+      req: {
+        apiFormat: request.apiFormat,
+        baseUrl: request.baseUrl,
+        proxyUrl: request.proxyUrl,
+        apiKey: request.apiKey,
+        input: request.input,
+        model: request.model,
+        voice: request.voice,
+        format: request.format,
+        speed: request.speed,
+      },
+    })
+    if (signal?.aborted) {
+      throw new DOMException('The operation was aborted', 'AbortError')
+    }
+    const bytes = payload instanceof ArrayBuffer
+      ? payload
+      : payload instanceof Uint8Array
+        ? payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer
+        : new Uint8Array(payload).buffer
+    const mimeType = request.format === 'opus' ? 'audio/ogg' : `audio/${request.format}`
+    return new Blob([bytes], { type: mimeType })
+  }
+
+  function getOrStartOpenAIAudioRequest(rawText: string, signal?: AbortSignal) {
+    const key = buildOpenAIAudioCacheKey(rawText)
+    const existing = inFlightOpenAIAudioRequests.get(key)
+    if (existing) {
+      return { key, promise: existing }
+    }
+
+    const promise = fetchOpenAIAudioBlob(rawText, signal).finally(() => {
+      if (inFlightOpenAIAudioRequests.get(key) === promise) {
+        inFlightOpenAIAudioRequests.delete(key)
+      }
+    })
+    inFlightOpenAIAudioRequests.set(key, promise)
+    return { key, promise }
+  }
+
+  function clearPreloadedOpenAIAudio() {
+    preloadGeneration += 1
+    inFlightPreloadKeys.clear()
+    inFlightOpenAIAudioRequests.clear()
+    preloadedOpenAIAudio.value = []
+  }
+
+  async function preloadOpenAITTS(rawText?: string | string[] | null) {
+    if (speechConfig.provider !== 'openai' || !openAISpeechConfigured.value) return
+    const texts = Array.isArray(rawText) ? rawText : [rawText || '']
+    const normalizedTexts = texts.map((item) => item.trim()).filter(Boolean)
+    if (!normalizedTexts.length) return
+    const pendingTexts = normalizedTexts.filter((item) => {
+      const key = buildOpenAIAudioCacheKey(item)
+      return !preloadedOpenAIAudio.value.some((entry) => entry.key === key) && !inFlightPreloadKeys.has(key)
+    })
+    if (!pendingTexts.length) return
+
+    const generation = preloadGeneration
+    for (const text of pendingTexts.slice(0, OPENAI_AUDIO_PRELOAD_LIMIT)) {
+      const key = buildOpenAIAudioCacheKey(text)
+      inFlightPreloadKeys.add(key)
+      const { promise } = getOrStartOpenAIAudioRequest(text)
+      void promise
+        .then((blob) => {
+          if (generation !== preloadGeneration) return
+          const nextQueue = preloadedOpenAIAudio.value.filter((entry) => entry.key !== key)
+          nextQueue.push({ key, blob })
+          preloadedOpenAIAudio.value = nextQueue
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          inFlightPreloadKeys.delete(key)
+        })
+    }
+  }
+
+  function stopOpenAIAudioPlayback() {
+    if (currentOpenAIAbortController) {
+      currentOpenAIAbortController.abort()
+      currentOpenAIAbortController = null
+    }
+    if (currentOpenAIAudio) {
+      currentOpenAIAudio.onplay = null
+      currentOpenAIAudio.onpause = null
+      currentOpenAIAudio.onloadedmetadata = null
+      currentOpenAIAudio.ontimeupdate = null
+      currentOpenAIAudio.onended = null
+      currentOpenAIAudio.onerror = null
+      currentOpenAIAudio.pause()
+      currentOpenAIAudio.src = ''
+      currentOpenAIAudio = null
+    }
+    if (currentOpenAIAudioUrl) {
+      URL.revokeObjectURL(currentOpenAIAudioUrl)
+      currentOpenAIAudioUrl = ''
+    }
+  }
+
+  function clearSpeechStopTimer(resetConfig = true) {
+    if (speechStopTimer) {
+      clearTimeout(speechStopTimer)
+      speechStopTimer = null
+    }
+    speechStopAt.value = 0
+    if (resetConfig) {
+      speechConfig.stopAfterMinutes = 0
+      saveSpeechConfig()
+    }
+  }
+
+  function setSpeechStopTimer(minutes: number) {
+    clearSpeechStopTimer(false)
+    const normalized = Math.max(0, Math.min(180, Math.round(minutes)))
+    speechConfig.stopAfterMinutes = normalized
+    saveSpeechConfig()
+    if (!normalized) {
+      speechStopAt.value = 0
+      return
+    }
+    speechStopAt.value = Date.now() + normalized * 60 * 1000
+    speechStopTimer = window.setTimeout(() => {
+      stopTTS()
+      clearSpeechStopTimer(false)
+      speechConfig.stopAfterMinutes = 0
+      saveSpeechConfig()
+      appStore.showToast('朗读已按定时设置停止', 'success')
+    }, normalized * 60 * 1000)
+  }
+
+  function startSystemTTS(rawText: string, options: TTSOptions, sessionId: number) {
+    synth = resolveSpeechSynthesis()
+    if (!synth || typeof SpeechSynthesisUtterance === 'undefined') {
+      const error = new Error('当前系统不支持系统语音，请改用 API 语音')
+      isSpeechLoading.value = false
+      isSpeaking.value = false
+      isPaused.value = false
+      appStore.showToast(error.message, 'warning')
+      options.onError?.(error)
+      return
+    }
+    isSpeechLoading.value = false
+    if (!voiceList.value.length) {
+      fetchVoices()
+    }
+
+    const utterance = new SpeechSynthesisUtterance(rawText)
+    speechProgress.value = 0
+    options.onProgress?.(0)
+    currentUtterance = utterance
+    const safariSpeechFallback = isSafariSpeechFallbackMode() && !systemTtsNativeEventsReliable.value
+
+    const selectedVoice = voiceList.value.find((voice) => voice.name === speechConfig.voiceName)
+    utterance.lang = selectedVoice?.lang || 'zh-CN'
+    utterance.voice = selectedVoice || null
+    utterance.rate = speechConfig.speechRate
+    utterance.pitch = speechConfig.speechPitch
+    logTTS('system speak queued', {
+      sessionId,
+      voice: utterance.voice?.name || utterance.lang,
+      rate: utterance.rate,
+      pitch: utterance.pitch,
+      text: rawText.slice(0, 80),
+    })
+
+    let completed = false
+    let finishWatchdog: number | null = null
+    const startedAt = Date.now()
+    let lastProgressAt = startedAt
+    let sawStart = false
+    let sawBoundary = false
+    let pausedStartedAt: number | null = null
+    let pausedAccumulatedMs = 0
+
+    const clearFinishWatchdog = () => {
+      if (finishWatchdog) {
+        clearTimeout(finishWatchdog)
+        finishWatchdog = null
+      }
+    }
+
+    const effectiveElapsed = () => {
+      const now = Date.now()
+      const currentPaused = pausedStartedAt ? now - pausedStartedAt : 0
+      return now - startedAt - pausedAccumulatedMs - currentPaused
+    }
+
+    const finalizePlayback = (kind: 'end' | 'error' | 'interrupted', event?: SpeechSynthesisErrorEvent) => {
+      if (completed) return
+      completed = true
+      clearFinishWatchdog()
+      if (currentUtterance === utterance) {
+        currentUtterance = null
+      }
+      if (!isCurrentTTSSession(sessionId)) return
+      isSpeaking.value = false
+      isPaused.value = false
+      logTTS('system finalize', {
+        sessionId,
+        kind,
+        error: event?.error,
+        speaking: synth?.speaking,
+        pending: synth?.pending,
+      })
+      if (kind === 'end') {
+        options.onEnd?.()
+        return
+      }
+      if (kind === 'error') {
+        options.onError?.(event)
+      }
+    }
+
+    const forceFinalizeEnd = (reason: string) => {
+      logTTS('system watchdog force end', {
+        sessionId,
+        reason,
+        speaking: synth?.speaking,
+        pending: synth?.pending,
+        elapsed: effectiveElapsed(),
+        text: rawText.slice(0, 40),
+      })
+      finalizePlayback('end')
+      window.setTimeout(() => {
+        if (!isCurrentTTSSession(sessionId)) return
+        try {
+          synth?.cancel()
+        } catch {
+          // ignore platform-specific cancel errors
+        }
+      }, 0)
+    }
+
+    const scheduleFinishWatchdog = () => {
+      clearFinishWatchdog()
+      const estimatedMs = safariSpeechFallback
+        ? Math.max(2400, Math.ceil((rawText.length / Math.max(0.6, speechConfig.speechRate)) * 235))
+        : Math.max(2800, Math.ceil((rawText.length / Math.max(0.6, speechConfig.speechRate)) * 280))
+      const noStartTimeoutMs = safariSpeechFallback
+        ? estimatedMs + Math.max(400, Math.ceil(rawText.length * 22))
+        : 0
+      const hardTimeoutMs = safariSpeechFallback
+        ? estimatedMs + Math.max(1800, Math.ceil(rawText.length * 80))
+        : Math.min(120000, estimatedMs + Math.max(4000, Math.ceil(rawText.length * 120)))
+      logTTS('system watchdog scheduled', {
+        sessionId,
+        estimatedMs,
+        noStartTimeoutMs,
+        hardTimeoutMs,
+        safariSpeechFallback,
+        text: rawText.slice(0, 40),
+      })
+      const checkFinish = () => {
+        if (completed || !isCurrentTTSSession(sessionId) || currentUtterance !== utterance) return
+        if (synth?.paused || isPaused.value) {
+          if (pausedStartedAt == null) {
+            pausedStartedAt = Date.now()
+          }
+          lastProgressAt = Date.now()
+          finishWatchdog = window.setTimeout(checkFinish, 600)
+          return
+        }
+        if (pausedStartedAt != null) {
+          pausedAccumulatedMs += Date.now() - pausedStartedAt
+          pausedStartedAt = null
+        }
+        const elapsed = effectiveElapsed()
+        const idleMs = Date.now() - lastProgressAt
+        if (!synth?.speaking && !synth?.pending) {
+          logTTS('system watchdog finalize end', { sessionId })
+          finalizePlayback('end')
+          return
+        }
+        if (sawBoundary && idleMs > 1800 && elapsed > Math.max(2200, estimatedMs * 0.75)) {
+          forceFinalizeEnd('boundary-idle')
+          return
+        }
+        if (safariSpeechFallback && !sawStart && elapsed > noStartTimeoutMs) {
+          forceFinalizeEnd('no-start-timeout')
+          return
+        }
+        if (elapsed > hardTimeoutMs) {
+          forceFinalizeEnd('hard-timeout')
+          return
+        }
+        finishWatchdog = window.setTimeout(checkFinish, 600)
+      }
+      finishWatchdog = window.setTimeout(checkFinish, safariSpeechFallback ? Math.min(estimatedMs, 1200) : estimatedMs)
+    }
+
+    utterance.onstart = () => {
+      if (!isCurrentTTSSession(sessionId) || currentUtterance !== utterance) return
+      isSpeaking.value = true
+      isPaused.value = false
+      sawStart = true
+      systemTtsNativeEventsReliable.value = true
+      lastProgressAt = Date.now()
+      logTTS('system onstart', { sessionId, text: rawText.slice(0, 40) })
+      options.onStart?.()
+    }
+    utterance.onboundary = (event) => {
+      if (!isCurrentTTSSession(sessionId) || currentUtterance !== utterance) return
+      sawBoundary = true
+      lastProgressAt = Date.now()
+      const charIndex = Number.isFinite(event.charIndex) ? event.charIndex : 0
+      const progress = Math.max(0, Math.min(1, charIndex / Math.max(1, rawText.length)))
+      speechProgress.value = progress
+      options.onProgress?.(progress)
+    }
+    utterance.onend = () => {
+      logTTS('system onend', { sessionId, text: rawText.slice(0, 40) })
+      speechProgress.value = 1
+      options.onProgress?.(1)
+      finalizePlayback('end')
+    }
+    utterance.onerror = (event) => {
+      const interrupted = event.error === 'interrupted' || event.error === 'canceled'
+      logTTS('system onerror', { sessionId, error: event.error, interrupted, text: rawText.slice(0, 40) })
+      finalizePlayback(interrupted ? 'interrupted' : 'error', event)
+    }
+
+    synth.speak(utterance)
+    logTTS('system speak invoked', {
+      sessionId,
+      speaking: synth.speaking,
+      pending: synth.pending,
+      text: rawText.slice(0, 40),
+    })
+    scheduleFinishWatchdog()
+  }
+
+  async function startOpenAITTS(rawText: string, options: TTSOptions, sessionId: number) {
+    if (!openAISpeechConfigured.value) {
+      const error = new Error('请先配置 API 语音服务')
+      appStore.showToast(error.message, 'warning')
+      options.onError?.(error)
+      return
+    }
+
+    isSpeechLoading.value = true
+    speechProgress.value = 0
+    options.onProgress?.(0)
+    logTTS('openai speak queued', {
+      sessionId,
+      model: speechConfig.openaiModel,
+      voice: speechConfig.openaiVoice,
+      text: rawText.slice(0, 80),
+    })
+    const playBlob = (blob: Blob, controller: AbortController) => {
+      if (controller.signal.aborted) return
+      if (!isCurrentTTSSession(sessionId)) return
+      isSpeechLoading.value = false
+      currentOpenAIAudioUrl = URL.createObjectURL(blob)
+      const audio = new Audio(currentOpenAIAudioUrl)
+      currentOpenAIAudio = audio
+      currentOpenAIAbortController = null
+
+      const updateProgress = () => {
+        if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
+        if (!Number.isFinite(audio.duration) || audio.duration <= 0) return
+        const progress = Math.max(0, Math.min(1, audio.currentTime / audio.duration))
+        speechProgress.value = progress
+        options.onProgress?.(progress)
+      }
+
+      audio.onplay = () => {
+        if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
+        isSpeaking.value = true
+        isPaused.value = false
+        logTTS('openai onplay', { sessionId, text: rawText.slice(0, 40) })
+        options.onStart?.()
+      }
+
+      audio.onpause = () => {
+        if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
+        if (!audio.ended) {
+          isPaused.value = true
+          isSpeaking.value = true
+        }
+      }
+
+      audio.onloadedmetadata = updateProgress
+      audio.ontimeupdate = updateProgress
+
+      audio.onended = () => {
+        if (currentOpenAIAudio === audio) {
+          currentOpenAIAudio = null
+        }
+        if (!isCurrentTTSSession(sessionId)) return
+        speechProgress.value = 1
+        options.onProgress?.(1)
+        isSpeaking.value = false
+        isPaused.value = false
+        logTTS('openai onended', { sessionId, text: rawText.slice(0, 40) })
+        if (currentOpenAIAudioUrl) {
+          URL.revokeObjectURL(currentOpenAIAudioUrl)
+          currentOpenAIAudioUrl = ''
+        }
+        options.onEnd?.()
+      }
+
+      audio.onerror = () => {
+        if (currentOpenAIAudio === audio) {
+          currentOpenAIAudio = null
+        }
+        if (!isCurrentTTSSession(sessionId)) return
+        isSpeaking.value = false
+        isPaused.value = false
+        const error = new Error('API 语音音频播放失败')
+        logTTS('openai onerror', { sessionId, text: rawText.slice(0, 40) })
+        options.onError?.(error)
+      }
+
+      return audio.play().catch((error: Error) => {
+        if (!isCurrentTTSSession(sessionId)) return
+        isSpeechLoading.value = false
+        isSpeaking.value = false
+        isPaused.value = false
+        currentOpenAIAudio = null
+        logTTS('openai play catch', { sessionId, message: error.message, text: rawText.slice(0, 40) })
+        options.onError?.(error)
+      })
+    }
+
+    const controller = new AbortController()
+    currentOpenAIAbortController = controller
+
+    const key = buildOpenAIAudioCacheKey(rawText)
+    const cached = preloadedOpenAIAudio.value.find((entry) => entry.key === key)
+    if (cached) {
+      void Promise.resolve(playBlob(cached.blob, controller))
+      return
+    }
+
+    const inFlight = inFlightOpenAIAudioRequests.get(key)
+    if (inFlight) {
+      void inFlight.then((blob) => {
+        return playBlob(blob, controller)
+      }).catch((error: Error) => {
+        if (controller.signal.aborted || !isCurrentTTSSession(sessionId)) return
+        isSpeechLoading.value = false
+        isSpeaking.value = false
+        isPaused.value = false
+        currentOpenAIAbortController = null
+        currentOpenAIAudio = null
+        logTTS('openai inflight catch', { sessionId, message: error.message, text: rawText.slice(0, 40) })
+        options.onError?.(error)
+      })
+      return
+    }
+
+    const started = getOrStartOpenAIAudioRequest(rawText, controller.signal)
+    void started.promise.then((blob) => {
+      return playBlob(blob, controller)
+    }).catch((error: Error) => {
+      if (controller.signal.aborted || !isCurrentTTSSession(sessionId)) return
+      isSpeechLoading.value = false
+      isSpeaking.value = false
+      isPaused.value = false
+      currentOpenAIAbortController = null
+      currentOpenAIAudio = null
+      logTTS('openai request catch', { sessionId, message: error.message, text: rawText.slice(0, 40) })
+      appStore.showToast(error.message || 'API 语音请求失败', 'error')
+      options.onError?.(error)
+    })
+  }
+
+  function startTTS(text?: string, options: TTSOptions = {}, interruptCurrent = true) {
+    const hasActiveSystemSpeech = !!synth && (synth.speaking || synth.pending || !!currentUtterance)
+    const hasActiveOpenAISpeech = !!currentOpenAIAudio || !!currentOpenAIAbortController
+
+    if (interruptCurrent && (hasActiveSystemSpeech || hasActiveOpenAISpeech || isSpeaking.value || isSpeechLoading.value)) {
+      stopTTS(false)
+    }
+
+    const rawText = (text || content.value.replace(/<[^>]+>/g, '')).trim()
+    if (!rawText) return
+
+    const sessionId = beginTTSSession()
+    logTTS('startTTS', {
+      sessionId,
+      provider: speechConfig.provider,
+      interruptCurrent,
+      text: rawText.slice(0, 80),
+    })
+
+    if (
+      !interruptCurrent &&
+      speechConfig.provider === 'system' &&
+      synth &&
+      !synth.speaking &&
+      isSafariSpeechFallbackMode() &&
+      !systemTtsNativeEventsReliable.value
+    ) {
+      try {
+        logTTS('startTTS cleanup idle system synth', { sessionId })
+        synth.cancel()
+      } catch {
+        // ignore platform-specific cancel errors
+      }
+    }
+
+    if (speechConfig.provider === 'openai') {
+      void startOpenAITTS(rawText, options, sessionId)
+      return
+    }
+
+    startSystemTTS(rawText, options, sessionId)
+  }
+
+  function pauseTTS() {
+    if (speechConfig.provider === 'openai') {
+      if (!currentOpenAIAudio) return
+      if (currentOpenAIAudio.paused) {
+        const audio = currentOpenAIAudio
+        void audio.play().catch((error: Error) => {
+          if (currentOpenAIAudio !== audio) return
+          isPaused.value = true
+          isSpeaking.value = true
+          appStore.showToast(error.message || '恢复播放失败', 'error')
+        })
+      } else {
+        currentOpenAIAudio.pause()
+        isPaused.value = true
+        isSpeaking.value = true
+      }
+      return
+    }
+
+    if (!synth) return
+    if (synth.speaking && !synth.paused) {
+      synth.pause()
+      isPaused.value = true
+    } else if (synth.paused) {
+      synth.resume()
+      isPaused.value = false
+    }
+  }
+
+  function stopTTS(resetCallbacks = true) {
+    const sessionId = beginTTSSession()
+    logTTS('stopTTS', {
+      sessionId,
+      resetCallbacks,
+      provider: speechConfig.provider,
+      caller: captureTTSCaller(),
+    })
+    if (synth) {
+      synth.cancel()
+      currentUtterance = null
+    }
+    stopOpenAIAudioPlayback()
+    isSpeechLoading.value = false
+    isSpeaking.value = false
+    isPaused.value = false
+    speechProgress.value = 0
+    if (resetCallbacks) {
+      clearSpeechStopTimer()
+    }
+  }
+
+  /* ─── Book / chapter ops ─── */
+  async function loadBook(b: Book, syncProgress = true) {
+    loading.value = true
+    const requestId = ++bookLoadRequestId
+    chapterLoadRequestId += 1
+    pendingLegadoProgress.value = null
+    legadoPositionRestore.value = null
+    legadoPositionRestoreCompleted.value = null
+    // 返回主页再打开同一本书时，当前会话的正文预载仍然有效。此前无条件
+    // clear() 会让已缓存的章节也重新走一遍 loadChapter 加载态。
+    if (book.value?.bookUrl !== b.bookUrl) {
+      preloadedContent.value.clear()
+      preloadingContent.clear()
+    }
+    chapterPreloadGeneration += 1
+    book.value = b
+    snapshotOpenPosition(b)
+    appStore.setReadingSessionBook(b.bookUrl, b.name)
+    chapters.value = []
+    content.value = ''
+    appStore.markBookOpened(b.bookUrl)
+    currentIndex.value = b.durChapterIndex || 0
+    const localPosition = readSavedReadingPosition(b.bookUrl)
+    chapterScrollProgress.value = localPosition?.chapterIndex === currentIndex.value
+      ? localPosition.progress
+      : decodeServerProgress(b.durChapterPos)
+    loadReadChapterHistory(b)
+    progressDirty.value = false
+    lastServerProgressKey.value = ''
+    chaptersLoading.value = true
+    try {
+      let tocUrl = b.tocUrl
+      if (!tocUrl && !isLocalBook(b)) {
+        // 搜索结果还没有详情；取回书源脚本设置的每书配置，再用详情中的目录地址加载。
+        const detail = await getBookInfo(b.bookUrl, b.origin).catch(() => null)
+        if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
+        if (detail) {
+          tocUrl = detail.tocUrl || tocUrl
+          book.value = {
+            ...b,
+            tocUrl,
+            readConfig: detail.readConfig
+              ? { ...b.readConfig, ...detail.readConfig }
+              : b.readConfig,
+          }
+        }
+      }
+      // 先取初始章正文并恢复手机端进度，再设置当前章节，
+      // 避免 setActiveChapterState 更新阅读时间后遮蔽手机端进度。
+      const chapterList = await getChapterList({
+        bookUrl: b.bookUrl,
+        bookSourceUrl: b.origin,
+        tocUrl,
+      })
+      if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
+      chapters.value = chapterList
+
+      const initialIndex = chapters.value.length
+        ? Math.max(0, Math.min(chapters.value.length - 1, currentIndex.value))
+        : 0
+      currentIndex.value = initialIndex
+      if (!chapters.value.length) throw new Error('目录为空，无法加载正文')
+      await loadChapter(
+        initialIndex,
+        false,
+        localPosition?.chapterIndex === initialIndex ? localPosition.progress : undefined,
+      )
+      if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
+      if (syncProgress) {
+        await restoreCurrentBookProgressFromLegado(undefined, b.bookUrl, requestId)
+          .catch((error) => {
+            appStore.showToast((error as Error).message || '读取网盘阅读进度失败', 'warning')
+          })
+      }
+      if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
+      saveReaderSession()
+      // 打开书后台静默检查目录更新(按书 30 分钟节流), 不阻塞首屏渲染
+      void refreshTocFromSource()
+    } catch (error) {
+      loading.value = false
+      throw error
+    } finally {
+      if (requestId === bookLoadRequestId) {
+        chaptersLoading.value = false
+      }
+    }
+  }
+
+  function setActiveChapterState(index: number, chapterContent: string, progress = 0) {
+    content.value = chapterContent
+    currentIndex.value = index
+    chapterScrollProgress.value = Math.max(0, Math.min(1, progress))
+    if (book.value) {
+      book.value.durChapterIndex = index
+      book.value.durChapterTitle = chapters.value[index]?.title || book.value.durChapterTitle
+      book.value.durChapterTime = Date.now()
+      const shelfBook = shelfStore.books.find((item) => item.bookUrl === book.value?.bookUrl)
+      if (shelfBook) {
+        shelfBook.durChapterIndex = book.value.durChapterIndex
+        shelfBook.durChapterTitle = book.value.durChapterTitle
+        shelfBook.durChapterTime = book.value.durChapterTime
+      }
+    }
+    syncLocalBookProgress(chapterScrollProgress.value)
+    if (book.value) {
+      saveRecentReadBook(book.value)
+    }
+    localStorage.setItem('reader-currentIndex', String(index))
+    saveReaderSession()
+    markProgressDirty()
+  }
+
+  async function persistProgress(index = currentIndex.value, progress = chapterScrollProgress.value) {
+    const payload = currentServerProgressPayload(index, progress)
+    if (!payload) return
+    await saveBookProgress(payload).then(() => {
+      progressDirty.value = false
+      lastServerProgressKey.value = `${payload.bookUrl}::${payload.index}::${payload.position}`
+    }).catch(() => undefined)
+  }
+
+  async function flushProgressToServer(force = false) {
+    const payload = currentServerProgressPayload()
+    if (!payload) return
+    const nextKey = `${payload.bookUrl}::${payload.index}::${payload.position}`
+    if (!force && !progressDirty.value && lastServerProgressKey.value === nextKey) return
+    await persistProgress(payload.index, chapterScrollProgress.value)
+  }
+
+  function flushProgressToServerKeepalive(force = false): Promise<void> {
+    const payload = currentServerProgressPayload()
+    if (!payload) return Promise.resolve()
+    const nextKey = `${payload.bookUrl}::${payload.index}::${payload.position}`
+    if (!force && !progressDirty.value && lastServerProgressKey.value === nextKey) return Promise.resolve()
+
+    progressDirty.value = false
+    lastServerProgressKey.value = nextKey
+    return invokeRaw('save_book_progress', { req: payload })
+      .then(() => undefined)
+      .catch(() => undefined)
+  }
+
+  /**
+   * 预载缓存容量。
+   *
+   * 必须容纳「当前章 + 后两章 + 上一章」(预载一批最多 3 章, 加上 loadChapter 自己
+   * 要缓存的当前章共 4 个)再留一格余量。容量只有 3 时每写入一次就必然淘汰一个,
+   * 而淘汰按插入序进行 —— 最早插入的往往正是**下一章**, 于是用户翻页那一刻缓存
+   * 刚好被挤掉, 又得重新请求, 表现就是"开了预加载还是有加载动画"。
+   */
+  const PRELOAD_CACHE_LIMIT = 5
+
+  /**
+   * 写入缓存并按 LRU 淘汰。
+   *
+   * 用插入序而不是"离当前章的距离"来决定淘汰: 预载是**成批**写入的(一次 1~3 章),
+   * 按距离排序会把刚写进来的相邻章判成"远处"当场淘汰, 等于白写。插入序天然保护
+   * 了最近写入的整批。
+   *
+   * 当前章(`currentIndex`)永不淘汰。连续阅读/预载远端批次时, 用户正在读的那一章
+   * 可能长时间没有再次写入而沦为"最久未用", 被后续预载挤出去 —— 而字号调整、
+   * 窗口 resize、原地刷新都要重新取它, 一挤掉就又是一次网络请求。
+   */
+  function cachePreloadedContent(index: number, chapterContent: string) {
+    preloadedContent.value.set(index, chapterContent)
+    if (preloadedContent.value.size <= PRELOAD_CACHE_LIMIT) return
+
+    const reading = currentIndex.value
+    while (preloadedContent.value.size > PRELOAD_CACHE_LIMIT) {
+      // 本次刚写入的章节是这次访问的直接结果, 与当前章一并保留。
+      const oldestKey = Array.from(preloadedContent.value.keys())
+        .find((key) => key !== index && key !== reading)
+      if (oldestKey === undefined) break
+      preloadedContent.value.delete(oldestKey)
+    }
+  }
+
+  /**
+   * 把已在缓存里的章节标记为"刚刚用过"。
+   *
+   * Map 的 set 对已存在的键不会改变插入序, 所以命中缓存必须显式 delete + set 才能
+   * 移到队尾。缺了这一步, 一路预载下游会把**用户正在读的这一章**当成最久未用淘汰掉,
+   * 回看或重排时又得重新请求。
+   */
+  function touchPreloadedContent(index: number) {
+    const cached = preloadedContent.value.get(index)
+    if (cached === undefined) return
+    preloadedContent.value.delete(index)
+    preloadedContent.value.set(index, cached)
+  }
+
+  async function fetchChapterContent(index: number, forceRefresh = false, reportStage = false) {
+    if (!book.value || !chapters.value[index]) return null
+
+    // 命中已预加载内容 / 在途的预加载请求时都不会发请求，也就没有阶段可言。
+    // 这两个提前返回必须发生在设置 stage **之前**：否则设了提示却走不到 finally，
+    // 提示会永久卡在「正在获取章节…」。
+    if (!forceRefresh && preloadedContent.value.has(index)) {
+      touchPreloadedContent(index)
+      return preloadedContent.value.get(index) || null
+    }
+
+    if (!forceRefresh) {
+      const pending = preloadingContent.get(index)
+      if (pending) return pending
+    }
+
+    const chapter = chapters.value[index]
+    // 本次请求发起时的代次。换书/关闭预载会递增它, 迟到的响应据此放弃写缓存。
+    const generation = chapterPreloadGeneration
+
+    // 立即给出可见反馈，不等后端的阶段事件到达（否则跳章后会有一段"无响应"观感，
+    // 用户会以为点了没反应）。后端事件随后把阶段细化成 parsing / caching。
+    // 用「所有者令牌」登记：并发加载时只有最后登记的那次能清掉提示。
+    let ownsStage = false
+    if (reportStage) {
+      loadStage.value = 'fetching'
+      chapterStageOwner = ++chapterStageSeq
+      ownsStage = true
+    }
+    const stageOwner = chapterStageOwner
+
+    try {
+      const chapterContent = await getBookContent({
+        bookUrl: book.value.bookUrl,
+        chapterUrl: chapter.url,
+        bookSourceUrl: book.value.origin,
+        refresh: forceRefresh ? 1 : 0,
+        // 只有仍持有提示的那次加载才能更新阶段（并发加载时避免互相覆盖）
+        onStage: reportStage
+          ? (stage) => {
+              if (chapterStageOwner === stageOwner) loadStage.value = stage
+            }
+          : undefined,
+      })
+      if (typeof chapterContent !== 'string') {
+        throw new Error('书源返回的正文格式无效')
+      }
+      if (!chapterContent.trim()) {
+        throw new Error('书源正文解析为空，请检查正文规则')
+      }
+      // 任何拿到正文的路径都入缓存, 而不是只由 loadChapter 回写。
+      // 连续阅读的正文是经 buildContinuousChapter 走这条路径取的, 只在 loadChapter
+      // 里写缓存会让连续模式每滚过一次都要重新请求同一个章节。
+      if (generation === chapterPreloadGeneration) {
+        cachePreloadedContent(index, chapterContent)
+      }
+      return chapterContent
+    } catch (error) {
+      if (!appStore.isOnline) {
+        throw new Error('当前处于离线状态，未缓存章节无法打开')
+      }
+      throw error
+    } finally {
+      // 只清自己登记的提示：并发加载时旧请求不能清掉新章节的提示，
+      // 也不能用 requestId 判断（连续阅读/跳章不走 loadChapter，requestId 不变，
+      // 会让提示永久卡住）。
+      if (ownsStage && chapterStageOwner === stageOwner) loadStage.value = ''
+    }
+  }
+
+  async function loadChapter(
+    index: number,
+    forceRefresh = false,
+    initialProgressOverride?: number,
+  ) {
+    if (!book.value || !chapters.value[index]) return
+
+    if (legadoPositionRestoreCompleted.value?.index !== index) {
+      legadoPositionRestoreCompleted.value = null
+    }
+
+    const requestId = ++chapterLoadRequestId
+    const bookUrl = book.value.bookUrl
+
+    const cachedContent = !forceRefresh ? preloadedContent.value.get(index) : undefined
+    // 在途的预载请求同样算命中。fetchChapterContent 本来就能复用它、不会重复发请求,
+    // 但那次复用发生在 loading 赋值**之后** —— 只看已完成缓存的话, 预载已发出而尚未
+    // 返回时翻章会先闪一次全屏加载动画, 再被同一份正文瞬间替换掉。
+    const pendingPreload = cachedContent === undefined && !forceRefresh
+      ? preloadingContent.get(index)
+      : undefined
+    loading.value = cachedContent === undefined && pendingPreload === undefined
+    // 复用在途预载时同样不亮动画(否则就是那次闪烁), 但书源很慢的话用户会以为
+    // 翻页没反应。改成延迟兜底: 200ms 内返回就完全不显示动画, 超过才亮出来。
+    // 这个定时器只在"等一份已经在路上的正文"时存在, 与 loading 互斥。
+    let pendingIndicatorTimer: number | null = null
+    if (cachedContent === undefined && pendingPreload !== undefined) {
+      pendingIndicatorTimer = window.setTimeout(() => {
+        pendingIndicatorTimer = null
+        if (requestId === chapterLoadRequestId) loading.value = true
+      }, CHAPTER_LOADING_INDICATOR_DELAY_MS)
+    }
+    try {
+      let chapterContent = cachedContent !== undefined
+        ? cachedContent
+        : await fetchChapterContent(index, forceRefresh, true)
+      if (chapterContent == null && pendingPreload) {
+        // 复用的在途预载失败了(preloadNextChapter 把错误吞成 null)。这里必须补一次
+        // 真实请求: 否则用户只会看到"翻到下一章什么也没发生", 连错误提示都没有。
+        // 补请求期间必须亮出加载态 —— 这次是真的要等网络了。
+        if (pendingIndicatorTimer !== null) {
+          clearTimeout(pendingIndicatorTimer)
+          pendingIndicatorTimer = null
+        }
+        if (requestId === chapterLoadRequestId) loading.value = true
+        chapterContent = await fetchChapterContent(index, forceRefresh, true)
+      }
+      if (chapterContent == null) return
+      if (requestId !== chapterLoadRequestId || book.value?.bookUrl !== bookUrl) return
+
+      const previousSavedIndex = book.value.durChapterIndex ?? 0
+      const previousSavedProgress = decodeServerProgress(book.value.durChapterPos)
+      const isOpeningSavedChapter = !forceRefresh && index === previousSavedIndex
+      const pendingRemoteProgress = pendingLegadoProgress.value?.index === index
+        ? pendingLegadoProgress.value
+        : null
+      const cloudProgress = pendingRemoteProgress
+        ? Math.max(0, Math.min(1, pendingRemoteProgress.position
+          / Math.max(1, chapterContent.replace(/<[^>]+>/g, '').length)))
+        : null
+      const initialProgress = initialProgressOverride
+        ?? cloudProgress
+        ?? (isOpeningSavedChapter ? previousSavedProgress : 0)
+
+      cachePreloadedContent(index, chapterContent)
+      if (cloudProgress != null && book.value) {
+        snapshotOpenPosition({
+          ...book.value,
+          durChapterIndex: index,
+          durChapterPos: encodeServerProgress(cloudProgress),
+          durChapterTitle: chapters.value[index]?.title || book.value.durChapterTitle,
+        })
+      }
+      setActiveChapterState(index, chapterContent, initialProgress)
+      if (pendingRemoteProgress && cloudProgress != null) {
+        const existingRestore = legadoPositionRestore.value
+        legadoPositionRestore.value = {
+          index,
+          position: Math.max(0, pendingRemoteProgress.position),
+          progress: cloudProgress,
+          token: existingRestore?.index === index
+            && existingRestore.position === pendingRemoteProgress.position
+            ? existingRestore.token
+            : ++legadoPositionRestoreToken,
+          ready: true,
+        }
+        pendingLegadoProgress.value = null
+      }
+      markChapterAsRead(index)
+      appStore.markChapterRead(book.value.bookUrl, index, chapters.value.length)
+      loading.value = false
+
+      if (!isOpeningSavedChapter) {
+        void persistProgress(index, cloudProgress ?? 0)
+      }
+
+      if (config.enablePreload) {
+        void preloadAroundChapter(index)
+      }
+    } catch (error) {
+      // 章节加载失败必须让用户看到原因(如书源提示"VIP专属内容"、正文规则为空、
+      // 网络失败)。此前错误只向上抛: 目录/跳章的调用点没有 catch, 变成未处理
+      // 的 Promise 拒绝, 界面上什么提示都没有, 用户只觉得"点了没反应"。
+      if (requestId === chapterLoadRequestId) {
+        const message = error instanceof Error ? error.message : String(error ?? '')
+        appStore.showToast(message.trim() || '章节加载失败，请稍后重试', 'error')
+      }
+    } finally {
+      // 只收尾 loading：阶段提示由 fetchChapterContent 的持有者机制管理，
+      // 这里再清一次会误清连续模式下并发加载刚设置的提示。
+      if (pendingIndicatorTimer !== null) clearTimeout(pendingIndicatorTimer)
+      if (requestId === chapterLoadRequestId) loading.value = false
+    }
+  }
+
+  /**
+   * 同步探测某章是否已经"到手或马上到手"(已缓存或预载在途)。
+   *
+   * 给连续阅读判断要不要显示「正在加载下一章…」用: 命中预载时取正文只是一个
+   * 微任务, 提示却会被渲染出来闪一下 —— 那正是用户眼里"预加载没生效"的观感。
+   */
+  function isChapterReady(index: number) {
+    return preloadedContent.value.has(index) || preloadingContent.has(index)
+  }
+
+  /**
+   * 预载当前章周边。
+   *
+   * `options.forwardOnly` 用于「隐藏已读」形态: 身后章节会被立即裁掉, 预载它
+   * 既不会被读到、还要占一格缓存并把真正要用的下一章挤出去。
+   */
+  async function preloadAroundChapter(index: number, options: { forwardOnly?: boolean } = {}) {
+    if (!book.value || !config.enablePreload) return
+    const candidates = options.forwardOnly ? [index + 1, index + 2] : [index + 1, index + 2, index - 1]
+    const targets = candidates
+      .filter((target, pos, list) => target >= 0 && target < chapters.value.length && list.indexOf(target) === pos)
+    // 并发预载, 不等彼此
+    await Promise.allSettled(targets.map((target) => preloadNextChapter(target)))
+  }
+
+  async function preloadNextChapter(index: number) {
+    if (!book.value || !config.enablePreload || index < 0 || index >= chapters.value.length || preloadedContent.value.has(index)) return
+
+    const pending = preloadingContent.get(index)
+    if (pending) return pending
+
+    const generation = chapterPreloadGeneration
+    const bookUrl = book.value.bookUrl
+    let request: Promise<string | null>
+    request = fetchChapterContent(index)
+      .then((res) => {
+        if (res && generation === chapterPreloadGeneration && config.enablePreload && book.value?.bookUrl === bookUrl) {
+          cachePreloadedContent(index, res)
+        }
+        return res
+      })
+      .catch(() => null)
+      .finally(() => {
+        if (preloadingContent.get(index) === request) {
+          preloadingContent.delete(index)
+        }
+      })
+    preloadingContent.set(index, request)
+    return request
+  }
+
+  function normalizeChapterTitle(title?: string) {
+    return (title || '')
+      .replace(/\s+/g, '')
+      .replace(/[^\p{L}\p{N}]/gu, '')
+      .toLowerCase()
+  }
+
+  function resolveChapterIndexByTitle(list: BookChapter[], targetTitle?: string, fallbackIndex = 0) {
+    if (!list.length) return 0
+    const normalizedTarget = normalizeChapterTitle(targetTitle)
+    if (!normalizedTarget) {
+      return Math.max(0, Math.min(list.length - 1, fallbackIndex))
+    }
+
+    const exactIndex = list.findIndex((chapter) => normalizeChapterTitle(chapter.title) === normalizedTarget)
+    if (exactIndex >= 0) return exactIndex
+
+    const partialIndex = list.findIndex((chapter) => {
+      const title = normalizeChapterTitle(chapter.title)
+      return title.includes(normalizedTarget) || normalizedTarget.includes(title)
+    })
+    if (partialIndex >= 0) return partialIndex
+
+    return Math.max(0, Math.min(list.length - 1, fallbackIndex))
+  }
+
+  /* ─── Switch Source ─── */
+  async function switchSource(newUrl: string, sourceUrl: string) {
+    if (!book.value) return
+    const previousChapterTitle = currentChapter.value?.title || book.value.durChapterTitle
+    const previousIndex = currentIndex.value
+    const previousProgress = chapterScrollProgress.value
+    loading.value = true
+    try {
+      const updatedBook = await apiSetBookSource({
+        bookUrl: book.value.bookUrl,
+        newUrl,
+        bookSourceUrl: sourceUrl,
+        name: book.value.name,
+        author: book.value.author,
+        coverUrl: book.value.coverUrl,
+        intro: book.value.intro,
+        kind: book.value.kind,
+        latestChapterTitle: book.value.latestChapterTitle,
+        durChapterIndex: book.value.durChapterIndex,
+        durChapterTitle: book.value.durChapterTitle,
+        durChapterPos: book.value.durChapterPos,
+        durChapterTime: book.value.durChapterTime,
+      })
+      if (!updatedBook) return null
+
+      await loadBook(updatedBook, false)
+      const targetIndex = resolveChapterIndexByTitle(
+        chapters.value,
+        previousChapterTitle,
+        typeof updatedBook.durChapterIndex === 'number' ? updatedBook.durChapterIndex : previousIndex,
+      )
+      await loadChapter(targetIndex)
+      setChapterScrollProgress(previousProgress)
+      await shelfStore.fetchBooks().catch(() => undefined)
+      return updatedBook
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /**
+   * 重新抓取当前章正文。索引与章节内进度一律保持不变。
+   * refreshing 供阅读页区分「切章加载」与「原地刷新」: 连续阅读模式下后者
+   * 必须保留已渲染的章节列表, 否则容器内容塌缩会让 handleScroll 误判当前章。
+   */
+  async function refreshContent() {
+    if (!book.value || !chapters.value[currentIndex.value]) return
+    loading.value = true
+    refreshing.value = true
+    try {
+      const chapterContent = await fetchChapterContent(currentIndex.value, true, true)
+      if (chapterContent == null) return
+      setActiveChapterState(currentIndex.value, chapterContent, chapterScrollProgress.value)
+      contentRefreshToken.value += 1
+      void preloadAroundChapter(currentIndex.value)
+    } finally {
+      loading.value = false
+      refreshing.value = false
+    }
+  }
+
+  /* ─── 目录自动更新 ─── */
+  let tocCheckTimes: Record<string, number> | null = null
+  const tocRefreshInFlight = new Map<string, Promise<number>>()
+
+  function loadTocCheckTimes(): Record<string, number> {
+    if (tocCheckTimes) return tocCheckTimes
+    let parsed: Record<string, number> = {}
+    try {
+      const raw = localStorage.getItem(TOC_CHECK_TIMES_KEY)
+      const value = raw ? JSON.parse(raw) : {}
+      if (value && typeof value === 'object') parsed = value
+    } catch { /* 解析失败按空记录处理 */ }
+    tocCheckTimes = parsed
+    return parsed
+  }
+
+  function markTocChecked(bookUrl: string) {
+    const times = loadTocCheckTimes()
+    times[bookUrl] = Date.now()
+    const entries = Object.entries(times)
+    if (entries.length > TOC_CHECK_TIMES_LIMIT) {
+      const kept = entries.sort((a, b) => b[1] - a[1]).slice(0, TOC_CHECK_TIMES_LIMIT)
+      tocCheckTimes = Object.fromEntries(kept)
+    }
+    try {
+      localStorage.setItem(TOC_CHECK_TIMES_KEY, JSON.stringify(tocCheckTimes))
+    } catch { /* 存储写入失败时静默放弃节流记录 */ }
+  }
+
+  /** 强制重抓目录; 分页目录余下页由后端后台写入缓存, 轮询读取直到长度稳定。 */
+  async function fetchTocListWithStabilizing(): Promise<BookChapter[]> {
+    const b = book.value
+    if (!b) return []
+    const base = { bookUrl: b.bookUrl, bookSourceUrl: b.origin, tocUrl: b.tocUrl }
+    let list = await getChapterList({ ...base, refresh: 1 })
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (!list.length) break
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+      const cached = await getChapterList({ ...base })
+      if (cached.length <= list.length) break
+      list = cached
+    }
+    return list
+  }
+
+  async function performRefreshToc(minIntervalMs: number): Promise<number> {
+    const b = book.value
+    if (!b || isLocalBook(b) || !appStore.isOnline) return 0
+    const bookUrl = b.bookUrl
+    if (Date.now() - (loadTocCheckTimes()[bookUrl] || 0) < minIntervalMs) return 0
+    markTocChecked(bookUrl)
+    try {
+      const fresh = await fetchTocListWithStabilizing()
+      // 等待期间可能已切换书籍
+      if (book.value?.bookUrl !== bookUrl) return 0
+      const current = chapters.value
+      if (!current.length || fresh.length <= current.length) return 0
+      // 已有章节需完全对齐(末章 URL 一致)才静默替换, 避免源站目录重排错位阅读进度
+      if (fresh[current.length - 1]?.url !== current[current.length - 1]?.url) return 0
+      const added = fresh.length - current.length
+      chapters.value = fresh
+      saveReaderSession()
+      appStore.showToast(`目录已更新，新增 ${added} 章`, 'success')
+      return added
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * 后台静默刷新书源目录, 返回新增章节数(0 = 无更新/被节流/失败)。
+   * 打开书时按 TOC_OPEN_CHECK_INTERVAL_MS 节流; 读到末章再翻页时按更短间隔触发。
+   */
+  function refreshTocFromSource(minIntervalMs = TOC_OPEN_CHECK_INTERVAL_MS): Promise<number> {
+    const bookUrl = book.value?.bookUrl
+    if (!bookUrl) return Promise.resolve(0)
+    const existing = tocRefreshInFlight.get(bookUrl)
+    if (existing) return existing
+    const task = performRefreshToc(minIntervalMs).finally(() => {
+      if (tocRefreshInFlight.get(bookUrl) === task) tocRefreshInFlight.delete(bookUrl)
+    })
+    tocRefreshInFlight.set(bookUrl, task)
+    return task
+  }
+
+  async function refreshChapters() {
+    if (!book.value) return
+    chaptersLoading.value = true
+    try {
+      preloadedContent.value.clear()
+      preloadingContent.clear()
+      chapterPreloadGeneration += 1
+      markTocChecked(book.value.bookUrl)
+      chapters.value = await fetchTocListWithStabilizing()
+      const targetIndex = Math.max(0, Math.min(chapters.value.length - 1, currentIndex.value))
+      if (chapters.value[targetIndex]) {
+        await loadChapter(targetIndex, true)
+      }
+    } finally {
+      chaptersLoading.value = false
+    }
+  }
+
+  function setChapterScrollProgress(value: number) {
+    chapterScrollProgress.value = Math.max(0, Math.min(1, value))
+    syncLocalBookProgress(chapterScrollProgress.value)
+    // 高频路径(每次滚动事件): 只写轻量进度, 不序列化整份目录。
+    saveReaderProgress()
+    markProgressDirty()
+  }
+
+  async function nextChapter() {
+    if (hasNext.value) {
+      await loadChapter(currentIndex.value + 1)
+    }
+  }
+
+  async function prevChapter() {
+    if (hasPrev.value) {
+      await loadChapter(currentIndex.value - 1)
+    }
+  }
+
+  /* ─── Replace Rules ─── */
+  /** 拉取替换规则。返回是否成功 —— 失败时调用方需要知道"本地状态不可信",
+   *  例如开关失败后要靠这次拉取恢复真实值, 静默吞错会让 UI 停在错误状态。 */
+  async function fetchReplaceRules(): Promise<boolean> {
+    try {
+      replaceRules.value = await getReplaceRules()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /* ─── Bookmarks ─── */
+  async function fetchBookmarks() {
+    try {
+      const all = await getBookmarks()
+      // Filter for current book
+      if (book.value) {
+        bookmarks.value = all.filter(b => b.bookName === book.value?.name && b.bookAuthor === book.value?.author)
+      } else {
+        bookmarks.value = all
+      }
+    } catch { /* ignore */ }
+  }
+
+  async function addBookmark(pos: number = 0, snippet: string = '') {
+    if (!book.value || !currentChapter.value) return
+    const b: Bookmark = {
+      bookName: book.value.name,
+      bookAuthor: book.value.author,
+      chapterIndex: currentIndex.value,
+      chapterName: currentChapter.value.title,
+      chapterPos: pos,
+      bookText: snippet || content.value.slice(0, 50).replace(/<[^>]+>/g, ''),
+      time: Date.now(),
+      content: '',
+    }
+    await saveBookmark(b)
+    await fetchBookmarks()
+  }
+
+  async function removeBookmark(b: Bookmark) {
+    await apiDeleteBookmark(b)
+    await fetchBookmarks()
+  }
+
+  async function removeBookmarks(items: Bookmark[]) {
+    if (!items.length) return
+    await apiDeleteBookmarks(items)
+    await fetchBookmarks()
+  }
+
+  function clear() {
+    bookLoadRequestId += 1
+    chapterLoadRequestId += 1
+    restoringLegadoProgress.value = false
+    legadoPositionRestore.value = null
+    legadoPositionRestoreCompleted.value = null
+    book.value = null
+    openPosition.value = null
+    refreshing.value = false
+    // 作废在飞请求的阶段提示持有者: 只清空 loadStage 的话, 旧请求后续的
+    // onStage 回调仍持有所有权, 会把浮层重新点亮。
+    chapterStageOwner = ++chapterStageSeq
+    loadStage.value = ''
+    contentRefreshToken.value = 0
+    chapters.value = []
+    content.value = ''
+    currentIndex.value = 0
+    chapterScrollProgress.value = 0
+    preloadedContent.value.clear()
+    preloadingContent.clear()
+    chapterPreloadGeneration += 1
+    readChapterKeys.value = new Set()
+    stopAutoReading()
+  }
+
+  /* ─── Panel visibility ─── */
+  const activePanel = ref<ReaderPanel>(null)
+  const panelParent = ref<ReaderPanel>(null)
+
+  function openPanel(panel: ReaderPanel, parent: ReaderPanel = null) {
+    activePanel.value = panel
+    panelParent.value = parent
+  }
+
+  function togglePanel(panel: ReaderPanel, parent: ReaderPanel = null) {
+    if (activePanel.value === panel) {
+      closePanel()
+      return
+    }
+    openPanel(panel, parent)
+  }
+
+  function backPanel() {
+    if (panelParent.value) {
+      activePanel.value = panelParent.value
+      panelParent.value = null
+      return
+    }
+    activePanel.value = null
+  }
+
+  function closePanel() {
+    activePanel.value = null
+    panelParent.value = null
+  }
+
+  return {
+    book, chapters, currentIndex, content, loading, loadStage, refreshing, contentRefreshToken, chaptersLoading, openPosition, restoringLegadoProgress,
+    legadoPositionRestore,
+    legadoPositionRestoreCompleted,
+    currentChapter, hasNext, hasPrev, readingProgress,
+      loadBook, loadChapter, fetchChapterContent, setActiveChapterState, refreshContent, nextChapter, prevChapter, clear,
+      chapterScrollProgress, setChapterScrollProgress,
+      getPersistedReaderSession, restorePersistedSession, syncCurrentBookProgressToLegado,
+      saveReaderProgress, readReaderProgress,
+      restoreCurrentBookProgressFromLegado, uploadCurrentBookProgressToLegado,
+      syncCurrentBookProgressFromLegadoOnExit,
+      clearLegadoPositionRestore,
+      consumeLegadoPositionRestoreCompleted,
+      persistProgress, flushProgressToServer, flushProgressToServerKeepalive,
+      config, updateConfig, resetConfig, saveConfig, setBackgroundImage, clearBackgroundImage,
+      setReaderBackgroundImage, clearReaderBackgroundImage,
+      customFonts, fetchCustomFonts, importCustomFont, removeCustomFont, customFontFamily,
+    themeIndex, isNight, currentTheme, chromeTheme, readerTheme, readerBackgroundColor, setThemeIndex, toggleNight,
+    autoReading, autoReadingTimer, toggleAutoReading, stopAutoReading,
+    activePanel, openPanel, togglePanel, backPanel, closePanel,
+    bookmarks, fetchBookmarks, addBookmark, removeBookmark, removeBookmarks,
+    readChapterKeys, isChapterRead, markChapterAsRead,
+    replaceRules, fetchReplaceRules,
+    switchSource, preloadNextChapter, preloadAroundChapter, isChapterReady,
+    refreshChapters, refreshTocFromSource,
+    isSpeaking, isSpeechLoading, isPaused, speechProgress, startTTS, pauseTTS, stopTTS,
+    voiceList, speechConfig, speechStopAt, speechProviderLabel, openAISpeechConfigured,
+    systemTtsNativeEventsReliable, systemSpeechSupported,
+    fetchVoices, setVoiceName, setSpeechProvider, setSpeechRate, setSpeechPitch, setSpeechStopTimer, clearSpeechStopTimer,
+    setOpenAISpeechSource, setSpeechApiFormat, setOpenAISpeechBaseUrl, setSpeechProxyUrl, setOpenAISpeechApiKey, setOpenAISpeechModel, setOpenAISpeechVoice, setOpenAISpeechFormat, setOpenAISpeechRequestMode, preloadOpenAITTS,
+    displayContent, processContentForDisplay,
+    isAutoScrolling,
+    readerControlsVisible,
+    hotkeyBindings, hotkeyActions, hotkeysAreDefault, setHotkeyBinding, resetHotkeyBindings,
+    bindHotkeyKey, unbindHotkeyKey, hotkeyConflicts,
+  }
+})

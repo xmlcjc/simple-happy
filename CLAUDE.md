@@ -1,0 +1,79 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build and Run Commands
+
+### Rust 库（reader-rust）
+
+```bash
+cargo test -j 4        # 单测 + 集成测试。必须低并发，见下方「杀软并发竞态」
+cargo test --lib -j 4  # 只跑库单测
+cargo build -p reader-desktop -j 4   # 编译桌面壳（debug）
+```
+
+### Web Frontend (Vue 3)
+
+```bash
+cd frontend
+npm install            # 安装依赖（含 @tauri-apps/api）
+npm run dev            # Vite dev server（仅配合 tauri dev 使用）
+npm run build          # vue-tsc 类型检查 + 生产构建 → dist/
+npm test               # vitest 单测
+```
+
+### Desktop App (Tauri, Windows only)
+
+```bash
+cd desktop
+npm install
+npm run dev            # tauri dev：Vite HMR + 桌面窗口，数据在 desktop/.dev-data/
+npm run build          # 便携包 zip 在 desktop/dist/
+npm run icon           # 仅重新生成图标；图标已提交
+```
+
+## 架构（纯单机桌面，无 HTTP 服务端）
+
+reader-rust 是「阅读3.0」的 Rust 实现，当前形态为 **Tauri v2 桌面应用**：无 axum、无 Docker、无多用户。前端与后端同进程，通过 IPC 通信。
+
+### 模块结构
+
+- **`src/api/commands/`** — 全部 `#[tauri::command]`（原 axum handler 原地转型）。返回 `Result<ApiResponse<T>, AppError>` 信封。
+- **`src/api/protocol.rs`** — 自定义 URI 协议 `reader`（origin `http://reader.localhost`）：`/cover`、`/epub`、`/pdf`、`/files`、`/bookSourceProxy`（登录代理 HTML 重写）、`/bookSourceClientLog`。
+- **`src/api/mod.rs`** — `AppState`（10 个 Arc service）+ `invoke_handler()` 聚合注册所有 command。
+- **`src/service/`** — 业务逻辑（book / book_source / book_group / local_txt / local_epub / json_document / ai_book / ai_model / update / user）。
+- **`src/parser/`** — 内容提取引擎（CSS/XPath/JSONPath/Regex/JS 模式自动识别）。
+- **`src/crawler/`** — reqwest HTTP 抓取 + URL 分析。
+- **`src/storage/`** — SQLite（sqlx + migrations）、文件缓存、存储目录。
+- **`src/error/error.rs`** — `ApiResponse<T>` 信封 + `AppError`（自定义 `Serialize`，序列化为消息字符串，供 Tauri reject）。
+- **`desktop/src-tauri/`** — Tauri 壳：窗口、`reader` 协议注册、便携数据目录解析、WebView2 预检、单实例。
+
+### 前后端契约
+
+- 前端 `frontend/src/api/invoke.ts` 将旧 `/reader3/*` 路径映射到 command 名，解包 `{isSuccess, errorMsg, data}`；`get/post` 返回 `{data}` 形状（保留原 axios 调用模式）。
+- SSE 流（多源搜索/缓存进度/可用源探测/书源调试）走 `tauri::ipc::Channel`，前端 `api/sse.ts` 的 `openSse()` 提供 EventSource 兼容表面；payload 含 `event: "data"|"end"|"error"` 判别字段。
+- 二进制响应（`ai_proxy`/`ai_proxy_image`/`get_webdav_file`）返回 `{status, contentType, body: Vec<u8>}`，前端重建 DOM `Response`。上传传 `Uint8Array`/`Vec<u8>`（类型化数组，绝不 JSON 数字数组）。
+- command 参数默认 camelCase 匹配（Rust `on_event` ↔ JS `onEvent`）。
+- 单用户：无登录/鉴权，全部数据在 `"default"` 命名空间。
+
+### 书源格式
+
+书源是 JSON 对象：`bookSourceUrl`/`bookSourceName`/`searchUrl`/`exploreUrl` + `ruleSearch`/`ruleBookInfo`/`ruleToc`/`ruleContent` 规则。规则前缀：`@css:`/`@json:`/`@xpath:`/`@regex:`/`js:`（rquickjs 沙盒执行）。
+
+## 已知注意事项
+
+- **杀软并发编译竞态**：Windows 杀软实时扫描与 cargo 并行写 `.rlib` 冲突（随机 `invalid metadata files` / `link.exe 0xC000012D`）。**构建和测试务必用 `-j 4` 或更低并发**。建议给 `target/` 加 Defender 排除。
+- **`toml` 版本钉在 0.8.2**：共享 lockfile 因 `tauri -> gtk -> proc-macro-crate` 约束无法升级。无害（`config` 只用 Environment source，运行时从不解析 TOML）。不要尝试修复。
+- **`pdf-extract` 是 vendor 副本**（`vendor/pdf-extract`，经 `[patch.crates-io]` 接线），三处改动，都别退回上游行为：
+  - **中文 CMap**：上游遇到无 ToUnicode 的 `GBK-EUC-H` 等 Type0 编码会 panic、嵌入式 GB CMap 的分段 `begincidrange` 解析失败。副本加了「恒等字节映射 + `encoding_rs` 逐码位解码伪 ToUnicode 表」的降级路径。
+  - **字体缓存键**：上游按资源名（`F1`）缓存字体，而资源名只在单页内唯一 —— 一个 `Processor` 跨页复用时会串字体，表现为大段文字凭空消失。副本改为按字体对象 id 缓存。
+  - **`extract_text_for_page_ids`**：按显式页对象 id 提取并**共享一个 `Processor`**。上游的逐页接口每页重建解析器，1318 页中文书要 70s+；共享后同样内容 1.4s（字节级一致，已逐页比对验证）。
+- **`tao` 也是 vendor 副本**（`vendor/tao`，同样经 `[patch.crates-io]` 接线），只有**一处**改动，别退回上游行为：
+  - **`WM_NCCALCSIZE` 的 work-area 钳制**：`src/platform_impl/windows/event_loop.rs` 里 `util::is_maximized(window)` 那个判断加了 `&& !is_fullscreen`（上游 [tauri-apps/tao#1353](https://github.com/tauri-apps/tao/pull/1353)，2026-09-30 合并，但**尚未随任何 release 发布** —— 最新的 `tao-v0.37.1` 是 09-26，早于该合并）。
+  - **症状**：无边框窗口在**最大化状态**下进全屏，客户区被钳到显示器工作区（`rcWork`，已排除任务栏），而窗口本身是整屏尺寸，于是露出高度等于任务栏的黑边。非最大化时 `showCmd` 不是 `SW_MAXIMIZE`，所以只有最大化状态能复现。
+  - **打补丁的收益**：前端因此不必用「进全屏前先 `unmaximize`、退出后再 `maximize`」的变通。那个变通也能绕开黑边，但两次 `ShowWindow`（`SW_RESTORE` / `SW_MAXIMIZE`）都由 tao 异步派发到事件循环线程，退出全屏时会先看到一次窗口化动画、再来一次最大化动画。
+  - **上游发布含此修复的版本后**：删除 `vendor/tao` 与 `Cargo.toml` 里的 `tao = { path = "vendor/tao" }` 条目即可，无需其它改动。
+- **本地 PDF 管线**（`src/service/local_pdf_book.rs` + `frontend/src/utils/pdfPages.ts`）：阅读形态与 Legado 的 `PdfFile` 一致——**按页渲染**，不做全文重排。导入只解析页数、书签、封面与 `/Info` 元数据，原文件落盘为书目录下的 `book.pdf`；章节正文是每页一个 `<div class="pdf-page" data-pdf-page="N">` 占位，前端经 `reader://` 的 `/pdf?bookUrl=` 取整本 PDF，用 pdf.js 逐页画到 canvas（扫描件、复杂版式都能原样显示）。目录优先用 PDF 书签（`/Root/Outlines`，深度优先扁平化），无书签时从正文认「第X回/章」标题（`detect_headings`），都没有才按 20 页/章分段；书签章超过 `PAGES_PER_CHAPTER` 页会再细分并加 `(1/n)` 序号，避免整本只标一个书签时出现上百页的巨型章节。`collect_page_ids` 仍是页序的唯一来源。本地 PDF 强制单章模式：不走左右翻页（会把整页图切块），也不进连续阅读（页渲染按单章创建与释放，换章要回收上一章的 canvas）。`EXTRACTOR_VERSION` 5，更早的文本缓存需重新导入同一文件升级。
+
+- **桌面 origin 迁移**：`http://127.0.0.1:*` → `http://tauri.localhost` 后 localStorage 偏好重置一次；书库数据（SQLite/文件）不受影响。
+

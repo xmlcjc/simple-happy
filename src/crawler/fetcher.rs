@@ -1,0 +1,389 @@
+use crate::crawler::http_client::HttpClient;
+use encoding_rs::Encoding;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::time::sleep;
+use base64::Engine;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HttpMethod {
+    GET,
+    POST,
+    HEAD,
+    PUT,
+    PATCH,
+    DELETE,
+}
+
+impl Default for HttpMethod {
+    fn default() -> Self {
+        Self::GET
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestSpec {
+    pub url: String,
+    pub method: HttpMethod,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    /// 原始字节请求体。`java.net.URL(...).openConnection()` 这类 Java 互操作脚本
+    /// 会发送未按字符集重编码的二进制包(如 gzip 注册包)。设置后优先于 `body`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<Vec<u8>>,
+    pub retry: usize,
+    pub response_type: Option<String>,
+    pub charset: Option<String>,
+    pub proxy: Option<String>,
+    /// 单次尝试的覆盖超时。`None` 时沿用 client 自身的超时(书源默认 15s)。
+    /// 面板里的浏览器 `fetch`(头像/封面等第三方静态资源)用它压到 9s, 免得
+    /// 一个连不通的 CDN 一直挂着; 因为是 per-request 覆盖, 连接池仍然复用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Duration>,
+    pub server_id: Option<i64>,
+    pub web_view: bool,
+    pub web_js: Option<String>,
+    pub web_view_delay_time: u64,
+}
+
+impl Default for RequestSpec {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            method: HttpMethod::GET,
+            headers: Vec::new(),
+            body: None,
+            body_bytes: None,
+            retry: 2,
+            response_type: None,
+            charset: None,
+            proxy: None,
+            timeout: None,
+            server_id: None,
+            web_view: false,
+            web_js: None,
+            web_view_delay_time: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchResponse {
+    pub url: String,
+    pub status: u16,
+    pub body: String,
+    /// 未经字符集解码的原始响应字节。字节级互操作脚本(`java.net.URL`)用它按
+    /// 原始字节解读响应(gzip / 二进制协议),普通文本请求不使用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub is_successful: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StrResponse {
+    pub body: String,
+    pub url: String,
+    pub code: u16,
+    /// legado 的 `headers` 是 Map 语义, 书源脚本 `JSON.stringify(result.headers)`
+    /// 会产出对象(`{"k":"v"}`), 而 Rust 侧内部表示是 `[[k,v],...]`。两种都收。
+    #[serde(deserialize_with = "lenient_headers")]
+    pub headers: Vec<(String, String)>,
+    pub is_successful: bool,
+}
+
+/// 接受 `[[k,v],...]`、`{"k":"v"}` 与 null 三种形态。
+fn lenient_headers<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Array(rows)) => rows
+            .into_iter()
+            .filter_map(|row| {
+                let mut row = row.as_array()?.iter();
+                let key = row.next()?.as_str()?.to_string();
+                let value = row.next()?.as_str().unwrap_or_default().to_string();
+                Some((key, value))
+            })
+            .collect(),
+        Some(serde_json::Value::Object(map)) => map
+            .into_iter()
+            .map(|(key, value)| {
+                let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                (key, value)
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+pub async fn fetch(client: &HttpClient, req: RequestSpec) -> anyhow::Result<FetchResponse> {
+    let request_client = client.client_with_proxy(req.proxy.as_deref())?;
+    fetch_with_client(&request_client, req).await
+}
+
+/// Fetch with a caller-owned client. Book-source callers use a client scoped
+/// to one source, preserving redirects and cookies without sharing them with
+/// another source.
+pub async fn fetch_with_client(
+    request_client: &reqwest::Client,
+    req: RequestSpec,
+) -> anyhow::Result<FetchResponse> {
+    fetch_inner(request_client, req, false).await
+}
+
+/// 字节级请求: 请求体按原始字节发送, 响应体保留原始字节。
+///
+/// 调用方必须使用关闭了自动解压的客户端(见 `build_raw_source_client`),
+/// 否则 `Content-Encoding` 对应的字节在到达这里之前就已经被解压。
+pub async fn fetch_raw_with_client(
+    request_client: &reqwest::Client,
+    req: RequestSpec,
+) -> anyhow::Result<FetchResponse> {
+    fetch_inner(request_client, req, true).await
+}
+
+async fn fetch_inner(
+    request_client: &reqwest::Client,
+    req: RequestSpec,
+    raw: bool,
+) -> anyhow::Result<FetchResponse> {
+    if let Some(response) = data_uri_response(&req)? { return Ok(response); }
+    let mut last_err: Option<anyhow::Error> = None;
+    let max_retries = req.retry;
+    for attempt in 0..=max_retries {
+        let req = req.clone();
+        let mut builder = match req.method {
+            HttpMethod::GET => request_client.get(&req.url),
+            HttpMethod::POST => request_client.post(&req.url),
+            HttpMethod::HEAD => request_client.head(&req.url),
+            HttpMethod::PUT => request_client.put(&req.url),
+            HttpMethod::PATCH => request_client.patch(&req.url),
+            HttpMethod::DELETE => request_client.delete(&req.url),
+        };
+        if let Some(timeout) = req.timeout {
+            builder = builder.timeout(timeout);
+        }
+
+        let mut has_content_type = false;
+        for (k, v) in &req.headers {
+            if k.to_lowercase() == "content-type" {
+                has_content_type = true;
+            }
+            builder = builder.header(k, v);
+        }
+
+        if let Some(bytes) = req.body_bytes.clone() {
+            builder = builder.body(bytes);
+        } else if let Some(body) = req.body {
+            if matches!(req.method, HttpMethod::POST) && !has_content_type {
+                builder = builder.header(
+                    reqwest::header::CONTENT_TYPE,
+                    if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+                        "application/json"
+                    } else { "application/x-www-form-urlencoded" },
+                );
+            }
+            builder = builder.body(body);
+        }
+
+        match builder.send().await {
+            Ok(res) => {
+                let status = res.status().as_u16();
+                let is_successful = res.status().is_success();
+                let url = res.url().to_string();
+                let content_type = res
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let headers = res
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.to_string(), value.to_string()))
+                    })
+                    .collect::<Vec<_>>();
+                let bytes = res.bytes().await?;
+                // 只有字节级请求才需要保留原始字节; 文本路径直接解码,
+                // 避免每个响应都多一次整体拷贝。
+                let raw_body = if raw { bytes.to_vec() } else { Vec::new() };
+                let mut body = if req
+                    .response_type
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    hex::encode(&bytes)
+                } else {
+                    if raw {
+                        String::new()
+                    } else {
+                        decode_body(&bytes, req.charset.as_deref(), content_type.as_deref())
+                    }
+                };
+                if is_xml_response(content_type.as_deref(), &body)
+                    && !body.trim_start().starts_with("<?xml")
+                {
+                    body = format!("<?xml version=\"1.0\"?>{}", body);
+                }
+                if status >= 500 && attempt < max_retries {
+                    last_err = Some(anyhow::anyhow!("server error status {}", status));
+                } else {
+                    return Ok(FetchResponse {
+                        url,
+                        status,
+                        body,
+                        raw_body,
+                        content_type,
+                        headers,
+                        is_successful,
+                    });
+                }
+            }
+            Err(e) => {
+                last_err = Some(e.into());
+            }
+        }
+
+        if attempt < max_retries {
+            let backoff = 200u64 * (attempt as u64 + 1);
+            sleep(Duration::from_millis(backoff)).await;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("fetch failed")))
+}
+
+pub(crate) fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) -> String {
+    // URL charset controls request encoding. A declared response encoding takes
+    // precedence, including HTML pages returned by an UTF-8 search endpoint.
+    let label = charset_from_content_type(content_type)
+        .or_else(|| charset_from_html_meta(bytes))
+        .or_else(|| charset
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string));
+
+    if let Some(label) = label {
+        if let Some(encoding) = Encoding::for_label(label.trim().as_bytes()) {
+            let (text, _, _) = encoding.decode(bytes);
+            return text.into_owned();
+        }
+    }
+
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+pub(crate) fn data_uri_response(req: &RequestSpec) -> anyhow::Result<Option<FetchResponse>> {
+    let Some(data) = req.url.strip_prefix("data:") else { return Ok(None) };
+    let (meta, payload) = data.split_once(',').ok_or_else(|| anyhow::anyhow!("无效的内嵌数据地址"))?;
+    let decoded = urlencoding::decode_binary(payload.as_bytes());
+    let bytes = if meta.split(';').any(|part| part.eq_ignore_ascii_case("base64")) {
+        base64::engine::general_purpose::STANDARD.decode(decoded.as_ref())?
+    } else { decoded.into_owned() };
+    let content_type = meta.split(';').filter(|part| !part.eq_ignore_ascii_case("base64")).collect::<Vec<_>>().join(";");
+    let body = if req.response_type.as_deref().is_some_and(|value| !value.is_empty()) {
+        hex::encode(&bytes)
+    } else { decode_body(&bytes, req.charset.as_deref(), Some(&content_type)) };
+    Ok(Some(FetchResponse {
+        url: req.url.clone(), status: 200, body, raw_body: bytes, content_type: Some(content_type),
+        headers: Vec::new(), is_successful: true,
+    }))
+}
+
+fn charset_from_content_type(content_type: Option<&str>) -> Option<String> {
+    content_type.and_then(|content_type| {
+        content_type.split(';').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            if key.trim().eq_ignore_ascii_case("charset") {
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                (!value.is_empty()).then(|| value.to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn charset_from_html_meta(bytes: &[u8]) -> Option<String> {
+    let sniff_len = bytes.len().min(4096);
+    let head = String::from_utf8_lossy(&bytes[..sniff_len]);
+    let lower = head.to_ascii_lowercase();
+    let index = lower.find("charset")?;
+    let after = &head[index + "charset".len()..];
+    let after = after.trim_start();
+    let after = after.strip_prefix('=').unwrap_or(after).trim_start();
+    let after = after
+        .strip_prefix('"')
+        .or_else(|| after.strip_prefix('\''))
+        .unwrap_or(after);
+    let label = after
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect::<String>();
+    (!label.is_empty()).then_some(label)
+}
+
+impl From<FetchResponse> for StrResponse {
+    fn from(value: FetchResponse) -> Self {
+        Self {
+            body: value.body,
+            url: value.url,
+            code: value.status,
+            headers: value.headers,
+            is_successful: value.is_successful,
+        }
+    }
+}
+
+impl From<StrResponse> for FetchResponse {
+    fn from(value: StrResponse) -> Self {
+        Self {
+            url: value.url,
+            status: value.code,
+            body: value.body,
+            raw_body: Vec::new(),
+            content_type: None,
+            headers: value.headers,
+            is_successful: value.is_successful,
+        }
+    }
+}
+
+fn is_xml_response(content_type: Option<&str>, body: &str) -> bool {
+    content_type
+        .map(|value| value.to_ascii_lowercase().contains("xml"))
+        .unwrap_or(false)
+        || body.trim_start().starts_with("<rss")
+        || body.trim_start().starts_with("<feed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_body_uses_response_charset() {
+        let bytes = b"\xd0\xa1\xcb\xb5\xca\xd5\xb2\xd8\xc5\xc5\xd0\xd0\xb0\xf1";
+
+        let text = decode_body(bytes, None, Some("text/html; charset=gb2312"));
+
+        assert_eq!(text, "小说收藏排行榜");
+    }
+
+    #[test]
+    fn decode_body_detects_html_meta_charset() {
+        let bytes = b"<meta http-equiv=\"content-type\" content=\"text/html;charset=gb2312\"><title>\xb7\xc9\xc2\xac\xd0\xa1\xcb\xb5</title>";
+
+        let text = decode_body(bytes, None, None);
+
+        assert!(text.contains("飞卢小说"));
+    }
+}

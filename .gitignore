@@ -1,0 +1,49 @@
+# Environment variables (contains secrets)
+.env
+
+# Rust build artifacts
+target/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Storage data (if contains user data)
+/storage/
+
+# Desktop build output and dev data
+desktop/dist/
+desktop/.dev-data/
+desktop/src-tauri/gen/
+
+release-assets/
+node_modules/
+playwright-report/
+test-results/
+.superpowers/
+.codegraph/
+
+# Debug scratch files
+toc_tmp.html
+*.tmp.html
+.ace-tool/
+
+# 本地探针/取证临时目录（下载的书源 JSON、抓取页面、一次性 Rust 探针等，不入库）
+tmp_probe/
+
+# 改动前的临时回滚副本（内容已进版本库, 不必再存一份）
+backups/
+
+# 一次性清理脚本（临时改注释/挪文件用，跑完即弃，不入库）
+.trash

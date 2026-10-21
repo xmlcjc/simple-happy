@@ -1,0 +1,269 @@
+use crate::error::error::AppError;
+use crate::model::book_source::{book_source_from_value, BookSource};
+use crate::storage::db::repo::BookSourceRepo;
+use std::path::PathBuf;
+use tokio::fs;
+
+pub const INVALID_BOOK_SOURCE_GROUP: &str = "失效";
+
+#[derive(Clone)]
+pub struct BookSourceService {
+    repo: BookSourceRepo,
+    default_owner_path: PathBuf,
+}
+
+impl BookSourceService {
+    pub fn new(repo: BookSourceRepo, storage_dir: &str) -> Self {
+        let default_owner_path = PathBuf::from(storage_dir)
+            .join("data")
+            .join("__default__")
+            .join("defaultBookSourceOwner.txt");
+        Self {
+            repo,
+            default_owner_path,
+        }
+    }
+
+    pub async fn save(&self, user_ns: &str, source: BookSource) -> Result<(), AppError> {
+        let json =
+            serde_json::to_string(&source).map_err(|e| AppError::BadRequest(e.to_string()))?;
+        self.repo.upsert(user_ns, &source, &json).await
+    }
+
+    /// 批量保存。串行 `await` 会让导入 500 条源变成 500 次往返, 这里并发提交。
+    ///
+    /// 与 `save` 保持同样的错误语义: 任一失败仍上报(返回第一个错误), 但**不再
+    /// 中断其余写入** —— 与"取消测试后照常写库"同一考虑, 半途中断会留下
+    /// "部分导入成功"这种更难排查的状态。
+    pub async fn save_many(&self, user_ns: &str, sources: Vec<BookSource>) -> Result<(), AppError> {
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let mut writes = tokio::task::JoinSet::new();
+        for source in sources {
+            let repo = self.repo.clone();
+            let ns = user_ns.to_string();
+            writes.spawn(async move {
+                let json =
+                    serde_json::to_string(&source).map_err(|e| AppError::BadRequest(e.to_string()))?;
+                repo.upsert(&ns, &source, &json).await
+            });
+        }
+        let mut first_error: Option<AppError> = None;
+        while let Some(joined) = writes.join_next().await {
+            let error = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(err),
+                Err(err) => Some(AppError::Internal(anyhow::anyhow!("保存书源失败: {err}"))),
+            };
+            if let Some(err) = error {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Pin a source to the top of the search/换源 order by giving it the
+    /// smallest `custom_order` (Legado `topSource` semantics).
+    pub async fn pin(&self, user_ns: &str, book_source_url: &str) -> Result<(), AppError> {
+        let mut source = self
+            .get(user_ns, book_source_url)
+            .await?
+            .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?;
+        // None 与 0 同权参与比较(与 `list` 的排序一致): 若只统计已设置的正值,
+        // "沉底所选"产生的正序号会让 pin 分配到正值, 反而排在普通(None=0)源之后。
+        let min_order = self
+            .list(user_ns)
+            .await?
+            .into_iter()
+            .map(|s| s.custom_order.unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        source.custom_order = Some(min_order - 1);
+        self.save(user_ns, source).await
+    }
+
+    /// Unpin a source by resetting its `custom_order` to 0.
+    pub async fn unpin(&self, user_ns: &str, book_source_url: &str) -> Result<(), AppError> {
+        let mut source = self
+            .get(user_ns, book_source_url)
+            .await?
+            .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?;
+        source.custom_order = Some(0);
+        self.save(user_ns, source).await
+    }
+
+    pub async fn get(
+        &self,
+        user_ns: &str,
+        book_source_url: &str,
+    ) -> Result<Option<BookSource>, AppError> {
+        let json = self.repo.get(user_ns, book_source_url).await?;
+        if let Some(j) = json {
+            let value: serde_json::Value =
+                serde_json::from_str(&j).map_err(|e| AppError::BadRequest(e.to_string()))?;
+            let source =
+                book_source_from_value(value).map_err(|e| AppError::BadRequest(e.to_string()))?;
+            Ok(Some(source))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn list(&self, user_ns: &str) -> Result<Vec<BookSource>, AppError> {
+        let rows = self.repo.list(user_ns).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for j in rows {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&j) {
+                if let Ok(s) = book_source_from_value(value) {
+                    out.push(s);
+                }
+            } else if let Ok(s) = serde_json::from_str::<BookSource>(&j) {
+                out.push(s);
+            }
+        }
+        // Pinned sources (lower custom_order) come first; 沉底 (larger positive
+        // custom_order) last; 未设置 (None) 与 0 同级按名称排. This ordering
+        // drives multi-source search, 换源, and the source manager list.
+        //
+        // None 必须视为 0 而不是 i32::MAX: 前端搜索结果已经按 `customOrder ?? 0`
+        // 排序(SearchResults), 后端若把 None 当最大值, 两侧顺序会不一致; 且
+        // "沉底所选"给选中源分配的正数序号将永远压不过未设置的源(i32::MAX),
+        // 置底形同虚设, unpin(置 0) 也会把源错误地顶到所有未设置源之前.
+        out.sort_by(|a, b| {
+            let oa = a.custom_order.unwrap_or(0);
+            let ob = b.custom_order.unwrap_or(0);
+            oa.cmp(&ob).then_with(|| a.book_source_name.cmp(&b.book_source_name))
+        });
+        Ok(out)
+    }
+
+    pub async fn list_enabled(&self, user_ns: &str) -> Result<Vec<BookSource>, AppError> {
+        Ok(self
+            .list(user_ns)
+            .await?
+            .into_iter()
+            .filter(BookSource::is_enabled)
+            .collect())
+    }
+
+    pub async fn delete(&self, user_ns: &str, book_source_url: &str) -> Result<(), AppError> {
+        self.repo.delete(user_ns, book_source_url).await
+    }
+
+    /// 批量删除, 返回实际删除条数(见 `BookSourceRepo::delete_many`)。
+    pub async fn delete_many(
+        &self,
+        user_ns: &str,
+        book_source_urls: &[String],
+    ) -> Result<u64, AppError> {
+        self.repo.delete_many(user_ns, book_source_urls).await
+    }
+
+    pub async fn delete_all(&self, user_ns: &str) -> Result<(), AppError> {
+        self.repo.delete_all(user_ns).await
+    }
+
+    /// Copy sources from one user to another (used for setting default sources)
+    pub async fn copy_to(&self, from_ns: &str, to_ns: &str) -> Result<i64, AppError> {
+        self.repo.copy_to(from_ns, to_ns).await
+    }
+
+    /// Set a user's sources as the default sources (for new users)
+    pub async fn set_as_default(&self, from_ns: &str) -> Result<i64, AppError> {
+        let count = self.copy_to(from_ns, "__default__").await?;
+        if let Some(dir) = self.default_owner_path.parent() {
+            fs::create_dir_all(dir)
+                .await
+                .map_err(|e| AppError::Internal(e.into()))?;
+        }
+        fs::write(&self.default_owner_path, from_ns)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(count)
+    }
+
+    /// Copy default sources to a new user
+    pub async fn copy_default_to_user(&self, to_ns: &str) -> Result<i64, AppError> {
+        let defaults = self.list("__default__").await?;
+        if defaults.is_empty() {
+            return Ok(0);
+        }
+        let count = defaults.len() as i64;
+        self.save_many(to_ns, defaults).await?;
+        Ok(count)
+    }
+
+    pub async fn get_default_owner(&self) -> Result<Option<String>, AppError> {
+        match fs::read_to_string(&self.default_owner_path).await {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(AppError::Internal(err.into())),
+        }
+    }
+}
+
+pub fn book_source_has_group(source: &BookSource, target: &str) -> bool {
+    source
+        .book_source_group
+        .as_deref()
+        .map(split_source_groups)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|group| group == target)
+}
+
+pub fn set_invalid_book_source_group(source: &mut BookSource, invalid: bool) -> bool {
+    let mut groups = source
+        .book_source_group
+        .as_deref()
+        .map(split_source_groups)
+        .unwrap_or_default();
+    let had_invalid = groups
+        .iter()
+        .any(|group| group == INVALID_BOOK_SOURCE_GROUP);
+
+    if invalid {
+        if had_invalid {
+            return false;
+        }
+        groups.push(INVALID_BOOK_SOURCE_GROUP.to_string());
+    } else {
+        if !had_invalid {
+            return false;
+        }
+        groups.retain(|group| group != INVALID_BOOK_SOURCE_GROUP);
+    }
+
+    source.book_source_group = if groups.is_empty() {
+        None
+    } else {
+        Some(groups.join(","))
+    };
+    true
+}
+
+fn split_source_groups(raw: &str) -> Vec<String> {
+    raw.split(|ch| matches!(ch, ',' | ';' | '；' | '、'))
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(str::to_string)
+        .fold(Vec::new(), |mut groups, group| {
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+            groups
+        })
+}

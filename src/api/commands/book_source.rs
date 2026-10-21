@@ -1,0 +1,1054 @@
+use crate::api::commands::{decode_header_file_name, decode_upload_body};
+use crate::api::AppState;
+use crate::error::error::{ApiResponse, AppError};
+use crate::model::book_source::{book_source_from_value, BookSource};
+use crate::service::book_source_service::{
+    book_source_has_group, set_invalid_book_source_group, INVALID_BOOK_SOURCE_GROUP,
+};
+use crate::util::text::normalize_source_url;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tauri::Emitter;
+use tauri_plugin_dialog::DialogExt;
+use tokio::task::JoinSet;
+
+const MAX_TEST_SOURCE_BATCH_SIZE: usize = 100;
+static SOURCE_TEST_CANCELLATIONS: Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Deserialize)]
+pub struct BookSourceUrlParam {
+    #[serde(rename = "bookSourceUrl")]
+    book_source_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TestBookSourcesRequest {
+    pub book_source_urls: Option<Vec<String>>,
+    pub keyword: Option<String>,
+    pub mark_invalid: Option<bool>,
+    pub concurrent: Option<usize>,
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelBookSourceTestRequest {
+    pub task_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestBookSourceItem {
+    book_source_url: String,
+    book_source_name: String,
+    valid: bool,
+    search_ok: bool,
+    keyword: String,
+    search_error: Option<String>,
+    marked_invalid: bool,
+    /// 该条因用户中止而未检测完成(既不算有效也不算失效)。
+    cancelled: bool,
+    group: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestBookSourcesResponse {
+    total: usize,
+    valid: usize,
+    invalid: usize,
+    marked_invalid: usize,
+    cancelled: bool,
+    /// 因中止而未完成的条数, 供前端如实提示"已中止, N 个未检测"。
+    cancelled_count: usize,
+    results: Vec<TestBookSourceItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BookSourceTestProgress {
+    task_id: String,
+    total: usize,
+    completed: usize,
+    valid: usize,
+    invalid: usize,
+    cancelled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UsernameParam {
+    pub username: Option<String>,
+}
+
+#[tauri::command]
+pub async fn save_book_source(
+    state: tauri::State<'_, AppState>,
+    req: serde_json::Value,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let source =
+        book_source_from_value(req).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let existing_source = state
+        .book_source_service
+        .get(&user_ns, &source.book_source_url)
+        .await?;
+    let source_became_available = source_became_available(existing_source.as_ref(), &source);
+    state.book_source_service.save(&user_ns, source).await?;
+    if source_became_available {
+        invalidate_shelf_book_source_caches(&state, &user_ns).await?;
+    }
+    Ok(ApiResponse::ok(serde_json::json!({"saved": true})))
+}
+
+#[tauri::command]
+pub async fn save_book_sources(
+    state: tauri::State<'_, AppState>,
+    req: serde_json::Value,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let sources = extract_sources(req)?;
+    if sources.is_empty() {
+        return Err(AppError::BadRequest("empty book sources".to_string()));
+    }
+    let existing_sources = state
+        .book_source_service
+        .list(&user_ns)
+        .await?
+        .into_iter()
+        .map(|source| (source.book_source_url.clone(), source))
+        .collect::<HashMap<_, _>>();
+    let has_new_available_source = sources
+        .iter()
+        .any(|source| source_became_available(existing_sources.get(&source.book_source_url), source));
+    let count = sources.len();
+    let save_result = state
+        .book_source_service
+        .save_many(&user_ns, sources)
+        .await;
+    if has_new_available_source {
+        // save_many 是"尽力写入"(并发提交, 任一失败仍继续其余写入), 因此返回 Err 时
+        // **可能已有部分源入库**。缓存失效必须照常执行, 否则换源结果与刚写入的源
+        // 不一致。用 `?` 直接返回会跳过这一步, 留下已入库但缓存陈旧的源。
+        let invalidate_result = invalidate_shelf_book_source_caches(&state, &user_ns).await;
+        // 保存错误优先上报(它更关键), 但不能因此丢掉缓存失效的错误。
+        save_result?;
+        invalidate_result?;
+    } else {
+        save_result?;
+    }
+    Ok(ApiResponse::ok(
+        serde_json::json!({"saved": true, "count": count}),
+    ))
+}
+
+#[tauri::command]
+pub async fn get_book_source(
+    state: tauri::State<'_, AppState>,
+    req: BookSourceUrlParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let url = req
+        .book_source_url
+        .ok_or_else(|| AppError::BadRequest("bookSourceUrl required".to_string()))?;
+    let source = state
+        .book_source_service
+        .get(&user_ns, &url)
+        .await?
+        .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?;
+    Ok(ApiResponse::ok(
+        serde_json::to_value(source).unwrap_or_default(),
+    ))
+}
+
+#[tauri::command]
+pub async fn get_book_sources(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let list = state.book_source_service.list(&user_ns).await?;
+    Ok(ApiResponse::ok(
+        serde_json::to_value(list).unwrap_or_default(),
+    ))
+}
+
+#[tauri::command]
+pub async fn get_default_book_source_owner(
+    _state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    // Single-user desktop: no default-source ownership model.
+    Ok(ApiResponse::ok(serde_json::json!({ "username": null })))
+}
+
+#[tauri::command]
+pub async fn pin_book_source(
+    state: tauri::State<'_, AppState>,
+    req: BookSourceUrlParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let url = req
+        .book_source_url
+        .ok_or_else(|| AppError::BadRequest("bookSourceUrl required".to_string()))?;
+    state.book_source_service.pin(&user_ns, &url).await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "success": true })))
+}
+
+#[tauri::command]
+pub async fn unpin_book_source(
+    state: tauri::State<'_, AppState>,
+    req: BookSourceUrlParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let url = req
+        .book_source_url
+        .ok_or_else(|| AppError::BadRequest("bookSourceUrl required".to_string()))?;
+    state.book_source_service.unpin(&user_ns, &url).await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "success": true })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookSourceLoginParam {
+    pub book_source_url: Option<String>,
+    pub action: Option<String>,
+    pub values: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[tauri::command]
+pub async fn login_book_source(
+    state: tauri::State<'_, AppState>,
+    req: BookSourceLoginParam,
+    on_browser: tauri::ipc::Channel<crate::service::book_service::ShowBrowserRequest>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let url = req
+        .book_source_url
+        .ok_or_else(|| AppError::BadRequest("bookSourceUrl required".to_string()))?;
+    let source = state
+        .book_source_service
+        .get(&user_ns, &url)
+        .await?
+        .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?;
+    let handler: crate::service::source_browser::BrowserHandler = Arc::new(move |request| {
+        on_browser.send(request).map_err(|err| err.to_string())
+    });
+    let mut result = state.book_service.run_source_login_with_browser(&source, req.action, req.values, Some(handler)).await?;
+    let login_session = state
+        .book_service
+        .create_source_login_session(&source.book_source_url)
+        .await;
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "loginSession".to_string(),
+            serde_json::Value::String(login_session),
+        );
+    }
+    Ok(ApiResponse::ok(result))
+}
+
+#[tauri::command]
+pub fn close_source_panel(panel_id: String) {
+    crate::service::source_browser::cancel_browser(&panel_id);
+    crate::service::book_service::remove_source_panel(&panel_id);
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSourceCookieParam {
+    pub book_source_url: Option<String>,
+    pub cookie: Option<String>,
+}
+
+/// 手动导入书源登录 Cookie(如通过抓包获取的会话)。
+/// Cookie 按完整书源地址隔离存储，后续仅该书源请求自动携带。
+/// 存储前会用该书源做一次搜索校验,避免过期/无效 Cookie 毒化后续所有请求。
+#[tauri::command]
+pub async fn set_book_source_cookie(
+    state: tauri::State<'_, AppState>,
+    req: SetSourceCookieParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let url = req
+        .book_source_url
+        .ok_or_else(|| AppError::BadRequest("bookSourceUrl required".to_string()))?;
+    let cookie = req
+        .cookie
+        .ok_or_else(|| AppError::BadRequest("cookie required".to_string()))?
+        .trim()
+        .to_string();
+    // 先确认书源存在
+    let source = state
+        .book_source_service
+        .get(&user_ns, &url)
+        .await?
+        .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?;
+    // 存储前校验: 带 cookie 跑一次搜索, 无效/过期则拒绝写入, 避免毒化。
+    // 关键词同样走 check_keyword(默认"我的"), 不用"测试"——后者在很多站点
+    // 搜不到任何书, 会让"Cookie 校验失败"误报。
+    let validate_keyword = source.check_keyword();
+    let validated = if !cookie.is_empty() {
+        state.book_service.validate_source_cookie(&user_ns, &source, &cookie, &validate_keyword).await?
+    } else {
+        state.book_service.clear_source_cookie(&user_ns, &source.book_source_url).await;
+        false
+    };
+
+    state
+        .book_service
+        .set_source_cookie(&user_ns, &source.book_source_url, &cookie)
+        .await?;
+    Ok(ApiResponse::ok(
+        serde_json::json!({ "success": true, "saved": true, "validated": validated }),
+    ))
+}
+
+#[tauri::command]
+pub async fn test_book_sources(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    req: TestBookSourcesRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+
+    let requested = normalize_requested_source_urls(req.book_source_urls.as_deref())?;
+    let sources = state
+        .book_source_service
+        .list(&user_ns)
+        .await?
+        .into_iter()
+        .filter(|source| {
+            requested
+                .as_ref()
+                .map(|urls| urls.contains(&normalize_source_url(&source.book_source_url)))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+
+    // 上限 8: 每个源在检测过程中会有一次阻塞解析(js: 规则里还可能发起同步 HTTP),
+    // 并发越高, 取消时需要收尾的在途任务越多、峰值线程也越高。12 → 8 后,
+    // 取消响应更快且不会把两轮 HTTP 超时叠在一起。
+    let concurrent = req.concurrent.unwrap_or(8).clamp(1, 8);
+    let keyword = req.keyword.clone();
+    let mark_invalid = req.mark_invalid.unwrap_or(true);
+    let task_id = req.task_id.filter(|id| !id.trim().is_empty());
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    if let Some(id) = task_id.as_ref() {
+        if let Ok(mut tasks) = SOURCE_TEST_CANCELLATIONS.lock() {
+            if let Some(previous) = tasks.insert(id.clone(), cancel_flag.clone()) {
+                previous.store(true, Ordering::Relaxed);
+            }
+        }
+        emit_source_test_progress(&app, id, sources.len(), 0, 0, 0, false);
+    }
+
+    let (outcomes, cancelled) = test_sources_in_parallel(
+        state.book_service.clone(),
+        user_ns.to_string(),
+        keyword,
+        sources,
+        concurrent,
+        cancel_flag,
+        app,
+        task_id.clone(),
+    )
+    .await;
+    if let Some(id) = task_id.as_ref() {
+        if let Ok(mut tasks) = SOURCE_TEST_CANCELLATIONS.lock() {
+            tasks.remove(id);
+        }
+    }
+
+    // 先把要落库的源收集起来, 循环结束后一次性并发写入。
+    //
+    // 原实现是在这个循环里逐条 `save().await`: 取消时要收尾的已测源可能有一两百个,
+    // 每次都等一次 SQL 往返, 用户点了"中止"却还要盯着界面等好几秒。改成
+    // 「收集 → 并发写」后, 写库总耗时从 O(N) 次串行往返降到约一次往返的量级。
+    let mut pending_saves: Vec<BookSource> = Vec::new();
+    let mut results = Vec::with_capacity(outcomes.len());
+    let mut marked_invalid = 0usize;
+    let mut cancelled_count = 0usize;
+    for (mut source, availability) in outcomes {
+        // 被取消的源绝不能按结果写库: 它的 valid 是 false(未检测完),
+        // 走到下面会被 set_invalid_book_source_group 误标成"失效"并保存,
+        // 把一个可能完全正常的书源标坏。只如实回报, 不改分组。
+        if availability.cancelled {
+            cancelled_count += 1;
+            results.push(TestBookSourceItem {
+                book_source_url: availability.book_source_url,
+                book_source_name: availability.book_source_name,
+                valid: false,
+                search_ok: false,
+                keyword: availability.keyword,
+                search_error: None,
+                marked_invalid: false,
+                cancelled: true,
+                group: source.book_source_group,
+            });
+            continue;
+        }
+
+        let changed = if mark_invalid {
+            set_invalid_book_source_group(&mut source, !availability.valid)
+        } else {
+            false
+        };
+        if changed {
+            if !availability.valid {
+                marked_invalid += 1;
+            }
+            pending_saves.push(source.clone());
+        }
+
+        results.push(TestBookSourceItem {
+            book_source_url: availability.book_source_url,
+            book_source_name: availability.book_source_name,
+            valid: availability.valid,
+            search_ok: availability.search_ok,
+            keyword: availability.keyword,
+            search_error: availability.search_error,
+            marked_invalid: changed && !availability.valid,
+            cancelled: false,
+            group: source.book_source_group,
+        });
+    }
+
+    // 并发写回分组。这里**不能**在失败时立刻 `return Err`:
+    // `JoinSet` 被 drop 时会 abort 所有剩余任务(tokio 的 Drop 实现是
+    // `drain(|h| h.abort())`), 那样"已算好但还没落库"的源会被静默丢弃 ——
+    // 用户点"中止"后本应照常写库, 结果这些源既没进 DB、又不会出现在失效列表里,
+    // 连"删除失效"都删不掉, 只能重测。所以先全部写完, 再统一上报第一个错误。
+    if !pending_saves.is_empty() {
+        let mut writes = JoinSet::new();
+        for source in pending_saves {
+            let service = state.book_source_service.clone();
+            let ns = user_ns.to_string();
+            writes.spawn(async move { service.save(&ns, source).await });
+        }
+        let mut first_error: Option<AppError> = None;
+        while let Some(joined) = writes.join_next().await {
+            let error = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(err),
+                Err(err) => Some(AppError::Internal(anyhow::anyhow!(
+                    "保存书源分组失败: {err}"
+                ))),
+            };
+            // 只记第一个错误, 但循环继续跑完 —— 失败要上报, 其余写入不能因此中断。
+            if let Some(err) = error {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+    }
+
+    results.sort_by(|a, b| a.book_source_name.cmp(&b.book_source_name));
+    // 统计只算**已完成**的条目: 被取消的既不算有效也不算失效,
+    // 否则中止会让前端看到虚高的"失效 N 个"并可能去点"删除失效"。
+    let completed = results.iter().filter(|item| !item.cancelled).collect::<Vec<_>>();
+    let valid = completed.iter().filter(|item| item.valid).count();
+    let invalid = completed.len().saturating_sub(valid);
+    let response = TestBookSourcesResponse {
+        total: results.len(),
+        valid,
+        invalid,
+        marked_invalid,
+        cancelled: cancelled || cancelled_count > 0,
+        cancelled_count,
+        results,
+    };
+    Ok(ApiResponse::ok(
+        serde_json::to_value(response).unwrap_or_default(),
+    ))
+}
+
+#[tauri::command]
+pub async fn cancel_book_source_test(
+    req: CancelBookSourceTestRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let cancelled = SOURCE_TEST_CANCELLATIONS
+        .lock()
+        .ok()
+        .and_then(|tasks| tasks.get(&req.task_id).cloned())
+        .map(|flag| {
+            flag.store(true, Ordering::Relaxed);
+            true
+        })
+        .unwrap_or(false);
+    Ok(ApiResponse::ok(serde_json::json!({ "cancelled": cancelled })))
+}
+
+fn normalize_requested_source_urls(
+    urls: Option<&[String]>,
+) -> Result<Option<HashSet<String>>, AppError> {
+    let Some(urls) = urls else {
+        return Ok(None);
+    };
+    if urls.len() > MAX_TEST_SOURCE_BATCH_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "bookSourceUrls 最多支持 {} 条",
+            MAX_TEST_SOURCE_BATCH_SIZE
+        )));
+    }
+    Ok(Some(
+        urls.iter()
+            .map(|url| normalize_source_url(url))
+            .filter(|url| !url.is_empty())
+            .collect::<HashSet<_>>(),
+    ))
+}
+
+async fn test_sources_in_parallel(
+    book_service: Arc<crate::service::book_service::BookService>,
+    user_ns: String,
+    keyword: Option<String>,
+    sources: Vec<BookSource>,
+    concurrent: usize,
+    cancel_flag: Arc<AtomicBool>,
+    app: tauri::AppHandle,
+    task_id: Option<String>,
+) -> (
+    Vec<(
+        BookSource,
+        crate::service::book_service::BookSourceAvailability,
+    )>,
+    bool,
+) {
+    let total = sources.len();
+    let mut pending = sources.into_iter();
+    let mut tasks = JoinSet::new();
+
+    let spawn_next = |tasks: &mut JoinSet<_>, source: BookSource| {
+        let book_service = book_service.clone();
+        let user_ns = user_ns.clone();
+        let keyword = keyword.clone();
+        // 把取消信号一路传进单源检测: 解析段在阻塞线程池里跑, 在途 HTTP 用
+        // select! 包裹, 取消时 future 被 drop → 连接真断, 而不是等 30s 超时。
+        let cancel = cancel_flag.clone();
+        tasks.spawn(async move {
+            let availability = book_service
+                .test_book_source_availability_cancellable(
+                    &user_ns,
+                    &source,
+                    keyword.as_deref(),
+                    Some(&cancel),
+                )
+                .await;
+            (source, availability)
+        });
+    };
+
+    for source in pending.by_ref().take(concurrent.max(1)) {
+        spawn_next(&mut tasks, source);
+    }
+
+    let mut outcomes = Vec::with_capacity(tasks.len());
+    let mut valid = 0usize;
+    let mut invalid = 0usize;
+    let mut cancelled = false;
+    while !tasks.is_empty() {
+        if cancel_flag.load(Ordering::Relaxed) {
+            cancelled = true;
+            tasks.abort_all();
+            // 取消后不再等被 abort 的任务: 它们正卡在阻塞线程池的解析段里,
+            // 旧实现 `while join_next().await.is_some() {}` 会一直等到它们跑完,
+            // 这正是「前端已取消、后端还在检测」的来源。这里直接丢弃句柄。
+            break;
+        }
+
+        tokio::select! {
+            result = tasks.join_next() => {
+                if let Some(result) = result {
+                    match result {
+                        Ok(outcome) => {
+                            // 被取消的单源不计入有效/失效: 它的结果不完整,
+                            // 计进去会让"失效数"虚高并触发误标失效。
+                            if !outcome.1.cancelled {
+                                if outcome.1.valid { valid += 1; } else { invalid += 1; }
+                            }
+                            outcomes.push(outcome);
+                            if let Some(id) = task_id.as_deref() {
+                                emit_source_test_progress(
+                                    &app,
+                                    id,
+                                    total,
+                                    outcomes.len(),
+                                    valid,
+                                    invalid,
+                                    false,
+                                );
+                            }
+                            if let Some(source) = pending.next() {
+                                spawn_next(&mut tasks, source);
+                            }
+                        }
+                        Err(err) if !err.is_cancelled() => {
+                            tracing::error!("book source test task failed: {err}")
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+
+    if let Some(id) = task_id.as_deref() {
+        emit_source_test_progress(
+            &app,
+            id,
+            total,
+            outcomes.len(),
+            valid,
+            invalid,
+            cancelled,
+        );
+    }
+    (outcomes, cancelled)
+}
+
+fn emit_source_test_progress(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    total: usize,
+    completed: usize,
+    valid: usize,
+    invalid: usize,
+    cancelled: bool,
+) {
+    let _ = app.emit(
+        "book-source-test-progress",
+        BookSourceTestProgress {
+            task_id: task_id.to_string(),
+            total,
+            completed,
+            valid,
+            invalid,
+            cancelled,
+        },
+    );
+}
+
+#[tauri::command]
+pub async fn delete_invalid_book_sources(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let sources = state.book_source_service.list(&user_ns).await?;
+    let invalid_urls = sources
+        .iter()
+        .filter(|source| book_source_has_group(source, INVALID_BOOK_SOURCE_GROUP))
+        .map(|source| source.book_source_url.clone())
+        .collect::<Vec<_>>();
+    // 一条 SQL 批量删除, 不再逐条 await(删几百条时那是几百次往返)。
+    let deleted = state
+        .book_source_service
+        .delete_many(&user_ns, &invalid_urls)
+        .await?;
+    state
+        .book_service
+        .remove_source_candidates(&user_ns, &invalid_urls.iter().cloned().collect())
+        .await?;
+    // 失效源删除时一并清理登录 Cookie, 避免坏 Cookie 留在内存里继续毒化。
+    // 批量版只各取一次写锁(逐条调用是 3N 次锁竞争)。
+    state
+        .book_service
+        .clear_source_cookies(&user_ns, &invalid_urls)
+        .await;
+    // 用 DB 实际删除行数而不是"待删列表长度": 两者不一致时前者才是真相。
+    Ok(ApiResponse::ok(serde_json::json!({
+        "deleted": deleted
+    })))
+}
+
+#[tauri::command]
+pub async fn delete_book_source(
+    state: tauri::State<'_, AppState>,
+    req: BookSourceUrlParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let url = req
+        .book_source_url
+        .ok_or_else(|| AppError::BadRequest("bookSourceUrl required".to_string()))?;
+    state.book_source_service.delete(&user_ns, &url).await?;
+    state
+        .book_service
+        .remove_source_candidates(&user_ns, &HashSet::from([url.clone()]))
+        .await?;
+    state.book_service.clear_source_cookie(&user_ns, &url).await;
+    Ok(ApiResponse::ok(serde_json::json!({"deleted": true})))
+}
+
+#[tauri::command]
+pub async fn delete_book_sources(
+    state: tauri::State<'_, AppState>,
+    req: Vec<BookSourceUrlParam>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let mut deleted_urls = HashSet::new();
+    for item in req {
+        if let Some(url) = item.book_source_url {
+            deleted_urls.insert(url);
+        }
+    }
+    // 与"删除失效"同样改成批量: 逐个 await 删除 + 逐个清 Cookie 是 4N 次往返/锁。
+    let deleted_list = deleted_urls.iter().cloned().collect::<Vec<_>>();
+    state
+        .book_source_service
+        .delete_many(&user_ns, &deleted_list)
+        .await?;
+    state
+        .book_service
+        .remove_source_candidates(&user_ns, &deleted_urls)
+        .await?;
+    state
+        .book_service
+        .clear_source_cookies(&user_ns, &deleted_list)
+        .await;
+    Ok(ApiResponse::ok(serde_json::json!({"deleted": true})))
+}
+
+#[tauri::command]
+pub async fn delete_all_book_sources(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let deleted_urls = state
+        .book_source_service
+        .list(&user_ns)
+        .await?
+        .into_iter()
+        .map(|source| source.book_source_url)
+        .collect::<HashSet<_>>();
+    state.book_source_service.delete_all(&user_ns).await?;
+    state
+        .book_service
+        .remove_source_candidates(&user_ns, &deleted_urls)
+        .await?;
+    // 清空书源时一并清空全部登录 Cookie(批量, 避免 N 次写锁竞争)。
+    let deleted_list = deleted_urls.iter().cloned().collect::<Vec<_>>();
+    state
+        .book_service
+        .clear_source_cookies(&user_ns, &deleted_list)
+        .await;
+    Ok(ApiResponse::ok(serde_json::json!({"deleted": true})))
+}
+
+fn extract_sources(payload: serde_json::Value) -> Result<Vec<BookSource>, AppError> {
+    if let Some(items) = payload.as_array() {
+        return items
+            .iter()
+            .cloned()
+            .map(|value| {
+                book_source_from_value(value).map_err(|e| AppError::BadRequest(e.to_string()))
+            })
+            .collect();
+    }
+    if let Some(obj) = payload.as_object() {
+        for key in ["bookSourceList", "bookSources", "data", "sources"] {
+            if let Some(v) = obj.get(key) {
+                if let Some(items) = v.as_array() {
+                    return items
+                        .iter()
+                        .cloned()
+                        .map(|value| {
+                            book_source_from_value(value)
+                                .map_err(|e| AppError::BadRequest(e.to_string()))
+                        })
+                        .collect();
+                }
+            }
+        }
+        // 单个书源对象直接导入(与复制粘贴保存的惯用格式一致)
+        return Ok(vec![book_source_from_value(payload)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?]);
+    }
+    Err(AppError::BadRequest(
+        "invalid book sources payload".to_string(),
+    ))
+}
+
+async fn invalidate_shelf_book_source_caches(
+    state: &AppState,
+    user_ns: &str,
+) -> Result<(), AppError> {
+    let books = state.book_service.get_bookshelf(user_ns).await?;
+    for book in books {
+        state
+            .book_service
+            .delete_book_sources_cache(user_ns, &book.book_url)
+            .await?;
+    }
+    Ok(())
+}
+
+fn source_became_available(existing: Option<&BookSource>, incoming: &BookSource) -> bool {
+    incoming.is_enabled() && match existing {
+        Some(source) => !source.is_enabled(),
+        None => true,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteSourceParam {
+    url: String,
+}
+
+/// 从 `legado://` / `yuedu://` 一键导入链接里取出真正的 http(s) 地址。
+///
+/// 手机端这些是系统协议, PC 端没有注册, 用户在书源管理里直接粘贴整条链接
+/// 是自然用法 —— 直接把它交给 reqwest 会得到 `BadScheme`。这里按
+/// `?src=` / `?url=` 取值, 并只接受 http(s)(导入地址来自第三方网页,
+/// 不能让 `file:` 之类借道读取本地文件)。
+fn resolve_remote_source_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("legado://") || lower.starts_with("yuedu://")) {
+        // 普通 http(s) 地址: 原样使用, 保持既有行为。
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return Ok(trimmed.to_string());
+        }
+        return Err("请输入 http(s) 或 legado:// / yuedu:// 开头的一键导入链接".to_string());
+    }
+
+    let query = trimmed.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let mut candidate: Option<String> = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else { continue };
+        if key == "src" || key == "url" {
+            let decoded = urlencoding::decode(value).map(|v| v.into_owned()).unwrap_or_else(|_| value.to_string());
+            candidate = Some(decoded);
+            break;
+        }
+    }
+
+    let Some(candidate) = candidate else {
+        return Err("这个导入链接里没有 src 参数".to_string());
+    };
+    let candidate = candidate.trim();
+    let candidate_lower = candidate.to_ascii_lowercase();
+    if !(candidate_lower.starts_with("http://") || candidate_lower.starts_with("https://")) {
+        return Err("导入链接里的地址必须是 http(s)".to_string());
+    }
+    Ok(candidate.to_string())
+}
+
+#[tauri::command]
+pub async fn read_remote_source_file(
+    state: tauri::State<'_, AppState>,
+    req: RemoteSourceParam,
+) -> Result<ApiResponse<Vec<String>>, AppError> {
+    let client = state.book_service.http_client();
+    let target = resolve_remote_source_url(&req.url).map_err(AppError::BadRequest)?;
+
+    let text = client
+        .get(&target)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to fetch remote source from {}: {:?}", target, e);
+            AppError::BadRequest(format!("网络请求失败: {}", e))
+        })?
+        .text()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("读取响应失败: {}", e)))?;
+
+    let sources: Vec<BookSource> = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|_| AppError::BadRequest("invalid book sources json format".to_string()))
+        .and_then(extract_sources)?;
+
+    // Return as array of JSON strings (frontend expects each item to be a JSON string)
+    let json_str = serde_json::to_string(&sources)
+        .map_err(|e| AppError::BadRequest(format!("序列化书源失败: {}", e)))?;
+
+    Ok(ApiResponse::ok(vec![json_str]))
+}
+
+#[tauri::command]
+pub async fn read_source_file(
+    request: tauri::ipc::Request<'_>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    // 扩展名判断先于 body 解码：与原实现一致，非法扩展名一律返回
+    // "No json file uploaded"，而不是先报 body 形式的错。
+    let file_name = decode_header_file_name(&request)?;
+    if file_name.ends_with(".json") || file_name.ends_with(".txt") {
+        let file = decode_upload_body(request.body())?;
+        let text = String::from_utf8_lossy(&file);
+        let sources: Vec<BookSource> = serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|_| {
+                AppError::BadRequest("invalid book sources json format".to_string())
+            })
+            .and_then(extract_sources)?;
+        return Ok(ApiResponse::ok(serde_json::to_value(sources).unwrap_or_default()));
+    }
+    Err(AppError::BadRequest("No json file uploaded".to_string()))
+}
+
+/// Opens the native save dialog on desktop and writes a formatted book-source
+/// export. Browser callers should keep using the frontend download fallback.
+#[tauri::command]
+pub async fn export_book_sources_to_file(
+    app: tauri::AppHandle,
+    sources: Vec<BookSource>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let Some(file) = app
+        .dialog()
+        .file()
+        .set_title("导出书源")
+        .set_file_name(format!("reader-book-sources-{}.json", export_timestamp()))
+        .add_filter("JSON 文件", &["json"])
+        .blocking_save_file()
+    else {
+        return Ok(ApiResponse::ok(serde_json::json!({"saved": false, "cancelled": true})));
+    };
+    let path = file
+        .into_path()
+        .map_err(|error| AppError::BadRequest(format!("无法访问导出路径：{error}")))?;
+    let json = serde_json::to_vec_pretty(&sources)
+        .map_err(|error| AppError::Internal(error.into()))?;
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|error| AppError::Internal(error.into()))?;
+    Ok(ApiResponse::ok(serde_json::json!({
+        "saved": true,
+        "path": path.to_string_lossy(),
+    })))
+}
+
+fn export_timestamp() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+#[tauri::command]
+pub async fn set_as_default_book_sources(
+    _state: tauri::State<'_, AppState>,
+    _req: UsernameParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    // Single-user desktop: no default-source ownership model.
+    Ok(ApiResponse::ok(
+        serde_json::json!({"success": true, "count": 0}),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn requested_source_urls_rejects_batches_above_limit() {
+        let urls = (0..101)
+            .map(|index| format!("https://source-{index}.example"))
+            .collect::<Vec<_>>();
+
+        let err = normalize_requested_source_urls(Some(&urls)).unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(message) if message.contains("100")));
+    }
+
+    /// 书源管理里的「网络导入」: 用户直接粘贴源仓库的一键导入链接是自然用法,
+    /// 直接交给 reqwest 会得到 `BadScheme`。这里必须把 src 取出来。
+    #[test]
+    fn resolve_remote_source_url_unwraps_import_links() {
+        assert_eq!(
+            resolve_remote_source_url(
+                "yuedu://booksource/importonline?src=https://www.yck2026.fun/yuedu/shuyuan/json/id/7965.json"
+            )
+            .unwrap(),
+            "https://www.yck2026.fun/yuedu/shuyuan/json/id/7965.json"
+        );
+        assert_eq!(
+            resolve_remote_source_url(
+                "legado://import/booksource?src=https%3A%2F%2Fexample.com%2Fs.json"
+            )
+            .unwrap(),
+            "https://example.com/s.json"
+        );
+        // 普通地址与前后空白照常处理。
+        assert_eq!(
+            resolve_remote_source_url("  https://example.com/a.json ").unwrap(),
+            "https://example.com/a.json"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_source_url_rejects_unsafe_input() {
+        // 非 http(s) 目标不能被导入链接借道(避免读取本地文件)。
+        assert!(resolve_remote_source_url("legado://import/x?src=file:///C:/a.json").is_err());
+        assert!(resolve_remote_source_url("legado://import/x").is_err());
+        assert!(resolve_remote_source_url("mailto:a@b.c").is_err());
+    }
+
+    #[test]
+    fn extract_sources_accepts_single_source_object() {
+        let payload = json!({
+            "bookSourceName": "single",
+            "bookSourceUrl": "https://single.example",
+            "ruleSearch": {"bookList": ".item"}
+        });
+        let sources = extract_sources(payload).expect("single object should import");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].book_source_name, "single");
+    }
+
+    #[test]
+    fn extract_sources_accepts_array() {
+        let payload = json!([
+            {"bookSourceName": "a", "bookSourceUrl": "https://a.example"},
+            {"bookSourceName": "b", "bookSourceUrl": "https://b.example"}
+        ]);
+        let sources = extract_sources(payload).expect("array should import");
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[test]
+    fn extract_sources_accepts_wrapper_key() {
+        let payload = json!({
+            "bookSourceList": [
+                {"bookSourceName": "wrapped", "bookSourceUrl": "https://wrapped.example"}
+            ]
+        });
+        let sources = extract_sources(payload).expect("wrapped list should import");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].book_source_name, "wrapped");
+    }
+
+    #[test]
+    fn extract_sources_rejects_invalid_payload() {
+        // 非对象/数组(字符串、数字等)不是合法书源载荷
+        let err = extract_sources(json!("just a string")).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        let err = extract_sources(json!(42)).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn source_became_available_only_for_new_or_reenabled_sources() {
+        let enabled = BookSource {
+            book_source_url: "https://source.example".to_string(),
+            enabled: Some(true),
+            ..BookSource::default()
+        };
+        let disabled = BookSource {
+            enabled: Some(false),
+            ..enabled.clone()
+        };
+
+        assert!(source_became_available(None, &enabled));
+        assert!(!source_became_available(None, &disabled));
+        assert!(source_became_available(Some(&disabled), &enabled));
+        assert!(!source_became_available(Some(&enabled), &enabled));
+    }
+}

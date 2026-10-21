@@ -1,0 +1,196 @@
+// Drop-in replacement for the old axios `http` client. The 14 api/*.ts modules
+// keep their exact signatures — `http.get<T>('/x').then(r => r.data)` becomes
+// `get<T>('/x').then(r => r.data)` — only the import changes.
+//
+// Each call maps a `/reader3/*` path to a Tauri command name and unwraps the
+// ApiResponse envelope, rejecting with `new Error(errorMsg)` exactly like the
+// old axios response interceptor.
+
+import { invoke } from '@tauri-apps/api/core'
+import type { ApiResponse } from '../types'
+
+const COMMAND_BY_PATH: Record<string, string> = {
+  '/reader3/getBookSources': 'get_book_sources',
+  // Source login uses an IPC channel for interactive pages; see api/source.ts.
+  '/reader3/setBookSourceCookie': 'set_book_source_cookie',
+  '/reader3/testBookSources': 'test_book_sources',
+  '/reader3/cancelBookSourceTest': 'cancel_book_source_test',
+  '/reader3/cancelCacheBook': 'cancel_cache_book',
+  '/reader3/deleteInvalidBookSources': 'delete_invalid_book_sources',
+  '/reader3/saveBookSource': 'save_book_source',
+  '/reader3/saveBookSources': 'save_book_sources',
+  '/reader3/deleteBookSource': 'delete_book_source',
+  '/reader3/deleteBookSources': 'delete_book_sources',
+  '/reader3/deleteAllBookSources': 'delete_all_book_sources',
+  '/reader3/pinBookSource': 'pin_book_source',
+  '/reader3/unpinBookSource': 'unpin_book_source',
+  '/reader3/readRemoteSourceFile': 'read_remote_source_file',
+  '/reader3/searchBookMulti': 'search_book_multi',
+  '/reader3/getBookshelf': 'get_bookshelf',
+  '/reader3/getShelfBookWithCacheInfo': 'get_shelf_book_with_cache_info',
+  '/reader3/getBookGroups': 'get_book_groups',
+  '/reader3/saveBookGroup': 'save_book_group',
+  '/reader3/saveBookGroupOrder': 'save_book_group_order',
+  '/reader3/deleteBookGroup': 'delete_book_group',
+  '/reader3/deleteBookGroups': 'delete_book_groups',
+  '/reader3/saveBookGroupId': 'save_book_group_id',
+  '/reader3/saveBook': 'save_book',
+  '/reader3/saveBooks': 'save_books',
+  '/reader3/setBookSource': 'set_book_source',
+  '/reader3/deleteBook': 'delete_book',
+  '/reader3/deleteBooks': 'delete_books',
+  '/reader3/saveBookProgress': 'save_book_progress',
+  '/reader3/getBookInfo': 'get_book_info',
+  '/reader3/getChapterList': 'get_chapter_list',
+  // 注意: getBookContent 需要额外的 Channel 参数(加载阶段), 不能走这里 ——
+  // 见 api/bookshelf.ts 的 getBookContent 直接 invoke 实现。
+  '/reader3/deleteBookCache': 'delete_book_cache',
+  '/reader3/clearSearchCoverCache': 'clear_search_cover_cache',
+  '/reader3/getCachedChapterUrls': 'get_cached_chapter_urls',
+  '/reader3/getChapterWordCounts': 'get_chapter_word_counts',
+  '/reader3/getAvailableBookSource': 'get_available_book_source',
+  '/reader3/getRssSources': 'get_rss_sources',
+  '/reader3/saveRssSource': 'save_rss_source',
+  '/reader3/saveRssSources': 'save_rss_sources',
+  '/reader3/deleteRssSource': 'delete_rss_source',
+  '/reader3/deleteRssSources': 'delete_rss_sources',
+  '/reader3/readRemoteRssSourceFile': 'read_remote_rss_source_file',
+  '/reader3/getRssArticles': 'get_rss_articles',
+  '/reader3/getRssContent': 'get_rss_content',
+  '/reader3/openRssSourcePanel': 'open_rss_source_panel',
+  '/reader3/getBookmarks': 'get_bookmarks',
+  '/reader3/saveBookmark': 'save_bookmark',
+  '/reader3/saveBookmarks': 'save_bookmarks',
+  '/reader3/deleteBookmark': 'delete_bookmark',
+  '/reader3/deleteBookmarks': 'delete_bookmarks',
+  '/reader3/getReplaceRules': 'get_replace_rules',
+  '/reader3/saveReplaceRule': 'save_replace_rule',
+  '/reader3/saveReplaceRules': 'save_replace_rules',
+  '/reader3/deleteReplaceRule': 'delete_replace_rule',
+  '/reader3/deleteReplaceRules': 'delete_replace_rules',
+  '/reader3/getWebdavFileList': 'get_webdav_file_list',
+  '/reader3/getWebdavFile': 'get_webdav_file',
+  '/reader3/getWebdavBackupArchive': 'get_webdav_backup_archive',
+  '/reader3/deleteWebdavFile': 'delete_webdav_file',
+  '/reader3/deleteWebdavFileList': 'delete_webdav_file_list',
+  '/reader3/getWebdavHome': 'get_webdav_home',
+  '/reader3/openWebdavFolder': 'open_webdav_folder',
+}
+
+/**
+ * 把 Tauri command 的 reject 值统一成 `Error`。
+ *
+ * Rust 侧的 `AppError` 自定义了 `Serialize`（`serializer.serialize_str(...)`），
+ * 因此 `invoke()` 被 `Err(AppError)` 拒绝时拿到的是**字符串**而非 `Error`。
+ * 调用方写 `(error as Error).message` 只会得到 `undefined`，真实原因被兜底文案
+ * 吞掉 —— 用户只能看到「备份失败」，无从判断是超限、路径还是网络问题。
+ */
+export function toError(value: unknown, fallback = '请求失败'): Error {
+  if (value instanceof Error) return value
+  if (typeof value === 'string' && value.trim()) return new Error(value)
+  if (value && typeof value === 'object' && typeof (value as { message?: unknown }).message === 'string') {
+    const message = (value as { message: string }).message
+    if (message.trim()) return new Error(message)
+  }
+  return new Error(fallback)
+}
+
+let lastNeedLoginDispatchAt = 0
+
+function dispatchNeedLogin() {
+  const now = Date.now()
+  if (now - lastNeedLoginDispatchAt < 1500) return
+  lastNeedLoginDispatchAt = now
+  window.dispatchEvent(new CustomEvent('need-login'))
+}
+
+async function call<T>(path: string, payload: unknown): Promise<T> {
+  // The api/*.ts modules pass relative paths (e.g. `/getBookSources`) because
+  // the old axios client had `baseURL: '/reader3'`. Normalize to the full path
+  // the command map is keyed on.
+  const fullPath = path.startsWith('/reader3') ? path : `/reader3${path}`
+  const command = COMMAND_BY_PATH[fullPath]
+  if (!command) throw new Error(`未知接口: ${path}`)
+  try {
+    const res = (await invoke(command, payload === undefined ? {} : { req: payload })) as
+      | ApiResponse<T>
+      | T
+    if (typeof res === 'object' && res !== null && 'isSuccess' in res) {
+      const box = res as ApiResponse<T>
+      if (!box.isSuccess) {
+        if (box.errorMsg === 'NEED_LOGIN' || box.data === 'NEED_LOGIN') {
+          dispatchNeedLogin()
+        }
+        throw new Error(box.errorMsg || '请求失败')
+      }
+      return box.data as T
+    }
+    return res as T // raw payload (binary endpoints that bypass the envelope)
+  } catch (err) {
+    throw toError(err)
+  }
+}
+
+/** GET with query params → command args. */
+export function get<T>(path: string, opts?: { params?: Record<string, unknown> }): Promise<{ data: T }> {
+  return call<T>(path, opts?.params).then((data) => ({ data }))
+}
+
+/** POST with a JSON body → command `req` arg. */
+export function post<T>(path: string, body?: unknown, _config?: unknown): Promise<{ data: T }> {
+  return call<T>(path, body).then((data) => ({ data }))
+}
+
+/** Direct invoke without the axios-shaped wrapper (for binary/SSE helpers). */
+export function invokeRaw<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  return invoke<T>(command, args)
+}
+
+/**
+ * Invoke a command that takes top-level args (not wrapped in `req`) and returns
+ * an ApiResponse envelope. Used by upload commands whose Rust params are
+ * `file`/`file_name`/`path` etc. rather than a single `req` struct.
+ */
+export async function invokeEnvelope<T>(
+  command: string,
+  args: Record<string, unknown>,
+): Promise<T> {
+  const res = await invoke<ApiResponse<T>>(command, args).catch((err) => {
+    throw toError(err)
+  })
+  if (!res.isSuccess) throw new Error(res.errorMsg || '请求失败')
+  return res.data as T
+}
+
+/**
+ * 上传二进制文件专用：把字节作为**顶层** payload 交给 Tauri。
+ *
+ * 为什么不能复用 `invokeEnvelope` —— Tauri 只在载荷本身是二进制时才走
+ * octet-stream 通道（tauri 的 process-ipc-message-fn.js: 顶层 ArrayBuffer /
+ * ArrayBufferView / Array 才命中）。一旦把 `Uint8Array` 塞进对象（如
+ * `{ fileName, file }`），就落进 `JSON.stringify` 分支，那里对 Uint8Array 做
+ * `Array.from(val)` —— 每个字节变成一个十进制数字、平均 3.57 个字符。
+ * 一本 50MB 的 TXT 会因此涨到约 178MB 字符串再被 Rust 解析回字节，
+ * 纯编码就要 1.8s 以上，这正是"导入本地书比初版慢几倍"的主因。
+ *
+ * 顶层传字节后，附带信息（文件名等）改走 IPC 的 header。注意 header 值只能是
+ * ASCII，中文文件名必须在调用方先 encodeURIComponent，Rust 侧再解码。
+ *
+ * 参数收 `Blob` 而非 `File`：WebDAV 上传传的是 `Blob`（无 .name），
+ * `File` 是其子类，因此两类调用点都能用。
+ */
+export async function invokeUpload<T>(
+  command: string,
+  commandHeaders: Record<string, string>,
+  file: Blob,
+): Promise<T> {
+  const res = await invoke<ApiResponse<T>>(command, new Uint8Array(await file.arrayBuffer()), {
+    headers: commandHeaders,
+  }).catch((err) => {
+    throw toError(err)
+  })
+  if (!res.isSuccess) throw new Error(res.errorMsg || '请求失败')
+  return res.data as T
+}
+
+export default { get, post, invokeRaw, invokeEnvelope, invokeUpload, toError }

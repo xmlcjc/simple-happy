@@ -1,0 +1,67 @@
+use serde::{Deserialize, Serialize};
+
+use super::search::SearchBook;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BookReadConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_replace_rule: Option<bool>,
+    /// Preserve the remaining Legado reading settings during book round trips.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Book {
+    pub name: String,
+    pub author: String,
+    pub book_url: String,
+    pub origin: String,
+    pub origin_name: Option<String>,
+    pub cover_url: Option<String>,
+    pub toc_url: Option<String>,
+    pub charset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_config: Option<BookReadConfig>,
+    pub custom_cover_url: Option<String>,
+    /// 用户自定义书名/作者/简介之前的原始值, 用于「还原」。
+    ///
+    /// 只在**首次**保存自定义内容时写入, 之后不再变动 —— 这样无论用户改过多少轮,
+    /// 都能一键回到最初始(书源/导入时)的样子。三个字段都是 Option: 从未自定义过
+    /// 的书它们是 None, 此时「还原」无内容可回退。
+    pub original_name: Option<String>,
+    pub original_author: Option<String>,
+    pub original_intro: Option<String>,
+    pub can_update: Option<bool>,
+    pub dur_chapter_index: Option<i32>,
+    pub dur_chapter_pos: Option<i32>,
+    pub dur_chapter_time: Option<i64>,
+    pub dur_chapter_title: Option<String>,
+    pub intro: Option<String>,
+    pub latest_chapter_title: Option<String>,
+    pub last_check_time: Option<i64>,
+    pub total_chapter_num: Option<i32>,
+    pub r#type: Option<i32>,
+    pub group: Option<i64>,
+    /// Legado 的 `order`: 手动排序(书架排序方式=「手动排序」)时的位置。
+    ///
+    /// 之前顺序完全靠 bookshelf.json 的数组下标表达, 与 Legado 的备份格式
+    /// 互不相认 —— 从 Legado 恢复的书架会把 order 一路丢弃, 「手动排序」
+    /// 退化成导入顺序; 反过来导出给 Legado 也没有 order 可用。
+    /// 缺失时前端把这本书排在所有有 order 的书之后, 老数据无需迁移。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+    pub word_count: Option<String>,
+    pub info_html: Option<String>,
+    pub toc_html: Option<String>,
+    pub kind: Option<String>,
+    pub update_time: Option<String>,
+    pub can_re_name: Option<String>,
+    pub download_urls: Option<String>,
+    /// Per-source search hits retained for stable source switching after the
+    /// book is added to the shelf.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_candidates: Option<Vec<SearchBook>>,
+}

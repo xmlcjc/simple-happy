@@ -1,0 +1,13 @@
+# Project-local cargo mirror.
+# Reason: this machine cannot reach github.com / crates.io directly (proxy 127.0.0.1:7890 not listening,
+# direct git/https to github.com timed out). USTC/rsproxy mirrors are reachable.
+# This file is LOCAL ONLY (not part of upstream Reader). Delete it when network is unrestricted.
+#
+# Note: [patch.crates-io] entries in Cargo.toml (vendor/pdf-extract, vendor/tao) still apply on top
+# of the replaced source.
+
+[source.crates-io]
+replace-with = "ustc"
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
