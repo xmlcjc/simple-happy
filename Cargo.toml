@@ -1,7 +1,8 @@
 [package]
 name = "reader-rust"
-version = "1.5.7"
+version = "1.0.0"
 edition = "2021"
+description = "Simple Happy — 阅读 + 直播 + 音乐 + RSS 一体化桌面客户端的本地核心"
 
 # The desktop app is a workspace member so it shares this target/ directory, but
 # `default-members` keeps bare `cargo build` / `cargo test` (and the Dockerfile)
