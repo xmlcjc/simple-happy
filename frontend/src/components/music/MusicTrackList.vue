@@ -31,6 +31,19 @@
         <small>{{ subtitle(item) }}</small>
       </span>
       <span v-if="item.duration" class="track-duration">{{ formatDuration(item.duration) }}</span>
+      <button
+        v-if="allowQueueAction"
+        type="button"
+        class="queue-action"
+        title="下一首播放"
+        aria-label="下一首播放"
+        @click.stop="emit('play-next', item)"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M4 6h9M4 12h9M4 18h5" />
+          <path d="M14 12h7M18 8l4 4-4 4" />
+        </svg>
+      </button>
       <slot name="actions" :item="item"></slot>
       <span v-if="showSource" class="track-source">{{ item.platform }}</span>
     </button>
@@ -46,16 +59,19 @@ withDefaults(
     emptyText?: string
     emptyHint?: string
     showSource?: boolean
+    allowQueueAction?: boolean
   }>(),
   {
     emptyText: '暂无歌曲',
     emptyHint: '',
     showSource: true,
+    allowQueueAction: true,
   },
 )
 
 const emit = defineEmits<{
   play: [item: MusicItem]
+  'play-next': [item: MusicItem]
 }>()
 
 function subtitle(item: MusicItem) {
@@ -152,6 +168,34 @@ function formatDuration(seconds: number) {
   background: var(--color-bg-sunken);
   color: var(--color-text-tertiary);
   font-size: 11px;
+}
+
+.queue-action {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-tertiary);
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-out), color var(--duration-fast);
+}
+
+.track-row:hover .queue-action,
+.queue-action:focus-visible {
+  opacity: 1;
+}
+
+.queue-action:hover {
+  background: var(--color-bg-sunken);
+  color: var(--color-primary);
+}
+
+.queue-action svg {
+  width: 15px;
+  height: 15px;
 }
 
 .track-empty {

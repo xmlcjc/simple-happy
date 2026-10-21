@@ -3,6 +3,8 @@
 //! 只做参数解包与 `MusicService` 转发, 不写业务逻辑。
 //! 复合参数统一收进 `req`, 与 `commands::live` 的调用约定保持一致。
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 use crate::api::AppState;
@@ -12,7 +14,9 @@ use crate::service::music::library::{
 };
 use crate::service::music::local::LocalTrack;
 use crate::service::music::model::{
-    MusicItem, MusicLyric, MusicMediaSource, MusicPlugin, MusicSearchPage,
+    MusicCollectionDetail, MusicCollectionItem, MusicCollectionPage, MusicItem, MusicLyric,
+    MusicMediaSource, MusicPlugin, MusicRecommendTags, MusicSearchPage, MusicSheetGroup, MusicTag,
+    PluginVariable,
 };
 
 /// 当前为单用户桌面应用; 数据表仍保留 user_ns 维度, 便于日后多用户扩展。
@@ -69,6 +73,67 @@ pub async fn music_plugin_set_enabled(
     Ok(ApiResponse::ok(serde_json::json!({ "enabled": enabled })))
 }
 
+#[tauri::command]
+pub async fn music_plugin_update(
+    state: tauri::State<'_, AppState>,
+    platform: String,
+) -> Result<ApiResponse<MusicPlugin>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.update_plugin(&platform).await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_plugin_update_all(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.update_all_plugins().await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_plugin_user_variables(
+    state: tauri::State<'_, AppState>,
+    platform: String,
+) -> Result<ApiResponse<Vec<PluginVariable>>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .plugin_variable_definitions(&platform)
+            .await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_plugin_variables(
+    state: tauri::State<'_, AppState>,
+    platform: String,
+) -> Result<ApiResponse<HashMap<String, String>>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.plugin_variable_values(&platform).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicPluginVariablesRequest {
+    pub platform: String,
+    pub values: HashMap<String, String>,
+}
+
+#[tauri::command]
+pub async fn music_plugin_set_variables(
+    state: tauri::State<'_, AppState>,
+    req: MusicPluginVariablesRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    state
+        .music_service
+        .set_plugin_variables(&req.platform, &req.values)
+        .await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "saved": true })))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MusicSearchRequest {
@@ -92,6 +157,140 @@ pub async fn music_search(
                 &req.keyword,
                 req.page.unwrap_or(1),
                 req.search_type.as_deref().unwrap_or("music"),
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicCollectionSearchRequest {
+    pub platform: String,
+    pub keyword: String,
+    pub page: Option<u32>,
+    /// album / artist / sheet。
+    pub search_type: String,
+}
+
+#[tauri::command]
+pub async fn music_search_collections(
+    state: tauri::State<'_, AppState>,
+    req: MusicCollectionSearchRequest,
+) -> Result<ApiResponse<MusicCollectionPage>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .search_collections(
+                &req.platform,
+                &req.keyword,
+                req.page.unwrap_or(1),
+                &req.search_type,
+            )
+            .await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_top_lists(
+    state: tauri::State<'_, AppState>,
+    platform: String,
+) -> Result<ApiResponse<Vec<MusicSheetGroup>>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.top_lists(&platform).await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_recommend_sheet_tags(
+    state: tauri::State<'_, AppState>,
+    platform: String,
+) -> Result<ApiResponse<MusicRecommendTags>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.recommend_sheet_tags(&platform).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicRecommendSheetsRequest {
+    pub platform: String,
+    pub tag: MusicTag,
+    pub page: Option<u32>,
+}
+
+#[tauri::command]
+pub async fn music_recommend_sheets(
+    state: tauri::State<'_, AppState>,
+    req: MusicRecommendSheetsRequest,
+) -> Result<ApiResponse<MusicCollectionPage>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .recommend_sheets(&req.platform, &req.tag, req.page.unwrap_or(1))
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicImportRequest {
+    pub platform: String,
+    /// 分享链接（由插件解析）。
+    pub url: String,
+}
+
+#[tauri::command]
+pub async fn music_import_sheet(
+    state: tauri::State<'_, AppState>,
+    req: MusicImportRequest,
+) -> Result<ApiResponse<Vec<MusicItem>>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .import_sheet(&req.platform, &req.url)
+            .await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_import_item(
+    state: tauri::State<'_, AppState>,
+    req: MusicImportRequest,
+) -> Result<ApiResponse<MusicItem>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .import_item(&req.platform, &req.url)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicCollectionDetailRequest {
+    pub platform: String,
+    /// album / artist / sheet / toplist。
+    pub kind: String,
+    pub item: MusicCollectionItem,
+    pub page: Option<u32>,
+    /// 歌手详情专用: music / album。
+    pub work_type: Option<String>,
+}
+
+#[tauri::command]
+pub async fn music_collection_detail(
+    state: tauri::State<'_, AppState>,
+    req: MusicCollectionDetailRequest,
+) -> Result<ApiResponse<MusicCollectionDetail>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .collection_detail(
+                &req.platform,
+                &req.kind,
+                &req.item,
+                req.page.unwrap_or(1),
+                req.work_type.as_deref().unwrap_or("music"),
             )
             .await?,
     ))
@@ -312,6 +511,31 @@ pub struct MusicPlaylistKey {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MusicPlaylistRemoveBatchRequest {
+    pub playlist_id: String,
+    pub keys: Vec<MusicPlaylistKey>,
+}
+
+#[tauri::command]
+pub async fn music_playlist_remove_batch(
+    state: tauri::State<'_, AppState>,
+    req: MusicPlaylistRemoveBatchRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let keys: Vec<(String, String)> = req
+        .keys
+        .into_iter()
+        .map(|key| (key.platform, key.item_id))
+        .collect();
+    let removed = state
+        .music_service
+        .library()
+        .remove_many_from_playlist(USER_NS, &req.playlist_id, &keys)
+        .await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "removed": removed })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MusicPlaylistReorderRequest {
     pub playlist_id: String,
     pub keys: Vec<MusicPlaylistKey>,
@@ -462,6 +686,20 @@ pub async fn music_local_list(
     Ok(ApiResponse::ok(
         state.music_service.local().list(USER_NS).await?,
     ))
+}
+
+#[tauri::command]
+pub async fn music_cache_stats(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    Ok(ApiResponse::ok(state.music_service.cache_stats()))
+}
+
+#[tauri::command]
+pub async fn music_cache_clear(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    Ok(ApiResponse::ok(state.music_service.clear_cache()))
 }
 
 #[tauri::command]

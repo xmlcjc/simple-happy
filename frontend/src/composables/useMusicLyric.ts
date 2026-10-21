@@ -1,5 +1,6 @@
 import { computed, ref, watch, type Ref } from 'vue'
 import { useMusicStore } from '../stores/music'
+import { useMusicSettingsStore } from '../stores/musicSettings'
 import type { MusicItem } from '../api/music'
 
 export interface LyricLine {
@@ -65,6 +66,7 @@ export function findLyricIndex(lines: LyricLine[], time: number): number {
 /** 跟随当前曲目加载歌词，并把播放时间映射到高亮行。 */
 export function useMusicLyric(current: Ref<MusicItem | null>, time: Ref<number>) {
   const store = useMusicStore()
+  const settings = useMusicSettingsStore()
   const lines = ref<LyricLine[]>([])
   const loading = ref(false)
   const error = ref('')
@@ -104,7 +106,10 @@ export function useMusicLyric(current: Ref<MusicItem | null>, time: Ref<number>)
     { immediate: true },
   )
 
-  const currentIndex = computed(() => findLyricIndex(lines.value, time.value))
+  // 偏移为正表示歌词延后：用「播放时间 - 偏移」去匹配行时间。
+  const currentIndex = computed(() =>
+    findLyricIndex(lines.value, time.value - settings.lyricOffsetMs / 1000),
+  )
 
   return { lines, loading, error, currentIndex }
 }

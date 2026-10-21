@@ -32,6 +32,63 @@ export interface MusicSearchPage {
   platform: string
 }
 
+/** 搜索类型：music 为单曲，其余为集合型条目。 */
+export type MusicSearchType = 'music' | 'album' | 'artist' | 'sheet'
+
+/** 专辑 / 歌手 / 歌单。歌手条目的 name/avatar 已在后端归一成 title/artwork。 */
+export interface MusicCollectionItem {
+  platform: string
+  id: string
+  title: string
+  artist?: string
+  artwork?: string
+  description?: string
+  worksNum?: number
+  playCount?: number
+  date?: string
+  [key: string]: unknown
+}
+
+export interface MusicCollectionPage {
+  items: MusicCollectionItem[]
+  isEnd: boolean
+  platform: string
+  searchType: string
+}
+
+/** 详情页类型：专辑 / 歌手 / 歌单 / 榜单。 */
+export type MusicCollectionKind = 'album' | 'artist' | 'sheet' | 'toplist'
+
+/** 集合详情：专辑/歌单/榜单给 items，歌手的专辑作品给 collections。 */
+export interface MusicCollectionDetail {
+  item: MusicCollectionItem | null
+  items: MusicItem[]
+  collections: MusicCollectionItem[]
+  isEnd: boolean
+}
+
+/** 榜单分组。 */
+export interface MusicSheetGroup {
+  title: string
+  items: MusicCollectionItem[]
+}
+
+export interface MusicTag {
+  id: string
+  title: string
+}
+
+export interface MusicTagGroup {
+  title: string
+  tags: MusicTag[]
+}
+
+/** 推荐歌单的 tag 列表；pinned 是插件固定的入口歌单。 */
+export interface MusicRecommendTags {
+  pinned: MusicCollectionItem[]
+  groups: MusicTagGroup[]
+}
+
 export interface MusicMediaSource {
   url: string
   quality: string
@@ -55,11 +112,46 @@ export function uninstallMusicPlugin(platform: string): Promise<{ removed: boole
   return invokeEnvelope('music_plugin_uninstall', { platform })
 }
 
+export function updateMusicPlugin(platform: string): Promise<MusicPlugin> {
+  return invokeEnvelope('music_plugin_update', { platform })
+}
+
+export interface MusicPluginUpdateAllResult {
+  updated: number
+  failures: Array<{ platform: string; error: string }>
+}
+
+export function updateAllMusicPlugins(): Promise<MusicPluginUpdateAllResult> {
+  return invokeEnvelope('music_plugin_update_all', {})
+}
+
 export function setMusicPluginEnabled(
   platform: string,
   enabled: boolean,
 ): Promise<{ enabled: boolean }> {
   return invokeEnvelope('music_plugin_set_enabled', { platform, enabled })
+}
+
+/** 插件声明的用户变量（登录 token / cookie 等）。 */
+export interface MusicPluginVariable {
+  key: string
+  name?: string
+  hint?: string
+}
+
+export function getMusicPluginVariables(platform: string): Promise<MusicPluginVariable[]> {
+  return invokeEnvelope('music_plugin_user_variables', { platform })
+}
+
+export function getMusicPluginVariableValues(platform: string): Promise<Record<string, string>> {
+  return invokeEnvelope('music_plugin_variables', { platform })
+}
+
+export function setMusicPluginVariables(
+  platform: string,
+  values: Record<string, string>,
+): Promise<{ saved: boolean }> {
+  return invokeEnvelope('music_plugin_set_variables', { req: { platform, values } })
 }
 
 export function searchMusic(params: {
@@ -74,6 +166,80 @@ export function searchMusic(params: {
       keyword: params.keyword,
       page: params.page ?? 1,
       searchType: params.searchType ?? 'music',
+    },
+  })
+}
+
+export function searchMusicCollections(params: {
+  platform: string
+  keyword: string
+  page?: number
+  searchType: Exclude<MusicSearchType, 'music'>
+}): Promise<MusicCollectionPage> {
+  return invokeEnvelope('music_search_collections', {
+    req: {
+      platform: params.platform,
+      keyword: params.keyword,
+      page: params.page ?? 1,
+      searchType: params.searchType,
+    },
+  })
+}
+
+export function getMusicTopLists(platform: string): Promise<MusicSheetGroup[]> {
+  return invokeEnvelope('music_top_lists', { platform })
+}
+
+export function getMusicRecommendTags(platform: string): Promise<MusicRecommendTags> {
+  return invokeEnvelope('music_recommend_sheet_tags', { platform })
+}
+
+export function getMusicRecommendSheets(params: {
+  platform: string
+  tag: MusicTag
+  page?: number
+}): Promise<MusicCollectionPage> {
+  return invokeEnvelope('music_recommend_sheets', {
+    req: { platform: params.platform, tag: params.tag, page: params.page ?? 1 },
+  })
+}
+
+export function importMusicSheet(platform: string, url: string): Promise<MusicItem[]> {
+  return invokeEnvelope('music_import_sheet', { req: { platform, url } })
+}
+
+export function importMusicItem(platform: string, url: string): Promise<MusicItem> {
+  return invokeEnvelope('music_import_item', { req: { platform, url } })
+}
+
+export interface MusicCacheStats {
+  bytes: number
+  files: number
+  limitBytes: number
+}
+
+export function getMusicCacheStats(): Promise<MusicCacheStats> {
+  return invokeEnvelope('music_cache_stats', {})
+}
+
+export function clearMusicCache(): Promise<{ freedBytes: number }> {
+  return invokeEnvelope('music_cache_clear', {})
+}
+
+export function getMusicCollectionDetail(params: {
+  platform: string
+  kind: MusicCollectionKind
+  item: MusicCollectionItem
+  page?: number
+  workType?: 'music' | 'album'
+}): Promise<MusicCollectionDetail> {
+  return invokeEnvelope('music_collection_detail', {
+    req: {
+      platform: params.platform,
+      kind: params.kind,
+      item: params.item,
+      page: params.page ?? 1,
+      workType: params.workType ?? 'music',
     },
   })
 }
@@ -187,6 +353,18 @@ export function removeMusicFromPlaylist(
 ): Promise<{ removed: boolean }> {
   return invokeEnvelope('music_playlist_remove', {
     req: { playlistId, platform, itemId },
+  })
+}
+
+export function removeMusicFromPlaylistBatch(
+  playlistId: string,
+  items: MusicItem[],
+): Promise<{ removed: number }> {
+  return invokeEnvelope('music_playlist_remove_batch', {
+    req: {
+      playlistId,
+      keys: items.map((item) => ({ platform: item.platform, itemId: item.id })),
+    },
   })
 }
 

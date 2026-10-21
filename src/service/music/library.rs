@@ -321,6 +321,41 @@ impl MusicLibrary {
         Ok(result.rows_affected() > 0)
     }
 
+    /// 批量从歌单移除，单事务完成，避免逐首删除的半途状态。
+    pub async fn remove_many_from_playlist(
+        &self,
+        user_ns: &str,
+        playlist_id: &str,
+        keys: &[(String, String)],
+    ) -> Result<u64, AppError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut removed = 0u64;
+        for (platform, item_id) in keys {
+            let result = sqlx::query(
+                "DELETE FROM music_playlist_item
+                 WHERE user_ns = ?1 AND playlist_id = ?2 AND platform = ?3 AND item_id = ?4",
+            )
+            .bind(user_ns)
+            .bind(playlist_id)
+            .bind(platform)
+            .bind(item_id)
+            .execute(&mut *tx)
+            .await?;
+            removed += result.rows_affected();
+        }
+        sqlx::query("UPDATE music_playlist SET updated_at = ?1 WHERE user_ns = ?2 AND id = ?3")
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(user_ns)
+            .bind(playlist_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     /// 按给定顺序重排歌单项。
     pub async fn reorder_playlist(
         &self,
@@ -561,6 +596,39 @@ mod tests {
             .unwrap());
         assert_eq!(library.playlist_items("default", &playlist.id).await.unwrap().len(), 1);
         assert!(library.delete_playlist("default", &playlist.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn playlist_remove_batch_deletes_selected_items() {
+        let library = MusicLibrary::new(memory_pool().await);
+        let playlist = library.create_playlist("default", "批量").await.unwrap();
+        let added = library
+            .add_to_playlist("default", &playlist.id, &[item("1"), item("2"), item("3")])
+            .await
+            .unwrap();
+        assert_eq!(added, 3);
+
+        let removed = library
+            .remove_many_from_playlist(
+                "default",
+                &playlist.id,
+                &[("demo".into(), "1".into()), ("demo".into(), "3".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+        let items = library.playlist_items("default", &playlist.id).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "2");
+
+        // 空列表直接返回 0，不会误删整个歌单。
+        assert_eq!(
+            library
+                .remove_many_from_playlist("default", &playlist.id, &[])
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

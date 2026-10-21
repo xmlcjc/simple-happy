@@ -91,6 +91,7 @@ pub async fn build_state(cfg: &AppConfig) -> anyhow::Result<AppState> {
     let live_service = Arc::new(LiveService::new(http.clone()));
     let live_stats_service = Arc::new(LiveStatsService::new(pool.clone()));
     let live_follow_service = Arc::new(LiveFollowService::new(pool.clone()));
+    let live_history_service = Arc::new(crate::service::live::history::LiveHistoryService::new(pool.clone()));
     let music_service = Arc::new(MusicService::new(
         pool.clone(),
         http.clone(),
@@ -116,6 +117,7 @@ pub async fn build_state(cfg: &AppConfig) -> anyhow::Result<AppState> {
         live_service,
         live_stats_service,
         live_follow_service,
+        live_history_service,
         music_service,
         danmaku_registry: crate::service::live::danmaku::DanmakuRegistry::new(),
         update_service,

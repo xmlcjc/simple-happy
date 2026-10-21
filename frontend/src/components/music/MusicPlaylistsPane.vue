@@ -6,6 +6,8 @@
         <button type="submit" :disabled="!newName || creating">+</button>
       </form>
 
+      <button type="button" class="import-entry" @click="importOpen = true">链接导入</button>
+
       <div class="playlist-rows">
         <button
           v-for="playlist in libraryStore.playlists"
@@ -28,9 +30,31 @@
           <strong>{{ activePlaylist.name }}</strong>
           <small>{{ libraryStore.playlistItems.length }} 首</small>
           <span class="playlist-spacer"></span>
+          <select v-model="sortKey" class="sort-select" title="歌曲排序">
+            <option value="added">默认顺序</option>
+            <option value="title">按标题</option>
+            <option value="artist">按歌手</option>
+            <option value="album">按专辑</option>
+          </select>
+          <button type="button" class="ghost-btn" @click="toggleEdit">
+            {{ editing ? '完成' : '编辑' }}
+          </button>
           <button type="button" class="ghost-btn" @click="startRename">重命名</button>
           <button type="button" class="ghost-btn danger" @click="removePlaylist">删除</button>
         </header>
+
+        <div v-if="editing" class="batch-bar">
+          <button type="button" @click="selectAll">全选</button>
+          <button type="button" @click="invertSelection">反选</button>
+          <span class="batch-count">已选 {{ selected.length }} 首</span>
+          <span class="playlist-spacer"></span>
+          <button type="button" :disabled="!selected.length" @click="addSelectedToPlaylist">
+            加入其它歌单
+          </button>
+          <button type="button" class="danger" :disabled="!selected.length" @click="removeSelected">
+            移出歌单
+          </button>
+        </div>
 
         <form v-if="renaming" class="rename-row" @submit.prevent="applyRename">
           <input v-model.trim="renameText" type="text" maxlength="40" />
@@ -39,13 +63,32 @@
         </form>
 
         <MusicTrackList
-          :items="libraryStore.playlistItems"
+          :items="displayedItems"
           empty-text="歌单还是空的"
           empty-hint="在搜索结果或收藏里点「+」加入。"
-          @play="emit('play', $event, libraryStore.playlistItems)"
+          @play="handleRowPlay"
+          @play-next="emit('play-next', $event)"
         >
           <template #actions="{ item }">
-            <button type="button" class="row-action" title="从歌单移除" @click.stop="removeItem(item)">
+            <button
+              v-if="editing"
+              type="button"
+              class="select-box"
+              :class="{ checked: isSelected(item) }"
+              :aria-label="isSelected(item) ? '取消选择' : '选择'"
+              @click.stop="toggleSelect(item)"
+            >
+              <svg v-if="isSelected(item)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                <path d="m5 13 4 4L19 7" />
+              </svg>
+            </button>
+            <button
+              v-else
+              type="button"
+              class="row-action"
+              title="从歌单移除"
+              @click.stop="removeItem(item)"
+            >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M5 12h14" />
               </svg>
@@ -60,6 +103,8 @@
       </div>
     </section>
   </div>
+
+  <MusicImportDialog v-model="importOpen" @imported="handleImported" />
 </template>
 
 <script setup lang="ts">
@@ -68,10 +113,13 @@ import { useMusicLibraryStore } from '../../stores/musicLibrary'
 import { useAppStore } from '../../stores/app'
 import { renameMusicPlaylist } from '../../api/music'
 import MusicTrackList from './MusicTrackList.vue'
+import MusicImportDialog from './MusicImportDialog.vue'
 import type { MusicItem } from '../../api/music'
 
 const emit = defineEmits<{
   play: [item: MusicItem, queue: MusicItem[]]
+  'play-next': [item: MusicItem]
+  'import-items': [items: MusicItem[]]
 }>()
 
 const libraryStore = useMusicLibraryStore()
@@ -81,6 +129,92 @@ const newName = ref('')
 const creating = ref(false)
 const renaming = ref(false)
 const renameText = ref('')
+const importOpen = ref(false)
+
+type SortKey = 'added' | 'title' | 'artist' | 'album'
+const sortKey = ref<SortKey>('added')
+const editing = ref(false)
+const selected = ref<string[]>([])
+
+function keyOf(item: MusicItem) {
+  return `${item.platform}:${item.id}`
+}
+
+/** 默认按歌单内顺序；其余排序只影响展示，不写库。 */
+const displayedItems = computed(() => {
+  const list = [...libraryStore.playlistItems]
+  if (sortKey.value === 'added') return list
+  const key = sortKey.value
+  return list.sort((a, b) =>
+    String(a[key] ?? '').localeCompare(String(b[key] ?? ''), 'zh-Hans-CN'),
+  )
+})
+
+function isSelected(item: MusicItem) {
+  return selected.value.includes(keyOf(item))
+}
+
+function toggleSelect(item: MusicItem) {
+  const key = keyOf(item)
+  selected.value = selected.value.includes(key)
+    ? selected.value.filter((entry) => entry !== key)
+    : [...selected.value, key]
+}
+
+function toggleEdit() {
+  editing.value = !editing.value
+  if (!editing.value) selected.value = []
+}
+
+function selectAll() {
+  selected.value = displayedItems.value.map(keyOf)
+}
+
+function invertSelection() {
+  selected.value = displayedItems.value
+    .map(keyOf)
+    .filter((key) => !selected.value.includes(key))
+}
+
+function handleRowPlay(item: MusicItem) {
+  if (editing.value) {
+    toggleSelect(item)
+    return
+  }
+  emit('play', item, displayedItems.value)
+}
+
+function addSelectedToPlaylist() {
+  const items = displayedItems.value.filter(isSelected)
+  if (!items.length) return
+  emit('import-items', items)
+  selected.value = []
+  editing.value = false
+}
+
+async function removeSelected() {
+  if (!activePlaylist.value) return
+  const items = displayedItems.value.filter(isSelected)
+  if (!items.length) return
+  const confirmed = await appStore.confirmDialog(
+    `从歌单「${activePlaylist.value.name}」移除选中的 ${items.length} 首歌曲？`,
+    { title: '批量移除', danger: true },
+  )
+  if (!confirmed) return
+  try {
+    const removed = await libraryStore.removeManyFromPlaylist(activePlaylist.value.id, items)
+    appStore.showToast(`已移除 ${removed} 首`, 'success')
+    selected.value = []
+    editing.value = false
+  } catch (error) {
+    appStore.showToast((error as Error).message || '移除失败', 'error')
+  }
+}
+
+/** 导入对话框只负责解析，存到哪个歌单交给统一的选择器。 */
+function handleImported(items: MusicItem[]) {
+  if (items.length) emit('import-items', items)
+}
 
 const activePlaylist = computed(
   () => libraryStore.playlists.find((item) => item.id === libraryStore.activePlaylistId) ?? null,
@@ -114,6 +248,8 @@ async function createPlaylist() {
 }
 
 async function selectPlaylist(id: string) {
+  editing.value = false
+  selected.value = []
   try {
     await libraryStore.loadPlaylistItems(id)
   } catch (error) {
@@ -219,6 +355,20 @@ onMounted(refresh)
   cursor: not-allowed;
 }
 
+.import-entry {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--color-border-light);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.import-entry:hover {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
+}
+
 .playlist-rows {
   flex: 1;
   min-height: 0;
@@ -295,6 +445,81 @@ onMounted(refresh)
 
 .playlist-spacer {
   flex: 1;
+}
+
+.sort-select {
+  padding: 4px 6px;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  outline: none;
+}
+
+.sort-select:focus {
+  border-color: var(--color-primary);
+}
+
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-sunken);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.batch-bar button {
+  padding: 4px 10px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.batch-bar button:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-primary);
+}
+
+.batch-bar button.danger:hover:not(:disabled) {
+  color: var(--color-danger, #c0392b);
+}
+
+.batch-bar button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.batch-count {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+}
+
+.select-box {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-primary-soft-text);
+}
+
+.select-box.checked {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.select-box svg {
+  width: 13px;
+  height: 13px;
 }
 
 .ghost-btn {

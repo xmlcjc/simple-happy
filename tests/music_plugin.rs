@@ -86,7 +86,12 @@ module.exports = {{
     );
 
     let http = HttpClient::new(5, None).unwrap();
-    let worker = PluginWorker::spawn("fetch-fixture", &source, http);
+    let worker = PluginWorker::spawn(
+        "fetch-fixture",
+        &source,
+        http,
+        std::collections::HashMap::new(),
+    );
 
     let search = call(&worker, "search", json!(["q", 1, "music"])).await;
     assert_eq!(search["isEnd"], json!(true));

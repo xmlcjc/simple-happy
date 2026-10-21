@@ -12,6 +12,7 @@
       empty-text="还没有导入本地音乐"
       empty-hint="支持 mp3 / flac / m4a / aac / ogg / wav。"
       @play="emit('play', $event, items)"
+      @play-next="emit('play-next', $event)"
     >
       <template #actions="{ item }">
         <button type="button" class="row-action" title="从曲库移除" @click.stop="removeTrack(item)">
@@ -33,6 +34,7 @@ import type { MusicItem } from '../../api/music'
 
 const emit = defineEmits<{
   play: [item: MusicItem, queue: MusicItem[]]
+  'play-next': [item: MusicItem]
 }>()
 
 const libraryStore = useMusicLibraryStore()

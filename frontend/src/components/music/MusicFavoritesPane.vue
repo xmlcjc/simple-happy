@@ -10,6 +10,7 @@
       empty-text="还没有收藏的歌曲"
       empty-hint="在搜索结果里点心形按钮即可收藏。"
       @play="emit('play', $event, libraryStore.favorites)"
+      @play-next="emit('play-next', $event)"
     >
       <template #actions="{ item }">
         <button
@@ -41,6 +42,7 @@ import type { MusicItem } from '../../api/music'
 
 const emit = defineEmits<{
   play: [item: MusicItem, queue: MusicItem[]]
+  'play-next': [item: MusicItem]
   'add-to-playlist': [item: MusicItem]
 }>()
 

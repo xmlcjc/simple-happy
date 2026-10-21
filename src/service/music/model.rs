@@ -51,6 +51,102 @@ pub struct MusicSearchPage {
     pub platform: String,
 }
 
+/// 专辑 / 歌手 / 歌单这类「集合型」条目。
+///
+/// MusicFree 的歌手用 `name`/`avatar`, 专辑与歌单用 `title`/`artwork`;
+/// 归一化后统一放进 title/artwork, 其余私有字段与 MusicItem 一样原样保留。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicCollectionItem {
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub artwork: String,
+    #[serde(default)]
+    pub description: String,
+    /// 收录曲目数(专辑/歌单)。
+    #[serde(default)]
+    pub works_num: Option<f64>,
+    #[serde(default)]
+    pub play_count: Option<f64>,
+    #[serde(default)]
+    pub date: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// 集合型搜索的结果页。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicCollectionPage {
+    pub items: Vec<MusicCollectionItem>,
+    pub is_end: bool,
+    pub platform: String,
+    /// 本次搜索类型: album / artist / sheet。
+    #[serde(default)]
+    pub search_type: String,
+}
+
+/// 集合详情。专辑/歌单给 `items`; 歌手的「专辑」作品给 `collections`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicCollectionDetail {
+    /// 插件回传的集合信息(可能补全了封面/简介), 没回传则为空。
+    #[serde(default)]
+    pub item: Option<MusicCollectionItem>,
+    #[serde(default)]
+    pub items: Vec<MusicItem>,
+    #[serde(default)]
+    pub collections: Vec<MusicCollectionItem>,
+    #[serde(default)]
+    pub is_end: bool,
+}
+
+/// 榜单分组：插件返回的榜单按组展示。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicSheetGroup {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub items: Vec<MusicCollectionItem>,
+}
+
+/// 推荐歌单的 tag。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicTag {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicTagGroup {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<MusicTag>,
+}
+
+/// 推荐歌单的 tag 列表：`pinned` 是插件固定的入口歌单。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicRecommendTags {
+    #[serde(default)]
+    pub pinned: Vec<MusicCollectionItem>,
+    #[serde(default)]
+    pub groups: Vec<MusicTagGroup>,
+}
+
 /// 播放地址。部分插件会要求 Referer/UA 才能取流。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,4 +194,15 @@ pub struct PluginManifest {
     pub src_url: String,
     /// 插件声明支持的搜索类型, 例如 ["music", "album"]。
     pub supported_search_type: Vec<String>,
+}
+
+/// 插件声明需要用户填写的变量（登录 token、cookie 等）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginVariable {
+    pub key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub hint: String,
 }

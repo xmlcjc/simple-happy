@@ -15,6 +15,7 @@ import {
   recordMusicHistory,
   removeLocalMusic,
   removeMusicFromPlaylist,
+  removeMusicFromPlaylistBatch,
   reorderMusicPlaylist,
   toggleMusicFavorite,
   type LocalTrack,
@@ -116,6 +117,15 @@ export const useMusicLibraryStore = defineStore('musicLibrary', () => {
     await loadPlaylists()
   }
 
+  /** 批量移出歌单；成功后刷新列表与歌单计数。 */
+  async function removeManyFromPlaylist(id: string, items: MusicItem[]) {
+    if (!items.length) return 0
+    const result = await removeMusicFromPlaylistBatch(id, items)
+    if (activePlaylistId.value === id) await loadPlaylistItems(id)
+    await loadPlaylists()
+    return result.removed
+  }
+
   async function reorderPlaylist(id: string, items: MusicItem[]) {
     await reorderMusicPlaylist(
       id,
@@ -178,6 +188,7 @@ export const useMusicLibraryStore = defineStore('musicLibrary', () => {
     loadPlaylistItems,
     addToPlaylist,
     removeFromPlaylist,
+    removeManyFromPlaylist,
     reorderPlaylist,
     loadHistory,
     clearHistory,

@@ -6,12 +6,17 @@ import {
   getMusicPlugins,
   installMusicPlugin,
   searchMusic,
+  searchMusicCollections,
   setMusicPluginEnabled,
   uninstallMusicPlugin,
+  updateAllMusicPlugins,
+  updateMusicPlugin,
+  type MusicCollectionItem,
   type MusicItem,
   type MusicLyric,
   type MusicMediaSource,
   type MusicPlugin,
+  type MusicSearchType,
 } from '../api/music'
 
 /**
@@ -23,17 +28,41 @@ import {
  *   保证离开页面即停、不会影响其它页面；
  * - 收藏/歌单/历史在 musicLibrary store，后续阶段接入。
  */
+
+const SEARCH_HISTORY_KEY = 'music-search-history'
+const SEARCH_HISTORY_LIMIT = 20
+
+/** node 测试环境没有 localStorage，读写都要能安全降级。 */
+function readSearchHistory(): string[] {
+  try {
+    if (typeof localStorage === 'undefined') return []
+    const parsed = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY) || '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is string => typeof item === 'string').slice(
+      0,
+      SEARCH_HISTORY_LIMIT,
+    )
+  } catch {
+    return []
+  }
+}
+
 export const useMusicStore = defineStore('music', () => {
   const plugins = ref<MusicPlugin[]>([])
   const pluginsLoading = ref(false)
   const activePlatform = ref('')
 
   const keyword = ref('')
+  /** 搜索类型：单曲 / 专辑 / 歌手。 */
+  const searchType = ref<MusicSearchType>('music')
   const results = ref<MusicItem[]>([])
+  /** 集合型搜索结果（专辑/歌手）。 */
+  const collections = ref<MusicCollectionItem[]>([])
   const searching = ref(false)
   const searchError = ref('')
   const page = ref(1)
   const hasMore = ref(false)
+  const searchHistory = ref<string[]>(readSearchHistory())
 
   const enabledPlugins = computed(() => plugins.value.filter((item) => item.enabled))
   const activePlugin = computed(
@@ -72,6 +101,21 @@ export const useMusicStore = defineStore('music', () => {
     }
   }
 
+  /** 更新单个插件，并同步本地列表里的版本信息。 */
+  async function updatePlugin(platform: string) {
+    const plugin = await updateMusicPlugin(platform)
+    plugins.value = plugins.value.map((item) =>
+      item.platform === platform ? plugin : item,
+    )
+    return plugin
+  }
+
+  async function updateAllPlugins() {
+    const result = await updateAllMusicPlugins()
+    await loadPlugins()
+    return result
+  }
+
   async function togglePlugin(platform: string, enabled: boolean) {
     await setMusicPluginEnabled(platform, enabled)
     const plugin = plugins.value.find((item) => item.platform === platform)
@@ -85,15 +129,59 @@ export const useMusicStore = defineStore('music', () => {
     if (activePlatform.value === platform) return
     activePlatform.value = platform
     results.value = []
+    collections.value = []
     searchError.value = ''
     hasMore.value = false
     page.value = 1
+  }
+
+  /** 切换搜索类型；已有搜索结果时立即用新类型重搜。 */
+  function setSearchType(type: MusicSearchType) {
+    if (searchType.value === type) return
+    searchType.value = type
+    results.value = []
+    collections.value = []
+    searchError.value = ''
+    hasMore.value = false
+    page.value = 1
+    if (keyword.value.trim() && activePlatform.value) void search()
+  }
+
+  function persistSearchHistory(next: string[]) {
+    searchHistory.value = next
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next))
+      }
+    } catch {
+      // 存储不可用时只保留内存态。
+    }
+  }
+
+  function rememberSearch(text: string) {
+    const keyword = text.trim()
+    if (!keyword) return
+    persistSearchHistory(
+      [keyword, ...searchHistory.value.filter((item) => item !== keyword)].slice(
+        0,
+        SEARCH_HISTORY_LIMIT,
+      ),
+    )
+  }
+
+  function removeSearchHistory(text: string) {
+    persistSearchHistory(searchHistory.value.filter((item) => item !== text))
+  }
+
+  function clearSearchHistory() {
+    persistSearchHistory([])
   }
 
   async function search(reset = true) {
     const text = keyword.value.trim()
     if (!text) {
       results.value = []
+      collections.value = []
       hasMore.value = false
       return
     }
@@ -101,21 +189,40 @@ export const useMusicStore = defineStore('music', () => {
       searchError.value = '请先安装并启用一个音乐插件'
       return
     }
+    rememberSearch(text)
     if (reset) {
       page.value = 1
       results.value = []
+      collections.value = []
     }
     searching.value = true
     searchError.value = ''
     try {
-      const result = await searchMusic({
-        platform: activePlatform.value,
-        keyword: text,
-        page: page.value,
-      })
-      results.value = reset ? result.items : [...results.value, ...result.items]
-      hasMore.value = !result.isEnd && result.items.length > 0
-      if (!result.isEnd) page.value += 1
+      const type = searchType.value
+      let isEnd = true
+      let count = 0
+      if (type === 'music') {
+        const result = await searchMusic({
+          platform: activePlatform.value,
+          keyword: text,
+          page: page.value,
+        })
+        results.value = reset ? result.items : [...results.value, ...result.items]
+        isEnd = result.isEnd
+        count = result.items.length
+      } else {
+        const result = await searchMusicCollections({
+          platform: activePlatform.value,
+          keyword: text,
+          page: page.value,
+          searchType: type,
+        })
+        collections.value = reset ? result.items : [...collections.value, ...result.items]
+        isEnd = result.isEnd
+        count = result.items.length
+      }
+      hasMore.value = !isEnd && count > 0
+      if (!isEnd) page.value += 1
     } catch (e) {
       searchError.value = (e as Error).message || '搜索失败'
     } finally {
@@ -131,13 +238,14 @@ export const useMusicStore = defineStore('music', () => {
   function clearSearch() {
     keyword.value = ''
     results.value = []
+    collections.value = []
     searchError.value = ''
     hasMore.value = false
     page.value = 1
   }
 
-  function mediaSource(item: MusicItem): Promise<MusicMediaSource> {
-    return getMusicMediaSource({ platform: item.platform, item })
+  function mediaSource(item: MusicItem, quality?: string): Promise<MusicMediaSource> {
+    return getMusicMediaSource({ platform: item.platform, item, quality })
   }
 
   function lyric(item: MusicItem): Promise<MusicLyric> {
@@ -149,21 +257,30 @@ export const useMusicStore = defineStore('music', () => {
     pluginsLoading,
     activePlatform,
     keyword,
+    searchType,
     results,
+    collections,
     searching,
     searchError,
     page,
     hasMore,
+    searchHistory,
     enabledPlugins,
     activePlugin,
     loadPlugins,
     installPlugin,
     uninstallPlugin,
     togglePlugin,
+    updatePlugin,
+    updateAllPlugins,
     setActivePlatform,
+    setSearchType,
     search,
     loadMore,
     clearSearch,
+    rememberSearch,
+    removeSearchHistory,
+    clearSearchHistory,
     mediaSource,
     lyric,
   }

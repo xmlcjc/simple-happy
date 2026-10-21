@@ -8,7 +8,7 @@
         class="rail-item"
         :class="{ active: activeTab === tab.key }"
         :title="tab.label"
-        @click="activeTab = tab.key"
+        @click="selectTab(tab.key)"
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path v-for="(path, index) in tab.paths" :key="index" :d="path" />
@@ -35,15 +35,31 @@
           v-if="activeTab === 'search'"
           @open-plugins="activeTab = 'plugins'"
           @play="handlePlay"
+          @play-next="playNext"
           @add-to-playlist="openPicker"
+          @open-collection="openCollection"
         />
         <MusicFavoritesPane
           v-else-if="activeTab === 'favorites'"
           @play="handlePlay"
+          @play-next="playNext"
           @add-to-playlist="openPicker"
         />
-        <MusicPlaylistsPane v-else-if="activeTab === 'playlists'" @play="handlePlay" />
-        <MusicLocalPane v-else-if="activeTab === 'local'" @play="handlePlay" />
+        <MusicDiscoverPane
+          v-else-if="activeTab === 'discover'"
+          @open="openCollection"
+        />
+        <MusicPlaylistsPane
+          v-else-if="activeTab === 'playlists'"
+          @play="handlePlay"
+          @play-next="playNext"
+          @import-items="openPickerForItems"
+        />
+        <MusicLocalPane
+          v-else-if="activeTab === 'local'"
+          @play="handlePlay"
+          @play-next="playNext"
+        />
         <MusicHistoryPane v-else-if="activeTab === 'history'" @play="handlePlay" />
         <MusicPluginPane v-else-if="activeTab === 'plugins'" />
 
@@ -57,8 +73,36 @@
           :current-index="lyricIndex"
           :loading="lyricLoading"
           :error="lyricError"
+          :offset-ms="settings.lyricOffsetMs"
+          :font-size-px="lyricFontPx"
+          :font-label="lyricFontLabel"
           @close="lyricOpen = false"
           @seek="seek"
+          @shift-offset="shiftLyricOffset"
+          @reset-offset="settings.setLyricOffsetMs(0)"
+          @cycle-font-size="cycleLyricFontSize"
+        />
+
+        <MusicQueuePanel
+          v-if="queueOpen"
+          :items="playerQueue"
+          :current-index="queueIndex"
+          @close="queueOpen = false"
+          @jump="jumpTo"
+          @remove="removeAt"
+          @clear="clearQueue"
+        />
+
+        <MusicDetailPanel
+          v-if="detail"
+          :platform="detail.item.platform"
+          :kind="detail.kind"
+          :item="detail.item"
+          @close="detail = null"
+          @play="handlePlay"
+          @play-next="playNext"
+          @add-to-playlist="openPicker"
+          @open-collection="openCollection"
         />
       </div>
 
@@ -71,12 +115,30 @@
         :volume="volume"
         :error-text="playerError"
         :lyric-open="lyricOpen"
+        :play-mode="settings.playMode"
+        :playback-rate="settings.playbackRate"
+        :queue-count="playerQueue.length"
+        :queue-open="queueOpen"
+        :quality-label="qualityLabel"
+        :preferred-quality="settings.preferredQuality"
+        :quality-order="settings.qualityOrder"
+        :swapped-from="swappedFrom"
+        :sleep-mode="sleepMode"
+        :sleep-remaining="sleepRemaining"
         @toggle="toggle"
         @next="next"
         @prev="prev"
         @seek="seek"
         @volume="setVolume"
-        @toggle-lyric="lyricOpen = !lyricOpen"
+        @toggle-lyric="toggleLyric"
+        @toggle-queue="toggleQueue"
+        @cycle-mode="settings.cyclePlayMode()"
+        @cycle-rate="settings.setPlaybackRate(nextPlaybackRate(settings.playbackRate))"
+        @set-quality="changeQuality"
+        @set-quality-order="settings.setQualityOrder"
+        @set-sleep="setSleepCountdown"
+        @sleep-end="setSleepEndOfTrack"
+        @cancel-sleep="cancelSleep"
       />
 
       <MusicPlaylistPicker v-model="pickerOpen" :items="pickerItems" />
@@ -88,9 +150,11 @@
 import { computed, onMounted, ref } from 'vue'
 import { useMusicStore } from '../stores/music'
 import { useMusicLibraryStore } from '../stores/musicLibrary'
+import { nextPlaybackRate, MUSIC_QUALITY_OPTIONS, LYRIC_FONT_SIZE_OPTIONS, useMusicSettingsStore, type MusicQuality } from '../stores/musicSettings'
 import { useMusicPlayer } from '../composables/useMusicPlayer'
 import { useMusicLyric } from '../composables/useMusicLyric'
 import MusicSearchPane from '../components/music/MusicSearchPane.vue'
+import MusicDiscoverPane from '../components/music/MusicDiscoverPane.vue'
 import MusicFavoritesPane from '../components/music/MusicFavoritesPane.vue'
 import MusicPlaylistsPane from '../components/music/MusicPlaylistsPane.vue'
 import MusicHistoryPane from '../components/music/MusicHistoryPane.vue'
@@ -98,17 +162,26 @@ import MusicLocalPane from '../components/music/MusicLocalPane.vue'
 import MusicPluginPane from '../components/music/MusicPluginPane.vue'
 import MusicPlayerBar from '../components/music/MusicPlayerBar.vue'
 import MusicLyricPanel from '../components/music/MusicLyricPanel.vue'
+import MusicQueuePanel from '../components/music/MusicQueuePanel.vue'
+import MusicDetailPanel from '../components/music/MusicDetailPanel.vue'
 import MusicPlaylistPicker from '../components/music/MusicPlaylistPicker.vue'
-import type { MusicItem } from '../api/music'
+import type {
+  MusicCollectionItem,
+  MusicCollectionKind,
+  MusicItem,
+} from '../api/music'
 
-type MusicTab = 'search' | 'favorites' | 'playlists' | 'local' | 'history' | 'plugins'
+type MusicTab = 'search' | 'discover' | 'favorites' | 'playlists' | 'local' | 'history' | 'plugins'
 
 const store = useMusicStore()
 const libraryStore = useMusicLibraryStore()
+const settings = useMusicSettingsStore()
 const activeTab = ref<MusicTab>('search')
 const lyricOpen = ref(false)
+const queueOpen = ref(false)
 const pickerOpen = ref(false)
 const pickerItems = ref<MusicItem[]>([])
+const detail = ref<{ item: MusicCollectionItem; kind: MusicCollectionKind } | null>(null)
 
 const {
   current,
@@ -118,7 +191,21 @@ const {
   duration,
   volume,
   errorText: playerError,
+  effectiveQuality,
+  swappedFrom,
+  sleepMode,
+  sleepRemaining,
+  queue: playerQueue,
   playQueue,
+  index: queueIndex,
+  playNext,
+  jumpTo,
+  removeAt,
+  clearQueue,
+  reload,
+  setSleepCountdown,
+  setSleepEndOfTrack,
+  cancelSleep,
   toggle,
   next,
   prev,
@@ -138,6 +225,13 @@ const tabs: Array<{ key: MusicTab; label: string; paths: string[] }> = [
     key: 'search',
     label: '搜索',
     paths: ['M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z', 'm21 21-4.3-4.3'],
+  },
+  {
+    key: 'discover',
+    label: '发现',
+    paths: [
+      'M12 3l2.3 5.2L20 10.5l-5.7 2.3L12 18l-2.3-5.2L4 10.5l5.7-2.3z',
+    ],
   },
   {
     key: 'favorites',
@@ -170,6 +264,32 @@ const tabs: Array<{ key: MusicTab; label: string; paths: string[] }> = [
 
 const activeTitle = computed(() => tabs.find((tab) => tab.key === activeTab.value)?.label || '音乐')
 
+/** 播放条显示的实际音质：插件可能返回 320k 这类自定义值，不在选项里就原样显示。 */
+const qualityLabel = computed(() => {
+  const value = effectiveQuality.value || settings.preferredQuality
+  return MUSIC_QUALITY_OPTIONS.find((option) => option.value === value)?.label || value
+})
+
+const lyricFontOption = computed(
+  () =>
+    LYRIC_FONT_SIZE_OPTIONS.find((option) => option.value === settings.lyricFontSize)
+    ?? LYRIC_FONT_SIZE_OPTIONS[1],
+)
+const lyricFontPx = computed(() => lyricFontOption.value.px)
+const lyricFontLabel = computed(() => lyricFontOption.value.label)
+
+function shiftLyricOffset(deltaMs: number) {
+  settings.setLyricOffsetMs(settings.lyricOffsetMs + deltaMs)
+}
+
+function cycleLyricFontSize() {
+  const index = LYRIC_FONT_SIZE_OPTIONS.findIndex(
+    (option) => option.value === settings.lyricFontSize,
+  )
+  const next = LYRIC_FONT_SIZE_OPTIONS[(index + 1) % LYRIC_FONT_SIZE_OPTIONS.length]
+  settings.setLyricFontSize(next.value)
+}
+
 function handlePlay(item: MusicItem, queue?: MusicItem[]) {
   // 优先使用来源面板给出的列表; 搜索结果作为默认队列。
   const list = queue && queue.length ? queue : store.results
@@ -184,6 +304,43 @@ function openPicker(item: MusicItem) {
   pickerOpen.value = true
 }
 
+/** 链接导入解析出多首时，直接复用歌单选择器。 */
+function openPickerForItems(items: MusicItem[]) {
+  if (!items.length) return
+  pickerItems.value = [...items]
+  pickerOpen.value = true
+}
+
+// 歌词与队列共用右侧浮层，同时只开一个。
+function toggleLyric() {
+  lyricOpen.value = !lyricOpen.value
+  if (lyricOpen.value) queueOpen.value = false
+}
+
+function toggleQueue() {
+  queueOpen.value = !queueOpen.value
+  if (queueOpen.value) lyricOpen.value = false
+}
+
+/** 打开专辑/歌手/歌单详情，覆盖内容区。 */
+function openCollection(item: MusicCollectionItem, kind: MusicCollectionKind) {
+  detail.value = { item, kind }
+  lyricOpen.value = false
+  queueOpen.value = false
+}
+
+/** 切 tab 时收起详情，避免详情页浮在别的分类上。 */
+function selectTab(key: MusicTab) {
+  activeTab.value = key
+  detail.value = null
+}
+
+/** 切音质：记住偏好并立刻用新音质重新取流。 */
+function changeQuality(quality: MusicQuality) {
+  settings.setPreferredQuality(quality)
+  if (current.value) reload()
+}
+
 onMounted(() => {
   void store.loadPlugins()
   void libraryStore.loadFavorites().catch(() => undefined)
@@ -196,37 +353,45 @@ onMounted(() => {
   min-height: 0;
   overflow: hidden;
   display: flex;
-  max-width: var(--content-max-width);
-  margin: 0 auto;
-  padding: 0 var(--space-6) var(--space-4);
+  /* 功能栏贴窗口左缘, 内容列吃满剩余宽度。 */
+  padding: 0 var(--space-6) var(--space-4) 0;
 }
 
 .music-rail {
   flex-shrink: 0;
-  width: 76px;
-  padding: var(--space-4) 8px;
+  width: 56px;
+  padding: var(--space-3) 4px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   border-right: 1px solid var(--color-divider);
   overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.music-rail::-webkit-scrollbar {
+  display: none;
 }
 
 .rail-item {
+  width: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 5px;
-  padding: 10px 4px;
-  border-radius: var(--radius-lg);
+  justify-content: center;
+  text-align: center;
+  gap: 4px;
+  padding: 8px 2px;
+  border-radius: var(--radius-md);
   color: var(--color-text-tertiary);
-  font-size: 12px;
+  font-size: 11px;
   transition: all var(--duration-fast) var(--ease-out);
 }
 
 .rail-item svg {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
 }
 
 .rail-item:hover {
@@ -246,7 +411,7 @@ onMounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding-left: var(--space-5);
+  padding-left: var(--space-4);
 }
 
 .music-head {
@@ -316,11 +481,22 @@ onMounted(() => {
 
 @media (max-width: 900px) {
   .music-view {
-    padding: 0 var(--space-3) var(--space-3);
+    padding: 0 var(--space-3) var(--space-3) 0;
   }
 
   .music-rail {
-    width: 64px;
+    width: 48px;
+    padding: var(--space-2) 2px;
+  }
+
+  .rail-item {
+    font-size: 10px;
+    padding: 7px 1px;
+  }
+
+  .rail-item svg {
+    width: 18px;
+    height: 18px;
   }
 
   .music-main {

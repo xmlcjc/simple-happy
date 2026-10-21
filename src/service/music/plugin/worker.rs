@@ -7,6 +7,7 @@
 //! 插件的 `fetch`/`XMLHttpRequest` 由 [`shim`](super::shim) 注入, 最终回到
 //! Rust 侧的 [`http_bridge`], 复用项目统一的代理与超时配置。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use rquickjs::context::EvalOptions;
@@ -39,7 +40,12 @@ pub struct PluginWorker {
 impl PluginWorker {
     /// 创建线程并加载插件。初始化在子线程内完成, 本函数只负责建通道,
     /// 因此不会阻塞调用方; 真正的加载错误会在第一次调用时返回。
-    pub fn spawn(platform: &str, source: &str, http: HttpClient) -> Self {
+    pub fn spawn(
+        platform: &str,
+        source: &str,
+        http: HttpClient,
+        user_variables: HashMap<String, String>,
+    ) -> Self {
         let (sender, mut receiver) = mpsc::unbounded_channel::<Job>();
         let platform_name = platform.to_string();
         let source = source.to_string();
@@ -56,7 +62,7 @@ impl PluginWorker {
                         return;
                     }
                 };
-                let init = WorkerState::new(&source, http);
+                let init = WorkerState::new(&source, http, &user_variables);
                 loop {
                     let job = match runtime.block_on(receiver.recv()) {
                         Some(job) => job,
@@ -107,7 +113,11 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn new(source: &str, http: HttpClient) -> Result<Self, String> {
+    fn new(
+        source: &str,
+        http: HttpClient,
+        user_variables: &HashMap<String, String>,
+    ) -> Result<Self, String> {
         let runtime = Runtime::new().map_err(|e| format!("创建插件运行时失败: {e}"))?;
         runtime.set_max_stack_size(4 * 1024 * 1024);
         runtime.set_memory_limit(64 * 1024 * 1024);
@@ -135,15 +145,27 @@ impl WorkerState {
 
         // 垫片 + CommonJS 包装。插件顶层抛错时记录到 __mf_boot_error,
         // 由这里翻译成可读错误返回给前端。
+        // 参数顺序对齐 MusicFree: 插件通过 env.userVariables 读取用户在设置里
+        // 填写的登录凭据等变量。
+        let variables_json = serde_json::to_string(user_variables).unwrap_or_else(|_| "{}".into());
         let boot = format!(
             r#"{shim}
+globalThis.__mf_user_variables = {variables};
 try {{
   globalThis.__mf_plugin = (function () {{
     var module = {{ exports: {{}} }};
     var exports = module.exports;
-    (function (module, exports, require) {{
+    var __mf_vars = globalThis.__mf_user_variables || {{}};
+    var env = {{
+      userVariables: __mf_vars,
+      getUserVariables: function () {{ return __mf_vars; }},
+      appVersion: "1.0.0",
+      os: "windows",
+      lang: "zh-CN"
+    }};
+    (function (require, __musicfree_require, module, exports, console, env, URL, process) {{
 {source}
-    }})(module, exports, require);
+    }})(require, require, module, exports, console, env, URL, process);
     return module.exports;
   }})();
 }} catch (e) {{
@@ -151,6 +173,7 @@ try {{
 }}
 "#,
             shim = shim::PRELUDE,
+            variables = variables_json,
             source = source
         );
         context
@@ -173,6 +196,10 @@ try {{
     }
 
     fn run(&self, method: &str, args: &str) -> Result<String, String> {
+        // 内部方法：读取插件声明的 userVariables 定义，不经过插件导出函数。
+        if method == "__mf_user_variables" {
+            return self.read_user_variables();
+        }
         let raw = self
             .context
             .with(|ctx| -> Result<Option<String>, rquickjs::Error> {
@@ -223,6 +250,25 @@ globalThis.__mf_result = undefined;
                     .unwrap_or("插件返回了未知错误"),
             ))
         }
+    }
+
+    /// 读取插件声明的 userVariables（[{key,name,hint}]），供设置界面渲染表单。
+    fn read_user_variables(&self) -> Result<String, String> {
+        self.context
+            .with(|ctx| -> Result<String, rquickjs::Error> {
+                let script = r#"
+(function () {
+  try {
+    var list = (globalThis.__mf_plugin || {}).userVariables;
+    return JSON.stringify(Array.isArray(list) ? list : []);
+  } catch (e) { return "[]"; }
+})()
+"#;
+                let mut options = EvalOptions::default();
+                options.strict = false;
+                ctx.eval_with_options::<String, _>(script.as_bytes(), options)
+            })
+            .map_err(|e| format!("读取插件变量失败: {e}"))
     }
 }
 
@@ -328,7 +374,9 @@ module.exports = {
   getMediaSource: function (item, quality) {
     return { url: "https://example.com/a.mp3", headers: { Referer: "https://example.com" } };
   },
-  getLyric: function (item) { return "[00:00.00]la"; }
+  getLyric: function (item) { return "[00:00.00]la"; },
+  userVariables: [{ key: "token", name: "登录令牌", hint: "从网页版抓取" }],
+  echoEnv: function () { return { token: env.userVariables.token || "" }; }
 };
 "#;
 
@@ -347,9 +395,43 @@ module.exports = {
     }
 
     #[test]
+    fn exposes_user_variables_through_env() {
+        let http = HttpClient::new(5, None).expect("http client");
+        let mut variables = HashMap::new();
+        variables.insert("token".to_string(), "abc123".to_string());
+        let worker = PluginWorker::spawn("fixture", FIXTURE_PLUGIN, http, variables);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        let echoed = runtime
+            .block_on(async {
+                let receiver = worker.submit("echoEnv", &json!([])).expect("submit");
+                tokio::time::timeout(Duration::from_secs(5), receiver).await
+            })
+            .expect("echo timeout")
+            .expect("echo channel")
+            .expect("echo result");
+        let value: Value = serde_json::from_str(&echoed).expect("json");
+        assert_eq!(value["token"], json!("abc123"));
+
+        let definitions = runtime
+            .block_on(async {
+                let receiver = worker
+                    .submit("__mf_user_variables", &json!([]))
+                    .expect("submit");
+                tokio::time::timeout(Duration::from_secs(5), receiver).await
+            })
+            .expect("definition timeout")
+            .expect("definition channel")
+            .expect("definition result");
+        let list: Value = serde_json::from_str(&definitions).expect("json");
+        assert_eq!(list[0]["key"], json!("token"));
+        assert_eq!(list[0]["name"], json!("登录令牌"));
+    }
+
+    #[test]
     fn executes_async_plugin_functions() {
         let http = HttpClient::new(5, None).expect("http client");
-        let worker = PluginWorker::spawn("fixture", FIXTURE_PLUGIN, http);
+        let worker = PluginWorker::spawn("fixture", FIXTURE_PLUGIN, http, HashMap::new());
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
 
         let search = runtime

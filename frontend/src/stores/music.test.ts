@@ -9,9 +9,20 @@ vi.mock('../api/music', () => ({
   uninstallMusicPlugin: vi.fn(),
   setMusicPluginEnabled: vi.fn(),
   searchMusic: vi.fn(),
+  searchMusicCollections: vi.fn(),
   getMusicMediaSource: vi.fn(),
   getMusicLyric: vi.fn(),
 }))
+
+function installLocalStorage(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial))
+  vi.stubGlobal('localStorage', {
+    getItem: vi.fn((key: string) => values.get(key) ?? null),
+    setItem: vi.fn((key: string, value: string) => values.set(key, value)),
+    removeItem: vi.fn((key: string) => values.delete(key)),
+  })
+  return values
+}
 
 function plugin(platform: string, enabled = true) {
   return {
@@ -30,6 +41,7 @@ function plugin(platform: string, enabled = true) {
 describe('music store', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
     setActivePinia(createPinia())
   })
 
@@ -72,5 +84,29 @@ describe('music store', () => {
     expect(store.results).toHaveLength(2)
     expect(store.hasMore).toBe(true)
     expect(vi.mocked(searchMusic).mock.calls.map((call) => call[0].page)).toEqual([1, 2])
+  })
+
+  it('records search history with dedupe, delete and clear', () => {
+    const values = installLocalStorage()
+    const store = useMusicStore()
+
+    store.rememberSearch(' 晴天 ')
+    store.rememberSearch('七里香')
+    store.rememberSearch('晴天')
+
+    expect(store.searchHistory).toEqual(['晴天', '七里香'])
+    expect(JSON.parse(values.get('music-search-history') || '[]')).toEqual(['晴天', '七里香'])
+
+    store.removeSearchHistory('晴天')
+    expect(store.searchHistory).toEqual(['七里香'])
+
+    store.clearSearchHistory()
+    expect(store.searchHistory).toEqual([])
+  })
+
+  it('restores search history from localStorage', () => {
+    installLocalStorage({ 'music-search-history': '["a","b","a"]' })
+    const store = useMusicStore()
+    expect(store.searchHistory).toEqual(['a', 'b', 'a'])
   })
 })

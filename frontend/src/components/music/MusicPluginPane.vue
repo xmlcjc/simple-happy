@@ -5,6 +5,13 @@
         <strong>MusicFree 插件</strong>
         <small>软件本身不内置音源；安装插件后即可搜索、播放与获取歌词。</small>
       </div>
+      <button
+        v-if="hasUpdatable"
+        type="button"
+        class="install-btn ghost"
+        :disabled="updatingAll"
+        @click="updateAll"
+      >{{ updatingAll ? '更新中…' : '全部更新' }}</button>
       <button type="button" class="install-btn" :disabled="installing" @click="fileInput?.click()">
         {{ installing ? '正在安装…' : '安装插件' }}
       </button>
@@ -37,6 +44,32 @@
           </small>
         </span>
         <button
+          v-if="plugin.srcUrl"
+          type="button"
+          class="vars-btn"
+          :disabled="updating.includes(plugin.platform)"
+          title="从插件源地址更新"
+          @click="updateOne(plugin)"
+        >{{ updating.includes(plugin.platform) ? '更新中' : '更新' }}</button>
+        <button type="button" class="vars-btn" title="填写插件变量" @click="openVariables(plugin)">
+          设置
+        </button>
+        <select
+          v-if="alternativeOptions(plugin).length"
+          class="alt-select"
+          :value="settings.alternativeMap[plugin.platform] || ''"
+          title="播放失败时改用其它音源"
+          :aria-label="`${plugin.name || plugin.platform} 的替代音源`"
+          @change="changeAlternative(plugin.platform, $event)"
+        >
+          <option value="">不换源</option>
+          <option
+            v-for="option in alternativeOptions(plugin)"
+            :key="option.platform"
+            :value="option.platform"
+          >换源：{{ option.name || option.platform }}</option>
+        </select>
+        <button
           class="switch-control"
           :class="{ on: plugin.enabled }"
           type="button"
@@ -51,20 +84,76 @@
       </div>
     </div>
   </div>
+
+  <MusicPluginVariablesDialog
+    v-model="varsOpen"
+    :plugin="varsPlugin"
+  />
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useMusicStore } from '../../stores/music'
+import { useMusicSettingsStore } from '../../stores/musicSettings'
 import { useAppStore } from '../../stores/app'
+import MusicPluginVariablesDialog from './MusicPluginVariablesDialog.vue'
 import type { MusicPlugin } from '../../api/music'
 
 const store = useMusicStore()
+const settings = useMusicSettingsStore()
 const appStore = useAppStore()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const installing = ref(false)
 const errorText = ref('')
+const varsOpen = ref(false)
+const varsPlugin = ref<MusicPlugin | null>(null)
+const updating = ref<string[]>([])
+const updatingAll = ref(false)
+
+const hasUpdatable = computed(() =>
+  store.plugins.some((plugin) => Boolean(plugin.srcUrl?.trim())),
+)
+
+function openVariables(plugin: MusicPlugin) {
+  varsPlugin.value = plugin
+  varsOpen.value = true
+}
+
+async function updateOne(plugin: MusicPlugin) {
+  const previous = plugin.version
+  updating.value = [...updating.value, plugin.platform]
+  try {
+    const next = await store.updatePlugin(plugin.platform)
+    appStore.showToast(
+      `「${next.name || next.platform}」已更新 ${previous || '?'} → ${next.version || '?'}`,
+      'success',
+    )
+  } catch (error) {
+    appStore.showToast((error as Error).message || '插件更新失败', 'error')
+  } finally {
+    updating.value = updating.value.filter((platform) => platform !== plugin.platform)
+  }
+}
+
+async function updateAll() {
+  updatingAll.value = true
+  try {
+    const result = await store.updateAllPlugins()
+    if (result.failures.length) {
+      appStore.showToast(
+        `更新成功 ${result.updated} 个，失败 ${result.failures.length} 个`,
+        'warning',
+      )
+    } else {
+      appStore.showToast(`已更新 ${result.updated} 个插件`, 'success')
+    }
+  } catch (error) {
+    appStore.showToast((error as Error).message || '更新失败', 'error')
+  } finally {
+    updatingAll.value = false
+  }
+}
 
 async function handleFile(event: Event) {
   const input = event.target as HTMLInputElement
@@ -90,6 +179,17 @@ async function togglePlugin(plugin: MusicPlugin) {
   } catch (error) {
     appStore.showToast((error as Error).message || '切换插件状态失败', 'error')
   }
+}
+
+/** 可换源的候选：其它已启用的插件。 */
+function alternativeOptions(plugin: MusicPlugin) {
+  return store.enabledPlugins.filter((item) => item.platform !== plugin.platform)
+}
+
+function changeAlternative(platform: string, event: Event) {
+  const value = (event.target as HTMLSelectElement).value
+  settings.setAlternative(platform, value)
+  appStore.showToast(value ? '已设置替代音源' : '已关闭替代播放', 'success')
 }
 
 async function removePlugin(plugin: MusicPlugin) {
@@ -158,6 +258,17 @@ async function removePlugin(plugin: MusicPlugin) {
   cursor: wait;
 }
 
+.install-btn.ghost {
+  border: 1px solid var(--color-border-light);
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+
+.install-btn.ghost:hover:not(:disabled) {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
+}
+
 .hidden-input {
   display: none;
 }
@@ -182,8 +293,9 @@ async function removePlugin(plugin: MusicPlugin) {
 
 .plugin-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2);
   padding: 10px 12px;
   border-radius: var(--radius-md);
   border: 1px solid transparent;
@@ -240,6 +352,36 @@ async function removePlugin(plugin: MusicPlugin) {
   border-radius: var(--radius-md);
   color: var(--color-text-tertiary);
   font-size: 12px;
+}
+
+.vars-btn {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-light);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.vars-btn:hover {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
+}
+
+.alt-select {
+  flex-shrink: 0;
+  max-width: 132px;
+  padding: 4px 6px;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  outline: none;
+}
+
+.alt-select:focus {
+  border-color: var(--color-primary);
 }
 
 .remove-btn:hover {

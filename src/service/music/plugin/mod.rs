@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use sqlx::{Row, SqlitePool};
 
+use crate::crawler::fetcher::{self, HttpMethod, RequestSpec};
 use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
-use crate::service::music::model::MusicPlugin;
+use crate::service::music::model::{MusicPlugin, PluginVariable};
 
 use self::manifest::parse_manifest;
 use self::worker::PluginWorker;
@@ -83,7 +84,8 @@ impl PluginRegistry {
         args: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, AppError> {
-        let worker = self.worker_for(plugin)?;
+        let variables = self.variable_values(&plugin.platform).await?;
+        let worker = self.worker_for(plugin, &variables)?;
         let receiver = worker.submit(method, &args)?;
         match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(Ok(raw))) => serde_json::from_str(&raw).map_err(|e| {
@@ -108,7 +110,11 @@ impl PluginRegistry {
     }
 
     /// 懒加载插件线程。插件文件缺失或脚本无法加载时返回明确错误。
-    fn worker_for(&self, plugin: &MusicPlugin) -> Result<Arc<PluginWorker>, AppError> {
+    fn worker_for(
+        &self,
+        plugin: &MusicPlugin,
+        variables: &HashMap<String, String>,
+    ) -> Result<Arc<PluginWorker>, AppError> {
         let mut workers = self
             .workers
             .lock()
@@ -123,6 +129,7 @@ impl PluginRegistry {
             &plugin.platform,
             &source,
             self.http.clone(),
+            variables.clone(),
         ));
         workers.insert(plugin.platform.clone(), worker.clone());
         Ok(worker)
@@ -234,7 +241,176 @@ impl PluginRegistry {
             .bind(platform)
             .execute(&self.pool)
             .await?;
+        let _ = sqlx::query("DELETE FROM music_plugin_variable WHERE platform = ?1")
+            .bind(platform)
+            .execute(&self.pool)
+            .await;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// 读取插件已保存的用户变量。
+    pub async fn variable_values(
+        &self,
+        platform: &str,
+    ) -> Result<HashMap<String, String>, AppError> {
+        let rows = sqlx::query(
+            "SELECT key, value FROM music_plugin_variable WHERE platform = ?1",
+        )
+        .bind(platform)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut map = HashMap::new();
+        for row in rows {
+            map.insert(row.get::<String, _>("key"), row.get::<String, _>("value"));
+        }
+        Ok(map)
+    }
+
+    /// 整体覆盖保存用户变量；保存后必须重建插件线程，让新值生效。
+    pub async fn set_variables(
+        &self,
+        platform: &str,
+        values: &HashMap<String, String>,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM music_plugin_variable WHERE platform = ?1")
+            .bind(platform)
+            .execute(&mut *tx)
+            .await?;
+        for (key, value) in values {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO music_plugin_variable (platform, key, value) VALUES (?1, ?2, ?3)",
+            )
+            .bind(platform)
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        self.drop_worker(platform);
+        Ok(())
+    }
+
+    /// 读取插件声明的变量定义，供设置界面渲染表单。
+    pub async fn variable_definitions(
+        &self,
+        plugin: &MusicPlugin,
+    ) -> Result<Vec<PluginVariable>, AppError> {
+        let value = self
+            .call(
+                plugin,
+                "__mf_user_variables",
+                serde_json::json!([]),
+                Duration::from_secs(10),
+            )
+            .await?;
+        let list = value.as_array().cloned().unwrap_or_default();
+        Ok(list
+            .into_iter()
+            .filter_map(|raw| {
+                let key = raw
+                    .get("key")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if key.is_empty() {
+                    return None;
+                }
+                Some(PluginVariable {
+                    key,
+                    name: raw
+                        .get("name")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    hint: raw
+                        .get("hint")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// 从插件声明的 srcUrl 拉取新版本并覆盖安装。
+    pub async fn update(&self, platform: &str) -> Result<MusicPlugin, AppError> {
+        let current = self
+            .get(platform)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("插件 {platform} 未安装")))?;
+        let src_url = current.src_url.trim();
+        if src_url.is_empty() {
+            return Err(AppError::BadRequest(
+                "该插件没有提供更新地址（srcUrl）".to_string(),
+            ));
+        }
+        let spec = RequestSpec {
+            url: src_url.to_string(),
+            method: HttpMethod::GET,
+            retry: 1,
+            timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        let response = fetcher::fetch(&self.http, spec)
+            .await
+            .map_err(|e| AppError::BadRequest(format!("下载插件失败: {e}")))?;
+        if !(200..300).contains(&response.status) {
+            return Err(AppError::BadRequest(format!(
+                "下载插件失败（HTTP {}）",
+                response.status
+            )));
+        }
+        let source = response.body;
+        let manifest = parse_manifest(&source)?;
+        // 防止 srcUrl 指向别的插件，覆盖掉当前插件。
+        if manifest.platform != platform {
+            return Err(AppError::BadRequest(format!(
+                "更新文件属于插件 {}，与当前插件不一致，已拒绝覆盖",
+                manifest.platform
+            )));
+        }
+        std::fs::write(&current.file_path, &source)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("写入插件文件失败: {e}")))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE music_plugin SET name = ?2, version = ?3, author = ?4, src_url = ?5, updated_at = ?6
+             WHERE platform = ?1",
+        )
+        .bind(platform)
+        .bind(&manifest.name)
+        .bind(&manifest.version)
+        .bind(&manifest.author)
+        .bind(&manifest.src_url)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        self.drop_worker(platform);
+        self.get(platform)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("插件 {platform} 未安装")))
+    }
+
+    /// 更新全部声明了 srcUrl 的插件；返回 (成功数, 失败列表)。
+    pub async fn update_all(&self) -> Result<(usize, Vec<(String, String)>), AppError> {
+        let mut updated = 0;
+        let mut failures = Vec::new();
+        for plugin in self.list().await? {
+            if plugin.src_url.trim().is_empty() {
+                continue;
+            }
+            match self.update(&plugin.platform).await {
+                Ok(_) => updated += 1,
+                Err(err) => failures.push((plugin.platform, err.to_string())),
+            }
+        }
+        Ok((updated, failures))
     }
 
     pub async fn set_enabled(&self, platform: &str, enabled: bool) -> Result<bool, AppError> {

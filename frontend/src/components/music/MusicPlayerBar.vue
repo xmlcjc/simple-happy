@@ -17,12 +17,18 @@
       </span>
       <span class="now-text">
         <strong>{{ current?.title || '未在播放' }}</strong>
-        <small>{{ current?.artist || '从搜索结果里选一首歌' }}</small>
+        <small>{{ current?.artist || '从搜索结果里选一首歌' }}<template v-if="swappedFrom"> · 已从 {{ swappedFrom }} 换源</template></small>
       </span>
     </div>
 
     <div class="player-center">
       <div class="player-controls">
+        <button
+          type="button"
+          class="mini-btn mode-btn"
+          :title="`播放模式：${modeLabel}（点击切换）`"
+          @click="emit('cycle-mode')"
+        >{{ modeLabel }}</button>
         <button type="button" class="ctrl-btn" title="上一首" :disabled="!current" @click="emit('prev')">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h2v14H6zM20 5v14L9 12z" /></svg>
         </button>
@@ -61,6 +67,77 @@
     </div>
 
     <div class="player-extra">
+      <div class="quality-wrap">
+        <button
+          type="button"
+          class="mini-btn"
+          :title="`音质：${qualityLabel}（点击选择）`"
+          @click="qualityOpen = !qualityOpen"
+        >{{ qualityLabel }}</button>
+        <div v-if="qualityOpen" class="quality-menu" role="menu" aria-label="音质选择">
+          <button
+            v-for="option in MUSIC_QUALITY_OPTIONS"
+            :key="option.value"
+            type="button"
+            class="quality-row"
+            role="menuitemradio"
+            :aria-checked="option.value === preferredQuality"
+            :class="{ active: option.value === preferredQuality }"
+            @click="chooseQuality(option.value)"
+          >{{ option.label }}</button>
+          <button
+            type="button"
+            class="quality-row order"
+            role="menuitem"
+            @click="emit('set-quality-order', qualityOrder === 'desc' ? 'asc' : 'desc')"
+          >失败时优先{{ qualityOrder === 'desc' ? '低' : '高' }}音质</button>
+        </div>
+      </div>
+      <div class="quality-wrap">
+        <button
+          type="button"
+          class="mini-btn"
+          :class="{ active: sleepMode !== 'off' }"
+          :title="sleepMode === 'off' ? '定时关闭' : `定时关闭：${sleepLabel}`"
+          @click="sleepOpen = !sleepOpen"
+        >{{ sleepLabel }}</button>
+        <div v-if="sleepOpen" class="quality-menu" role="menu" aria-label="定时关闭">
+          <button
+            v-for="minutes in [15, 30, 60]"
+            :key="minutes"
+            type="button"
+            class="quality-row"
+            role="menuitem"
+            @click="chooseSleep(minutes)"
+          >{{ minutes }} 分钟后</button>
+          <button
+            type="button"
+            class="quality-row"
+            role="menuitem"
+            @click="emit('sleep-end'); sleepOpen = false"
+          >播完当前曲</button>
+          <button
+            v-if="sleepMode !== 'off'"
+            type="button"
+            class="quality-row order"
+            role="menuitem"
+            @click="emit('cancel-sleep'); sleepOpen = false"
+          >取消定时</button>
+        </div>
+      </div>
+      <button
+        type="button"
+        class="mini-btn"
+        :class="{ active: queueOpen }"
+        :title="`播放队列（${queueCount} 首）`"
+        @click="emit('toggle-queue')"
+      >队列 {{ queueCount }}</button>
+      <button
+        type="button"
+        class="mini-btn"
+        title="播放速度（点击切换）"
+        @click="emit('cycle-rate')"
+      >{{ rateLabel }}</button>
       <button
         type="button"
         class="lyric-btn"
@@ -89,9 +166,17 @@
 </template>
 
 <script setup lang="ts">
+import { computed, ref } from 'vue'
+import {
+  MUSIC_QUALITY_OPTIONS,
+  PLAY_MODE_OPTIONS,
+  type MusicPlayMode,
+  type MusicQuality,
+  type MusicQualityOrder,
+} from '../../stores/musicSettings'
 import type { MusicItem } from '../../api/music'
 
-defineProps<{
+const props = defineProps<{
   current: MusicItem | null
   playing: boolean
   loading: boolean
@@ -100,6 +185,16 @@ defineProps<{
   volume: number
   errorText: string
   lyricOpen: boolean
+  playMode: MusicPlayMode
+  playbackRate: number
+  queueCount: number
+  queueOpen: boolean
+  qualityLabel: string
+  preferredQuality: MusicQuality
+  qualityOrder: MusicQualityOrder
+  swappedFrom: string
+  sleepMode: 'off' | 'countdown' | 'end-of-track'
+  sleepRemaining: number
 }>()
 
 const emit = defineEmits<{
@@ -109,7 +204,42 @@ const emit = defineEmits<{
   seek: [seconds: number]
   volume: [value: number]
   'toggle-lyric': []
+  'cycle-mode': []
+  'cycle-rate': []
+  'toggle-queue': []
+  'set-quality': [quality: MusicQuality]
+  'set-quality-order': [order: MusicQualityOrder]
+  'set-sleep': [minutes: number]
+  'sleep-end': []
+  'cancel-sleep': []
 }>()
+
+const qualityOpen = ref(false)
+const sleepOpen = ref(false)
+
+function chooseQuality(quality: MusicQuality) {
+  qualityOpen.value = false
+  emit('set-quality', quality)
+}
+
+function chooseSleep(minutes: number) {
+  sleepOpen.value = false
+  emit('set-sleep', minutes)
+}
+
+const sleepLabel = computed(() => {
+  if (props.sleepMode === 'end-of-track') return '播完'
+  if (props.sleepMode === 'countdown') {
+    const total = Math.max(0, props.sleepRemaining)
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`
+  }
+  return '定时'
+})
+
+const modeLabel = computed(
+  () => PLAY_MODE_OPTIONS.find((item) => item.value === props.playMode)?.label ?? '顺序',
+)
+const rateLabel = computed(() => `${props.playbackRate}x`)
 
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return '0:00'
@@ -328,6 +458,78 @@ function formatTime(seconds: number) {
   border: 1px solid var(--color-border-light);
   color: var(--color-text-secondary);
   font-size: 12px;
+}
+
+.mini-btn {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-light);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mini-btn:hover {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
+}
+
+.mini-btn.active {
+  border-color: var(--color-primary-border);
+  background: var(--color-primary-bg);
+  color: var(--color-primary);
+}
+
+.mode-btn {
+  min-width: 38px;
+}
+
+.quality-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.quality-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  min-width: 118px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  z-index: 5;
+}
+
+.quality-row {
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.quality-row:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.quality-row.active {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.quality-row.order {
+  margin-top: 2px;
+  border-top: 1px solid var(--color-divider);
+  color: var(--color-text-tertiary);
+  font-size: 11px;
 }
 
 .lyric-btn.active {
