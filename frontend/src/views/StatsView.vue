@@ -328,8 +328,6 @@ watch(() => appStore.theme, () => {
 
 .stats-content {
   height: 100%;
-  max-width: var(--content-max-width);
-  margin: 0 auto;
   padding: 0 var(--space-6);
   display: flex;
   flex-direction: column;

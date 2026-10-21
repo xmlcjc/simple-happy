@@ -646,19 +646,18 @@ onBeforeUnmount(() => {
   min-height: 0;
   overflow: hidden;
   display: flex;
-  max-width: var(--content-max-width);
-  margin: 0 auto;
-  padding: 0 var(--space-6) var(--space-4);
+  /* 功能栏贴窗口左缘: 去掉左边距, 图标列不会显得偏右。 */
+  padding: 0 var(--space-6) var(--space-4) 0;
 }
 
-/* 左侧功能栏：规格与直播页 rail 一致（76px、图标在上文字在下）。 */
+/* 左侧功能栏: 56px 窄栏, 图标与文字都居中。 */
 .shelf-rail {
   flex-shrink: 0;
-  width: 76px;
-  padding: var(--space-4) 8px;
+  width: 56px;
+  padding: var(--space-3) 4px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   border-right: 1px solid var(--color-divider);
   overflow-y: auto;
   scrollbar-width: none;
@@ -669,20 +668,24 @@ onBeforeUnmount(() => {
 }
 
 .rail-item {
+  width: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 5px;
-  padding: 10px 4px;
-  border-radius: var(--radius-lg);
+  justify-content: center;
+  text-align: center;
+  gap: 4px;
+  padding: 8px 2px;
+  border-radius: var(--radius-md);
   color: var(--color-text-tertiary);
-  font-size: 12px;
+  font-size: 11px;
   transition: all var(--duration-fast) var(--ease-out);
 }
 
 .rail-item svg {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
 }
 
 .rail-item:hover {
@@ -710,7 +713,7 @@ onBeforeUnmount(() => {
   min-width: 0;
   height: 100%;
   min-height: 0;
-  padding-left: var(--space-5);
+  padding-left: var(--space-4);
   display: flex;
   flex-direction: column;
 }
@@ -1058,12 +1061,22 @@ onBeforeUnmount(() => {
 
 @media (max-width: 640px) {
   .home-view {
-    padding: 0 var(--space-3) var(--space-3);
+    padding: 0 var(--space-3) var(--space-3) 0;
   }
 
   .shelf-rail {
-    width: 64px;
-    padding: var(--space-3) 4px;
+    width: 48px;
+    padding: var(--space-2) 2px;
+  }
+
+  .rail-item {
+    font-size: 10px;
+    padding: 7px 1px;
+  }
+
+  .rail-item svg {
+    width: 18px;
+    height: 18px;
   }
 
   .shelf-content {

@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="recent-view">
     <div class="recent-content">
       <div class="recent-header">
@@ -169,8 +169,6 @@ async function handleClearRecent() {
 
 .recent-content {
   height: 100%;
-  max-width: var(--content-max-width);
-  margin: 0 auto;
   padding: 0 var(--space-6);
   display: flex;
   flex-direction: column;

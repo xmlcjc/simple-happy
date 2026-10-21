@@ -1,21 +1,7 @@
 <template>
   <header class="app-topbar">
     <div class="topbar-inner">
-      <div class="topbar-left">
-        <div class="logo" @click="goHome">
-          <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <!-- 左页：阅读 -->
-            <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
-            <path d="M5 9h3.2M5 12.4h3.2" stroke-width="1.6" stroke-linecap="round" />
-            <!-- 右页：直播播放键 -->
-            <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
-            <path d="M14.6 9.2v5.2l4.2-2.6z" fill="currentColor" stroke="none" />
-          </svg>
-          <span class="logo-text">Simple Happy</span>
-        </div>
-      </div>
-
-      <!-- 主导航：原来在底栏，合并到顶栏后省掉一整行高度 -->
+      <!-- 品牌(logo + 名称)已移到系统标题栏, 顶栏只保留导航 -->
       <nav class="topbar-nav" aria-label="主导航">
         <button
           v-for="item in navItems"
@@ -58,14 +44,12 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAppStore } from '../stores/app'
-import { useBookshelfStore } from '../stores/bookshelf'
 
 type NavKey = 'home' | 'rss' | 'live' | 'music' | 'stats'
 
 const router = useRouter()
 const route = useRoute()
 const appStore = useAppStore()
-const shelfStore = useBookshelfStore()
 
 const theme = computed(() => appStore.theme)
 
@@ -130,11 +114,6 @@ function go(path: string) {
   if (route.path !== path) router.push(path)
 }
 
-function goHome() {
-  shelfStore.clearSearch()
-  router.replace('/')
-}
-
 function toggleTheme() {
   appStore.toggleTheme()
 }
@@ -159,44 +138,13 @@ function openSettings() {
 }
 
 .topbar-inner {
-  max-width: var(--content-max-width);
-  margin: 0 auto;
   min-height: var(--header-height);
-  display: flex;
+  /* 品牌移到标题栏后左侧留空, 用三栏网格保证导航始终居中 */
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: var(--space-4);
   padding: 0 var(--space-6);
-}
-
-.topbar-left {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex: 0 0 auto;
-  min-width: 0;
-}
-
-.logo {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.logo-icon {
-  width: 25px;
-  height: 25px;
-  color: var(--color-primary);
-  flex-shrink: 0;
-}
-
-.logo-text {
-  font-size: 17px;
-  font-weight: 700;
-  letter-spacing: 0;
-  color: var(--color-text);
-  white-space: nowrap;
 }
 
 /* 主导航：与底栏同源的胶囊样式，横向排在中间 */
@@ -204,7 +152,10 @@ function openSettings() {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin: 0 auto;
+  /* 网格自动排布会把导航放进第 1 列(1fr), 那样它只在左三分之一内居中;
+   * 显式放到中间列, 左右各留一个 1fr 空列, 导航才相对整个窗口居中。 */
+  grid-column: 2;
+  justify-self: center;
   padding: 4px;
   border-radius: var(--radius-full);
   background: var(--color-bg);
@@ -252,8 +203,8 @@ function openSettings() {
   align-items: center;
   justify-content: flex-end;
   gap: 4px;
-  flex: 0 0 auto;
-  margin-left: auto;
+  grid-column: 3;
+  justify-self: end;
 }
 
 .topbar-btn {
@@ -286,10 +237,6 @@ function openSettings() {
 }
 
 @media (max-width: 900px) {
-  .logo-text {
-    display: none;
-  }
-
   .nav-item span {
     display: none;
   }

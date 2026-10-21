@@ -127,7 +127,6 @@
   --header-height: 62px;
   --tabs-height: 44px;
   --sidebar-width: 360px;
-  --content-max-width: 880px;
 
   /* Transitions */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
