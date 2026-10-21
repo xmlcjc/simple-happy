@@ -39,7 +39,7 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 
 ## 🚀 快速开始
 
-1. 前往 [GitHub Releases](https://github.com/hadc188/simple-happy/releases) 下载当前系统对应的安装包或便携包。
+1. 前往 [GitHub Releases](https://github.com/xmlcjc/simple-happy/releases) 下载当前系统对应的安装包或便携包。
 2. **便携包**首次启动即带有内置书源种子（仅用于快速体验）；**安装包**首次启动若数据目录为空，会自动复制随包分发的种子数据库。
 3. 进入「书架 → 书源」查看/管理已导入的书源；在「音乐 → 插件」处导入自己的 MusicFree 插件（如 `xxeMusic.js` 等）。
 4. 直播模块无需额外配置，打开顶部「直播」tab 即可浏览 B 站 / 虎牙 / 斗鱼 / 抖音的分区。
