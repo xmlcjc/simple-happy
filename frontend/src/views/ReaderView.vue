@@ -50,7 +50,6 @@
           <ReaderCatalog
             v-if="store.activePanel === 'catalog' || store.activePanel === 'bookmark'"
             :initial-tab="store.activePanel === 'bookmark' ? 'bookmarks' : 'chapters'"
-            :mini="appStore.miniMode"
             @jump-chapter="jumpFromCatalog"
           />
           <ReadSettings v-else-if="store.activePanel === 'settings'" />
@@ -64,13 +63,10 @@
 
     <!--
       阅读页控件统一用 ReaderMobileControls(点击正文呼出上/下栏 + 左右悬浮钮),
-      宽屏与迷你模式共用同一套交互与外观。
-      历史: 宽屏曾走"鼠标移到左右边缘滑出竖栏"的独立组件, 已随本次统一删除
-      (见 backups/2026-10-05-review-fixes/)。
+      宽屏与窄屏共用同一套交互与外观。
     -->
     <ReaderMobileControls
       :show="showControls || !!store.activePanel"
-      :mini="appStore.miniMode"
       @goHome="goHome"
       @scrollTop="scrollToTop"
       @scrollBottom="scrollToBottom"
@@ -182,7 +178,24 @@
         }"
       >
         <!-- 章节加载阶段：段评解析可能耗时数秒。做成浮层，三种阅读模式都能看到。 -->
-        <div v-if="isHorizontalPageMode" class="horizontal-page-layout">
+        <!-- 正文解析失败: 给出原因与重试/换源入口, 避免整页空白。 -->
+        <div v-if="chapterEmpty" class="chapter-empty">
+          <p class="chapter-empty-title">本章正文加载失败</p>
+          <p class="chapter-empty-reason">{{ store.contentError }}</p>
+          <div class="chapter-empty-actions">
+            <button class="chapter-empty-btn" @click="refreshFromContextMenu">重试本章</button>
+            <button
+              v-if="!isLocalBook(store.book)"
+              class="chapter-empty-btn primary"
+              @click="openSourceFromContextMenu"
+            >
+              换源
+            </button>
+            <button class="chapter-empty-btn" @click="openCatalogFromContextMenu">目录</button>
+          </div>
+        </div>
+
+        <div v-else-if="isHorizontalPageMode" class="horizontal-page-layout">
           <section class="horizontal-content-page">
             <div
               ref="chapterTextRef"
@@ -238,24 +251,42 @@
       >
         <div v-if="continuousLoadingPrev" class="continuous-loading-inline">正在加载上一章...</div>
 
-        <section
-          v-for="chapter in continuousChapters"
-          :key="chapter.index"
-          class="chapter-content continuous-chapter"
-          :data-chapter-index="chapter.index"
-        >
-          <div class="chapter-title">{{ chapter.title }}</div>
+        <div v-if="chapterEmpty" class="chapter-empty">
+          <p class="chapter-empty-title">本章正文加载失败</p>
+          <p class="chapter-empty-reason">{{ store.contentError }}</p>
+          <div class="chapter-empty-actions">
+            <button class="chapter-empty-btn" @click="refreshFromContextMenu">重试本章</button>
+            <button
+              v-if="!isLocalBook(store.book)"
+              class="chapter-empty-btn primary"
+              @click="openSourceFromContextMenu"
+            >
+              换源
+            </button>
+            <button class="chapter-empty-btn" @click="openCatalogFromContextMenu">目录</button>
+          </div>
+        </div>
 
-          <div
-            class="chapter-text"
-            data-role="continuous"
+        <template v-else>
+          <section
+            v-for="chapter in continuousChapters"
+            :key="chapter.index"
+            class="chapter-content continuous-chapter"
             :data-chapter-index="chapter.index"
-            :style="{
-              '--p-spacing': config.paragraphSpacing + 'em',
-            }"
-            v-html="chapter.html"
-          ></div>
-        </section>
+          >
+            <div class="chapter-title">{{ chapter.title }}</div>
+
+            <div
+              class="chapter-text"
+              data-role="continuous"
+              :data-chapter-index="chapter.index"
+              :style="{
+                '--p-spacing': config.paragraphSpacing + 'em',
+              }"
+              v-html="chapter.html"
+            ></div>
+          </section>
+        </template>
 
         <div v-if="continuousLoadingNext" class="continuous-loading-inline">正在加载下一章...</div>
       </div>
@@ -644,10 +675,9 @@ function collapseControlsByClick() {
   }
 }
 
-/** 是否支持悬停展开: 桌面指针 + 非迷你窗口 + 用户没有关掉这个功能。 */
+/** 是否支持悬停展开: 桌面指针 + 用户没有关掉这个功能。 */
 function syncHoverPointerSupport() {
   supportsHoverPointer.value = !!hoverMediaQuery?.matches
-    && !appStore.miniMode
     && config.value.hoverRevealControls
   if (!supportsHoverPointer.value) {
     hoverPointerInZone = false
@@ -1284,6 +1314,11 @@ const formattedContent = computed(() => {
   if (isPdfPageChapter.value) return store.displayContent || ''
   return formatChapterHtml(store.displayContent || '')
 })
+
+/** 正文为空且最近一次加载失败: 渲染占位卡片, 而不是只剩标题 + 「下一章」。 */
+const chapterEmpty = computed(
+  () => !(store.displayContent || '').trim() && Boolean(store.contentError),
+)
 
 /** 上一章 PDF 页渲染的释放函数: 换章/卸载时必须调用, 否则 canvas 与文档常驻 */
 let disposePdfPages: (() => void) | null = null
@@ -3563,14 +3598,13 @@ onMounted(async () => {
     window.addEventListener('pagehide', handlePageHide)
     window.addEventListener('beforeunload', handleBeforeUnload)
     document.addEventListener('visibilitychange', handleVisibilityChange)
-    // 悬停展开: 桌面指针环境启用。迷你模式不启用(见 supportsHoverPointer 的注释),
-    // 因此还要监听 miniMode 变化 —— 切进小窗时退出悬停模式, 切回来再恢复。
+    // 悬停展开: 桌面指针环境启用; 用户改设置时同步开关状态。
     hoverMediaQuery = window.matchMedia('(hover: hover) and (pointer: fine)')
     hoverMediaQuery.addEventListener('change', syncHoverPointerSupport)
     syncHoverPointerSupport()
     hoverSupportStop = watch(
-      [() => appStore.miniMode, () => config.value.hoverRevealControls],
-      ([, hoverReveal]) => {
+      () => config.value.hoverRevealControls,
+      (hoverReveal) => {
         syncHoverPointerSupport()
         // 用户刚关掉悬停展开时, 已弹出的工具栏要一并收起: 指针此后不再触发展开/收起
         // 判定, 留在屏幕上的那条工具栏只能靠点击正文中部才能关掉。
@@ -4154,6 +4188,60 @@ watch(
   margin-bottom: 2em;
   text-align: center;
   line-height: 1.4;
+}
+
+/* 正文解析失败占位: 居中收纳原因与操作, 不遮挡翻章按钮 */
+.chapter-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 20px 40px;
+  text-align: center;
+}
+
+.chapter-empty-title {
+  margin: 0;
+  font-size: 1em;
+  font-weight: 600;
+  opacity: 0.86;
+}
+
+.chapter-empty-reason {
+  margin: 0;
+  max-width: 460px;
+  font-size: 0.82em;
+  line-height: 1.6;
+  opacity: 0.6;
+  word-break: break-word;
+}
+
+.chapter-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.chapter-empty-btn {
+  padding: 6px 16px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 0.8em;
+  color: inherit;
+  opacity: 0.7;
+  transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.chapter-empty-btn:hover {
+  opacity: 1;
+}
+
+.chapter-empty-btn.primary {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  opacity: 1;
 }
 
 /* 章节加载阶段：浮层形式，横向分页/普通/连续三种模式共用 */

@@ -350,6 +350,9 @@ export const useReaderStore = defineStore('reader', () => {
   const chapters = ref<BookChapter[]>([])
   const currentIndex = ref(0)
   const content = ref('')
+  /** 最近一次章节正文加载失败的原因; 空串表示没有错误。
+   *  阅读页正文为空时用它渲染「重试 / 换源」占位, 而不是只闪一条 toast。 */
+  const contentError = ref('')
   const loading = ref(false)
   /** 当前章节加载到哪一步（空串表示未在加载）；用于显示「正在解析段评」这类长耗时 */
   const loadStage = ref<ContentLoadStage | ''>('')
@@ -1986,6 +1989,7 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   function setActiveChapterState(index: number, chapterContent: string, progress = 0) {
+    contentError.value = ''
     content.value = chapterContent
     currentIndex.value = index
     chapterScrollProgress.value = Math.max(0, Math.min(1, progress))
@@ -2263,7 +2267,8 @@ export const useReaderStore = defineStore('reader', () => {
       // 的 Promise 拒绝, 界面上什么提示都没有, 用户只觉得"点了没反应"。
       if (requestId === chapterLoadRequestId) {
         const message = error instanceof Error ? error.message : String(error ?? '')
-        appStore.showToast(message.trim() || '章节加载失败，请稍后重试', 'error')
+        contentError.value = message.trim() || '章节加载失败，请稍后重试'
+        appStore.showToast(contentError.value, 'error')
       }
     } finally {
       // 只收尾 loading：阶段提示由 fetchChapterContent 的持有者机制管理，
@@ -2405,6 +2410,12 @@ export const useReaderStore = defineStore('reader', () => {
       setActiveChapterState(currentIndex.value, chapterContent, chapterScrollProgress.value)
       contentRefreshToken.value += 1
       void preloadAroundChapter(currentIndex.value)
+    } catch (error) {
+      // 原地刷新失败同样要更新占位卡片上的原因(调用方只负责 toast)。
+      contentError.value = error instanceof Error
+        ? error.message
+        : String(error ?? '刷新失败')
+      throw error
     } finally {
       loading.value = false
       refreshing.value = false
@@ -2602,6 +2613,7 @@ export const useReaderStore = defineStore('reader', () => {
     contentRefreshToken.value = 0
     chapters.value = []
     content.value = ''
+    contentError.value = ''
     currentIndex.value = 0
     chapterScrollProgress.value = 0
     preloadedContent.value.clear()
@@ -2643,7 +2655,7 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   return {
-    book, chapters, currentIndex, content, loading, loadStage, refreshing, contentRefreshToken, chaptersLoading, openPosition, restoringLegadoProgress,
+    book, chapters, currentIndex, content, contentError, loading, loadStage, refreshing, contentRefreshToken, chaptersLoading, openPosition, restoringLegadoProgress,
     legadoPositionRestore,
     legadoPositionRestoreCompleted,
     currentChapter, hasNext, hasPrev, readingProgress,

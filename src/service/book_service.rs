@@ -375,6 +375,50 @@ fn is_cancelled(signal: Option<&CancelSignal>) -> bool {
     signal.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// 展开 URL 里的 `@get:{key}`（legado `AnalyzeUrl` 语义）。
+///
+/// 书源常把章节地址写成 `https://yd.example.com//@get:{bid}/{{$.l}}`，`bid` 是
+/// `ruleBookInfo` 里 `@put:{bid:...}` 写入的书籍变量。原实现直接拿字面量去请求，
+/// 站点返回 404/空页，最终报「书源正文解析为空」。变量缺失时按空串处理，与
+/// `AnalyzeRule` 的 `@get` 规则一致。
+fn expand_url_variables(url: &str, book_url: &str, chapter_url: &str) -> String {
+    if !url.contains("@get:{") {
+        return url.to_string();
+    }
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"@get:\{([^}]+)\}").unwrap())
+        .replace_all(url, |caps: &regex::Captures<'_>| {
+            crate::parser::js::stored_variable(book_url, chapter_url, &caps[1]).unwrap_or_default()
+        })
+        .into_owned()
+}
+
+/// 识别"站点公告被当成正文"的情况(停更/强升客户端/付费提示等)。
+///
+/// 这类响应往往 HTTP 200 且正文规则也能取到内容, 但它不是书:
+/// 直接展示会让阅读页出现"当前版本过低，已停止使用…"这类公告。返回提示文本,
+/// 由调用方转成可读错误, 前端据此显示重试/换源入口。
+fn source_notice_text(content: &str) -> Option<String> {
+    static TAG_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let plain = TAG_RE
+        .get_or_init(|| regex::Regex::new(r"<[^>]*>").unwrap())
+        .replace_all(content, " ");
+    let text = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    let len = text.chars().count();
+    // 正常章节远超这个长度; 过短且命中提示词才判定为公告。
+    if len == 0 || len > 120 {
+        return None;
+    }
+    const MARKERS: [&str; 10] = [
+        "版本过低", "停止使用", "请升级", "请更新", "请下载最新",
+        "VIP", "付费", "购买", "请登录", "内容不存在",
+    ];
+    MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+        .then_some(text)
+}
+
 /// 阅读页统一渲染章节标题；正文若自带 `<h1>` 等标题块会重复显示。
 /// 只剥离开头第一个明确标题元素，保留图片和普通正文。
 fn strip_leading_content_title(content: &str) -> String {
@@ -1904,6 +1948,11 @@ impl BookService {
                 }
                 return Err(AppError::BadRequest("书源正文解析为空，请检查正文规则".to_string()));
             }
+            // 站点停更/强升客户端时会把公告当正文返回; 当成错误让用户换源,
+            // 否则阅读页会显示一段"当前版本过低…"而不是书的内容。
+            if let Some(notice) = source_notice_text(&content) {
+                return Err(AppError::BadRequest(format!("书源返回提示：{notice}")));
+            }
             Ok((content, logs))
         })
         .await
@@ -1965,7 +2014,8 @@ impl BookService {
 
         let mut all_content = String::new();
         let mut visited_urls = std::collections::HashSet::new();
-        let mut current_url = chapter_url.to_string();
+        // 章节地址可能带 `@get:{...}` 变量(如 API 书源), 发请求前先展开。
+        let mut current_url = expand_url_variables(chapter_url, book_url, chapter_url);
         let book_ctx = self.js_book_context(user_ns, book_url, chapter_url).await;
 
         // Follow pagination to get all content pages
@@ -2004,6 +2054,7 @@ impl BookService {
 
             // Check for next page
             if let Some(next_url) = self.source_scope(user_ns, source, || self.parser.next_content_url(source, &res.body, &res.url))? {
+                let next_url = expand_url_variables(&next_url, book_url, chapter_url);
                 tracing::debug!("get_content found next_url: {}", next_url);
                 if should_follow_content_page(chapter_url, &current_url, &next_url) {
                     current_url = next_url;
@@ -3517,6 +3568,34 @@ mod tests {
         assert_eq!(to_json(ContentLoadStage::Fetching), "\"fetching\"");
         assert_eq!(to_json(ContentLoadStage::Parsing), "\"parsing\"");
         assert_eq!(to_json(ContentLoadStage::Caching), "\"caching\"");
+    }
+
+    /// 章节地址里的 `@get:{key}` 必须在发请求前展开; 变量缺失时按空串替换,
+    /// 不能把字面量当成路径(API 书源因此会返回空页并报"正文解析为空")。
+    #[test]
+    fn expands_get_placeholders_in_urls() {
+        let book = "https://book.example/info/1";
+        let chapter = "https://yd.example//@get:{bid}/1";
+        assert_eq!(
+            expand_url_variables(chapter, book, chapter),
+            "https://yd.example///1"
+        );
+        // 不含占位符时原样返回
+        assert_eq!(
+            expand_url_variables("https://a.example/1", book, chapter),
+            "https://a.example/1"
+        );
+    }
+
+    #[test]
+    fn detects_dead_source_notice_as_error() {
+        // 停更/强升客户端公告: 内容非空, 但不能当正文展示。
+        assert!(source_notice_text("当前版本过低，已停止使用，请升级到最新版继续阅读。").is_some());
+        assert!(source_notice_text("<p>请登录后阅读</p>").is_some());
+        // 正常长正文不受影响。
+        assert!(source_notice_text(&"正文内容".repeat(50)).is_none());
+        // 短但没有公告特征也不拦。
+        assert!(source_notice_text("短内容").is_none());
     }
 
     #[test]

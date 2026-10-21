@@ -268,7 +268,7 @@ fn load_js_store() -> HashMap<String, String> {
     };
     std::fs::read_to_string(dir.join("js_store.json"))
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+        .and_then(|text| serde_json::from_str::<HashMap<String, String>>(&text).ok())
         .unwrap_or_default()
 }
 
@@ -278,6 +278,34 @@ fn store_get(key: &str) -> Option<String> {
         .unwrap_or_else(|e| e.into_inner())
         .get(key)
         .cloned()
+}
+
+/// 读取书籍/章节持久变量, 供宿主侧替换 URL 里的 `@get:{key}`。
+///
+/// legado 的 `AnalyzeUrl` 会先按 `AnalyzeRule` 的变量规则替换再发请求, 所以书源
+/// 可以把章节地址写成 `https://...../@get:{bid}/{{$.l}}` —— `bid` 由 `ruleBookInfo`
+/// 的 `@put:{bid:...}` 写入。少了这层替换, 字面量 `@get:{bid}` 会被当成路径发出去,
+/// 站点返回空页, 最终表现为「书源正文解析为空」。章节变量优先于书籍变量。
+pub fn stored_variable(book_url: &str, chapter_url: &str, key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if !chapter_url.trim().is_empty() {
+        if let Some(value) = store_get(&format!("cv:{}:{}", chapter_url.trim(), key)) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    if !book_url.trim().is_empty() {
+        if let Some(value) = store_get(&format!("bv:{}:{}", book_url.trim(), key)) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 /// Source-script reading preferences for this book. Merge these into a Book's

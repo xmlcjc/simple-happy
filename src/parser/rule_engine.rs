@@ -39,7 +39,7 @@ fn placeholder_re() -> &'static regex::Regex {
 #[derive(Clone, Default)]
 pub struct RuleEngine;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ParseMode {
     Css,      // CSS selector
     XPath,    // XPath expression
@@ -606,7 +606,25 @@ impl RuleEngine {
     }
 
     fn extract_content_single(&self, content_rule: &str, content_body: &str) -> String {
-        match self.detect_mode(content_rule, content_body) {
+        let mode = self.detect_mode(content_rule, content_body);
+        // JS / Regex 里 `##` 有各自语义(`@regex:pattern##find##replace` 本身就靠它
+        // 分段), 不能提前拆。其余模式必须按 legado `SourceRule` 先拆出替换段:
+        // 正文规则极常见 `$..body##第.*章.*` / `#content##广告`, 不拆会把 `##…`
+        // 当成路径/选择器的一部分, 结果恒为空 —— 表现就是「书源正文解析为空」。
+        if matches!(mode, ParseMode::Js | ParseMode::Regex) {
+            return self.extract_content_single_raw(content_rule, content_body, mode);
+        }
+        let (body_rule, replace_part) = split_legado_regex(content_rule);
+        let value = self.extract_content_single_raw(&body_rule, content_body, mode);
+        match replace_part {
+            Some(reg) => apply_legado_regex(&value, reg),
+            None => value,
+        }
+    }
+
+    /// `extract_content_single` 的取值部分(不含 `##` 替换段)。
+    fn extract_content_single_raw(&self, content_rule: &str, content_body: &str, mode: ParseMode) -> String {
+        match mode {
             // legado `AnalyzeByJSonPath.getString` / `getStringList`：值是 List 时
             // `joinToString("\n")`，多值**换行拼接**（不是只取第一个）。
             //
@@ -649,33 +667,43 @@ impl RuleEngine {
 
     /// `extract_content` 的多值版本: 取所有匹配, 而不是只取第一个或用换行拼接。
     fn extract_content_list(&self, content_rule: &str, content_body: &str) -> Vec<String> {
-        match self.detect_mode(content_rule, content_body) {
+        let mode = self.detect_mode(content_rule, content_body);
+        if mode == ParseMode::Regex {
+            let raw = self.strip_mode_prefix(content_rule);
+            let (pattern, replace) = split_regex_rule(raw);
+            let matched = regex_extract_all(content_body, pattern);
+            return match replace {
+                Some(part) => matched
+                    .into_iter()
+                    .map(|value| apply_legado_regex(&value, part))
+                    .collect(),
+                None => matched,
+            };
+        }
+        // 与单值版本一致: 先拆 `##` 替换段, 再按模式取多值, 最后逐项替换。
+        let (body_rule, replace_part) = split_legado_regex(content_rule);
+        let values = match mode {
             ParseMode::JsonPath => serde_json::from_str::<Value>(content_body)
                 .ok()
                 .map(|value| {
-                    jsonpath::jsonpath_query(&value, self.strip_mode_prefix(content_rule))
+                    jsonpath::jsonpath_query(&value, self.strip_mode_prefix(&body_rule))
                         .iter()
                         .filter_map(jsonpath::value_to_string)
-                        .collect()
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
-            ParseMode::XPath => html::select_xpath(content_body, self.strip_mode_prefix(content_rule)),
-            ParseMode::Regex => {
-                let raw = self.strip_mode_prefix(content_rule);
-                let (pattern, replace) = split_regex_rule(raw);
-                let matched = regex_extract_all(content_body, pattern);
-                match replace {
-                    Some(part) => matched
-                        .into_iter()
-                        .map(|value| apply_legado_regex(&value, part))
-                        .collect(),
-                    None => matched,
-                }
-            }
+            ParseMode::XPath => html::select_xpath(content_body, self.strip_mode_prefix(&body_rule)),
             _ => {
                 let doc = html::parse_document(content_body);
-                html::select_text_list(&doc, self.strip_mode_prefix(content_rule))
+                html::select_text_list(&doc, self.strip_mode_prefix(&body_rule))
             }
+        };
+        match replace_part {
+            Some(reg) => values
+                .into_iter()
+                .map(|value| apply_legado_regex(&value, reg))
+                .collect(),
+            None => values,
         }
     }
 
@@ -3336,6 +3364,23 @@ mod tests {
     use super::*;
     use crate::model::book_source::BookSource;
     use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
+
+    /// 正文规则的 `##` 替换段必须先拆掉再按模式取值。
+    /// 之前 `$..body##第.*章.*` 会把 `##…` 并进 JSONPath, 路径恒为空,
+    /// 阅读页于是报「书源正文解析为空」。
+    #[test]
+    fn test_content_rule_splits_replacement_suffix() {
+        let engine = RuleEngine::new().unwrap();
+        let body = r#"{"chapter":{"body":"第一段\n广告词\n第二段"}}"#;
+        assert_eq!(
+            engine.extract_content("$..body##广告.*", body),
+            "第一段\n\n第二段"
+        );
+        let html = "<div id=\"c\">正文<span>广告</span>结束</div>";
+        let text = engine.extract_content("#c##广告", html);
+        assert!(!text.contains("广告"), "替换段应被移除, 实际: {text:?}");
+        assert!(text.contains("正文") && text.contains("结束"));
+    }
 
     /// 空字段规则必须给空值。某书源 `ruleSearch.kind` / `updateTime` 是空串,
     /// 早先会落到"纯 JS 规则"分支返回**当前元素的 outerHtml**, 于是整段 `<li>`
