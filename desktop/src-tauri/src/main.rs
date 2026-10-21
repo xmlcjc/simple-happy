@@ -214,9 +214,7 @@ fn start(app: &mut App) -> anyhow::Result<()> {
     // running in a plain `cargo build`, which showed ERR_CONNECTION_REFUSED.
     let store = WindowStateStore::new(paths.window_state.clone());
     let saved_state = store.load();
-    // 迷你模式下窗口下限更小(控件只有上一章/下一章/目录, 不需要完整布局宽度)。
-    let initial_mini = saved_state.map(|s| s.mini_mode).unwrap_or(false);
-    let (min_width, min_height) = InitialGeometry::min_size_for(initial_mini);
+    let (min_width, min_height) = (InitialGeometry::MIN_WIDTH, InitialGeometry::MIN_HEIGHT);
 
     // 首屏显示状态。窗口先隐藏建窗, 等页面加载完成(或兜底超时)再一次性显示,
     // 避免用户在 WebView2 还没画出任何内容时看到一块白板 —— 见 reveal。
@@ -296,10 +294,6 @@ fn start(app: &mut App) -> anyhow::Result<()> {
     if geometry.maximized {
         // 只记下意图, 显示时再最大化 —— 见 RevealState::maximize 的说明。
         reveal_state.maximize.store(true, Ordering::SeqCst);
-    }
-    // 迷你模式: 自动置顶, 并在下次启动时仍以迷你尺寸建窗(见 resolve)。
-    if geometry.mini_mode {
-        let _ = window.set_always_on_top(true);
     }
 
     // 兜底: 页面加载失败(WebView2 异常、资源损坏)时 `on_page_load` 不会触发,

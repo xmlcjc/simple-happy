@@ -1,10 +1,7 @@
 <template>
   <div
     class="app-shell"
-    :class="{
-      'has-custom-background': showCustomBackground,
-      'mini-mode': appStore.miniMode,
-    }"
+    :class="{ 'has-custom-background': showCustomBackground }"
     :style="appShellStyle"
   >
     <div
@@ -65,7 +62,7 @@ const route = useRoute()
 const appStore = useAppStore()
 const readerStore = useReaderStore()
 
-const showHeader = computed(() => route.name !== 'reader' && !appStore.miniMode)
+const showHeader = computed(() => route.name !== 'reader')
 const titlebarSurface = computed<'settings' | 'reader-panel' | null>(() => {
   if (appStore.showSettingsDrawer) return 'settings'
   if (appStore.showSourceManager || appStore.showWebdavManager) return 'settings'
@@ -113,8 +110,6 @@ const stopBackgroundClassSync = watch(showCustomBackground, (active) => {
 onMounted(() => {
   void appStore.applyBossKey().catch(() => undefined)
   void appStore.applyNetworkProxy().catch(() => undefined)
-  // 迷你模式状态由 Rust 侧持有(桌面壳启动时据此建窗), 这里同步一份用于紧凑布局。
-  void appStore.syncWindowMode()
 })
 
 let closeUnlisten: (() => void) | undefined
@@ -373,10 +368,10 @@ body.custom-background-active .detail-modal :is(.tag, .action-btn:not(.primary))
   min-height: 0;
 }
 
-/* 迷你模式: 隐藏顶栏后正文能占满小窗。顶栏本身由 showHeader 控制不渲染,
-   这里只收掉标题栏里的应用名, 留出拖动区域。 */
-.app-shell.mini-mode > .titlebar .titlebar-title {
-  display: none;
+/* 直播全屏: 隐藏自绘标题栏与导航, 让直播间铺满整个窗口(窗口本身由 Tauri 设为全屏)。 */
+body.live-fullscreen .titlebar,
+body.live-fullscreen .app-topbar {
+  display: none !important;
 }
 
 /* Teleported dialogs live outside .app-shell. Keep their fixed viewport below

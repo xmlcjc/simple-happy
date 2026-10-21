@@ -14,7 +14,7 @@ Simple Happy v1.0.0 基于以下开源项目进行二次开发。本文件列出
   - **书源格式**：Simple Happy 的书源 JSON 结构（`bookSourceUrl` / `bookSourceName` / `searchUrl` / `ruleSearch` / `ruleBookInfo` / `ruleToc` / `ruleContent` 等）完全兼容 Legado。
   - **规则语法**：`@css:` / `@json:` / `@xpath:` / `@regex:` / `js:` 五种规则前缀语义与 Legado 保持一致，JS 规则由本地 rquickjs 引擎执行。
   - **备份格式**：ZIP 备份与 Legado 互通，书架、书源、RSS、书签、净化规则与阅读进度可双向恢复。
-  - **阅读体验**：主题系统、排版选项、迷你模式等交互参考 Legado。
+  - **阅读体验**：主题系统、排版选项等交互参考 Legado。
 
 ## 2. reader
 

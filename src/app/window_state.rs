@@ -1,13 +1,9 @@
-//! 窗口尺寸/位置与迷你模式的持久化。
+//! 窗口尺寸/位置与最大化状态的持久化。
 //!
 //! 不使用 `tauri-plugin-window-state`: 它把状态写进 Tauri 的 app config 目录,
 //! 而本应用是便携式的(数据固定在 exe 旁的 `data/`), 换机器后状态会错位。
 //! 这里只读写 `data/window-state.json`, 并在恢复前校验显示器, 避免窗口跑到
 //! 屏幕外导致"应用启动了但看不到窗口"。
-//!
-//! 本模块放在 `reader-rust`(而不是桌面壳)是必需的: 迷你模式开关由 IPC 命令
-//! 落盘, 桌面壳才能在下次启动时直接以迷你尺寸建窗。桌面壳依赖 reader-rust,
-//! 反向引用不成立。
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,26 +23,12 @@ pub struct Geometry {
 /// 窗口的持久化状态(逻辑像素)。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WindowState {
-    // ─── 常规模式几何 ───
     pub width: f64,
     pub height: f64,
     pub x: f64,
     pub y: f64,
     #[serde(default)]
     pub maximized: bool,
-    // ─── 迷你模式 ───
-    /// 迷你模式开关。开启时下次启动直接以迷你尺寸建窗, 避免先弹大窗再缩小。
-    #[serde(default)]
-    pub mini_mode: bool,
-    /// 迷你模式下的尺寸/位置, 用户调整过才有值(缺省用内置默认值)。
-    #[serde(default)]
-    pub mini_width: Option<f64>,
-    #[serde(default)]
-    pub mini_height: Option<f64>,
-    #[serde(default)]
-    pub mini_x: Option<f64>,
-    #[serde(default)]
-    pub mini_y: Option<f64>,
 }
 
 impl Default for WindowState {
@@ -57,31 +39,7 @@ impl Default for WindowState {
             x: 0.0,
             y: 0.0,
             maximized: false,
-            mini_mode: false,
-            mini_width: None,
-            mini_height: None,
-            mini_x: None,
-            mini_y: None,
         }
-    }
-}
-
-impl WindowState {
-    /// 迷你模式的尺寸: 用户调整过就用记下的, 否则用默认值。
-    pub fn mini_size(&self) -> (f64, f64) {
-        (
-            self.mini_width.unwrap_or(InitialGeometry::MINI_WIDTH),
-            self.mini_height.unwrap_or(InitialGeometry::MINI_HEIGHT),
-        )
-    }
-
-    /// 迷你模式的位置。用户还没调整过时退回常规模式的位置, 让窗口"就地缩小"
-    /// 而不是跳到屏幕左上角。
-    pub fn mini_position(&self) -> (f64, f64) {
-        (
-            self.mini_x.unwrap_or(self.x),
-            self.mini_y.unwrap_or(self.y),
-        )
     }
 }
 
@@ -91,8 +49,7 @@ const SAVE_THROTTLE: Duration = Duration::from_millis(1000);
 pub struct WindowStateStore {
     path: PathBuf,
     last_save: Option<Instant>,
-    /// 上次读写到的状态。事件处理里每个节流窗口都会用到它, 缓存避免反复读盘;
-    /// 最大化与迷你模式也靠它保留另一套几何信息。
+    /// 上次读写到的状态。事件处理里每个节流窗口都会用到它, 缓存避免反复读盘。
     cached: Option<WindowState>,
 }
 
@@ -165,22 +122,8 @@ pub fn read_geometry(window: &WebviewWindow) -> Option<Geometry> {
 ///
 /// 抽成纯函数(不碰窗口)有两个好处: 可被单测覆盖; 且能在持锁时安全调用 ——
 /// 它只读取已有数据, 不会触发窗口事件。
-///
-/// 常规与迷你两套几何互不覆盖: 否则来回切换迷你模式时, 退出后会回到"迷你
-/// 尺寸", 或下次进入时沿用被覆盖掉的常规尺寸。
 pub fn merge(state: WindowState, geometry: Option<Geometry>, maximized: bool) -> WindowState {
     let mut state = state;
-
-    if state.mini_mode {
-        // 最大化与迷你模式互斥, 这里不需要处理 maximized。
-        if let Some(geometry) = geometry {
-            state.mini_width = Some(geometry.width);
-            state.mini_height = Some(geometry.height);
-            state.mini_x = Some(geometry.x);
-            state.mini_y = Some(geometry.y);
-        }
-        return state;
-    }
 
     state.maximized = maximized;
     // 最大化时读到的是最大化尺寸, 记下来会导致下次还原后窗口比屏幕还大,
@@ -342,35 +285,15 @@ pub struct InitialGeometry {
     pub size: LogicalSize<f64>,
     pub position: Option<LogicalPosition<f64>>,
     pub maximized: bool,
-    /// 启动时是否处于迷你模式(桌面壳据此设置窗口置顶)。
-    pub mini_mode: bool,
 }
 
 impl InitialGeometry {
     pub const DEFAULT_WIDTH: f64 = 1180.0;
     pub const DEFAULT_HEIGHT: f64 = 820.0;
     /// 前端的响应式断点最窄到 420px(见 ReadSettings.vue), 布局在该宽度下
-    /// 有对应样式, 因此可以把它作为常规模式的窗口下限。
+    /// 有对应样式, 因此可以把它作为窗口下限。
     pub const MIN_WIDTH: f64 = 420.0;
     pub const MIN_HEIGHT: f64 = 320.0;
-    /// 迷你模式默认尺寸。刻意小于常规下限 —— 迷你模式的控件只有
-    /// 上一章/下一章/目录, 不需要完整布局的宽度, 因此单独放开下限。
-    pub const MINI_WIDTH: f64 = 320.0;
-    pub const MINI_HEIGHT: f64 = 240.0;
-    /// 迷你模式下窗口允许的最小尺寸。比 `MINI_WIDTH/HEIGHT` 再小一点,
-    /// 让用户能继续往里拖, 但不至于小到无法点击那三个按钮。
-    pub const MINI_MIN_WIDTH: f64 = 240.0;
-    pub const MINI_MIN_HEIGHT: f64 = 180.0;
-
-    /// 某一模式下的尺寸下限。迷你模式用更小的下限, 否则 320×240 会被常规
-    /// 下限(420×320)抬回去, 用户永远缩不到目标尺寸。
-    pub fn min_size_for(mini_mode: bool) -> (f64, f64) {
-        if mini_mode {
-            (Self::MINI_MIN_WIDTH, Self::MINI_MIN_HEIGHT)
-        } else {
-            (Self::MIN_WIDTH, Self::MIN_HEIGHT)
-        }
-    }
 
     fn default_size() -> LogicalSize<f64> {
         LogicalSize::new(Self::DEFAULT_WIDTH, Self::DEFAULT_HEIGHT)
@@ -382,7 +305,6 @@ impl InitialGeometry {
             size: Self::default_size(),
             position: None,
             maximized: false,
-            mini_mode: false,
         }
     }
 
@@ -396,32 +318,12 @@ impl InitialGeometry {
         // 用同一份列表, 否则该不变量在这里会悄悄失效。
         let monitors = monitor_rects(window);
 
-        // 迷你模式: 直接用迷你几何建窗, 并且不恢复最大化(两者互斥)。
-        if saved.mini_mode {
-            let (width, height) = saved.mini_size();
-            let (x, y) = saved.mini_position();
-            let (size, position) = sanitize_geometry(
-                width,
-                height,
-                x,
-                y,
-                &monitors,
-                Self::min_size_for(true),
-            );
-            return Self {
-                size,
-                position,
-                maximized: false,
-                mini_mode: true,
-            };
-        }
-
-        let (size, position, maximized) = sanitize(saved, &monitors, Self::min_size_for(false));
+        let min_size = (Self::MIN_WIDTH, Self::MIN_HEIGHT);
+        let (size, position, maximized) = sanitize(saved, &monitors, min_size);
         Self {
             size,
             position,
             maximized,
-            mini_mode: false,
         }
     }
 }
@@ -627,11 +529,6 @@ mod tests {
             x: -20.0,
             y: 40.0,
             maximized: true,
-            mini_mode: true,
-            mini_width: Some(460.0),
-            mini_height: Some(340.0),
-            mini_x: Some(10.0),
-            mini_y: Some(20.0),
         });
 
         let loaded = store.load().unwrap();
@@ -640,159 +537,29 @@ mod tests {
         assert_eq!(loaded.x, -20.0);
         assert_eq!(loaded.y, 40.0);
         assert!(loaded.maximized);
-        assert!(loaded.mini_mode);
-        assert_eq!(loaded.mini_width, Some(460.0));
-        assert_eq!(loaded.mini_y, Some(20.0));
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 旧版本的状态文件没有迷你字段, 必须仍能读出来(不能因为加了字段就丢失
-    /// 用户已有的窗口尺寸)。
+    /// 旧版本的状态文件可能带已删除的字段(迷你几何), 必须仍能读出来,
+    /// 且不影响用户已有的窗口尺寸。
     #[test]
-    fn loads_legacy_state_without_mini_fields() {
+    fn loads_legacy_state_with_removed_fields() {
         let dir = std::env::temp_dir().join("reader-window-state-test-legacy");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("window-state.json");
         std::fs::write(
             &path,
-            r#"{"width":900.0,"height":700.0,"x":30.0,"y":40.0,"maximized":false}"#,
+            r#"{"width":900.0,"height":700.0,"x":30.0,"y":40.0,"maximized":false,"mini_mode":true,"mini_width":320.0}"#,
         )
         .unwrap();
 
         let store = WindowStateStore::new(path.clone());
         let loaded = store.load().expect("legacy state must still load");
         assert_eq!(loaded.width, 900.0);
-        assert!(!loaded.mini_mode);
-        assert_eq!(loaded.mini_width, None);
-        // 未调整过迷你尺寸时应退回内置默认值(320×240)。
-        assert_eq!(
-            loaded.mini_size(),
-            (InitialGeometry::MINI_WIDTH, InitialGeometry::MINI_HEIGHT)
-        );
-        // 未调整过迷你位置时应就地缩小, 而不是跳到 (0,0)。
-        assert_eq!(loaded.mini_position(), (30.0, 40.0));
+        assert_eq!(loaded.height, 700.0);
+        assert_eq!(loaded.x, 30.0);
+        assert_eq!(loaded.y, 40.0);
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// 迷你尺寸同样受最小尺寸与显示器范围约束。
-    #[test]
-    fn mini_geometry_is_sanitized_too() {
-        // 比迷你下限还小的尺寸要被抬高(注意用的是迷你下限, 不是常规下限)。
-        let (size, position) = sanitize_geometry(
-            100.0,
-            80.0,
-            10.0,
-            10.0,
-            &[monitor(0.0, 0.0, 1920.0, 1080.0)],
-            InitialGeometry::min_size_for(true),
-        );
-        assert_eq!(size.width, InitialGeometry::MINI_MIN_WIDTH);
-        assert_eq!(size.height, InitialGeometry::MINI_MIN_HEIGHT);
-        assert!(position.is_some());
-
-        // 迷你位置落在已拔掉的副屏上时要被丢弃。
-        let (_, position) = sanitize_geometry(
-            320.0,
-            240.0,
-            2600.0,
-            300.0,
-            &[monitor(0.0, 0.0, 1920.0, 1080.0)],
-            InitialGeometry::min_size_for(true),
-        );
-        assert!(position.is_none());
-    }
-
-    /// 关键: 320×240 的迷你尺寸必须能原样保留。
-    /// 若误用常规下限(420×320), 它会被抬回去, 用户永远缩不到目标尺寸。
-    #[test]
-    fn mini_size_is_not_clamped_by_normal_minimum() {
-        let monitors = [monitor(0.0, 0.0, 1920.0, 1080.0)];
-        let (size, _) = sanitize_geometry(
-            InitialGeometry::MINI_WIDTH,
-            InitialGeometry::MINI_HEIGHT,
-            100.0,
-            100.0,
-            &monitors,
-            InitialGeometry::min_size_for(true),
-        );
-        assert_eq!(size.width, 320.0);
-        assert_eq!(size.height, 240.0);
-
-        // 同一尺寸在常规下限下会被抬到 420×320 —— 这正是需要按模式取下限的原因。
-        let (normal_size, _) = sanitize_geometry(
-            InitialGeometry::MINI_WIDTH,
-            InitialGeometry::MINI_HEIGHT,
-            100.0,
-            100.0,
-            &monitors,
-            InitialGeometry::min_size_for(false),
-        );
-        assert_eq!(normal_size.width, 420.0);
-        assert_eq!(normal_size.height, 320.0);
-    }
-
-    /// 迷你下限必须小于迷你默认尺寸, 否则用户没有可拖动的余量。
-    #[test]
-    fn mini_limits_are_smaller_than_mini_defaults() {
-        let (min_w, min_h) = InitialGeometry::min_size_for(true);
-        assert!(min_w < InitialGeometry::MINI_WIDTH);
-        assert!(min_h < InitialGeometry::MINI_HEIGHT);
-        // 常规下限仍应大于迷你默认尺寸, 保证两套模式的定位不混淆。
-        let (normal_w, normal_h) = InitialGeometry::min_size_for(false);
-        assert!(normal_w > InitialGeometry::MINI_WIDTH);
-        assert!(normal_h > InitialGeometry::MINI_HEIGHT);
-    }
-
-    /// 迷你模式解析出的初始几何不应带最大化标志(两者互斥)。
-    ///
-    /// `resolve` 需要窗口句柄, 无法在单测里构造; 因此这里验证它依赖的两条纯逻辑:
-    /// `fallback` 默认非迷你非最大化, 且 `sanitize` 只回传标志而不改写它
-    /// (强制为 false 由 `resolve` 在迷你分支完成)。
-    #[test]
-    fn mini_mode_geometry_is_not_maximized() {
-        let geometry = InitialGeometry::fallback();
-        assert!(!geometry.mini_mode);
-        assert!(!geometry.maximized);
-
-        // 迷你模式下仍带最大化标志的旧状态: sanitize 原样回传, 由 resolve 压掉。
-        let (size, _, maximized) = sanitize(
-            WindowState {
-                mini_mode: true,
-                maximized: true,
-                ..state(0.0, 0.0, 800.0, 600.0)
-            },
-            &[],
-            (420.0, 320.0),
-        );
-        assert!(maximized, "sanitize 只回传标志, 不负责压制");
-        assert_eq!(size.width, 800.0);
-    }
-
-    /// capture 在迷你模式下必须只更新迷你几何, 不能覆盖常规几何 ——
-    /// 否则退出迷你模式会回到"迷你尺寸"。
-    ///
-    /// 直接驱动 `merge`(capture 的纯函数内核): 之前这版只是手工给字段赋值再断言,
-    /// 等于把被测代码抄了一遍, 任何回归都发现不了。
-    #[test]
-    fn capture_in_mini_mode_keeps_normal_geometry() {
-        let previous = WindowState {
-            width: 1180.0,
-            height: 820.0,
-            x: 100.0,
-            y: 100.0,
-            mini_mode: true,
-            ..Default::default()
-        };
-        let merged = merge(previous, Some(geometry(460.0, 340.0, 40.0, 50.0)), false);
-
-        // 迷你几何被更新。
-        assert_eq!(merged.mini_size(), (460.0, 340.0));
-        assert_eq!(merged.mini_position(), (40.0, 50.0));
-        // 常规几何原样保留, 这是"退出迷你模式能回到原尺寸"的前提。
-        assert_eq!(merged.width, 1180.0);
-        assert_eq!(merged.height, 820.0);
-        assert_eq!(merged.x, 100.0);
-        assert_eq!(merged.y, 100.0);
     }
 
     /// 位置不在任何显示器上时, 尺寸上限必须回退到主显示器而不是被跳过。
@@ -824,47 +591,6 @@ mod tests {
             x,
             y,
         }
-    }
-
-    /// 迷你模式下 merge 只写迷你几何, 常规几何必须原样保留。
-    #[test]
-    fn merge_in_mini_mode_only_updates_mini_geometry() {
-        let state = WindowState {
-            width: 1180.0,
-            height: 820.0,
-            x: 100.0,
-            y: 100.0,
-            mini_mode: true,
-            ..Default::default()
-        };
-        let merged = merge(state, Some(geometry(460.0, 340.0, 40.0, 50.0)), false);
-
-        assert_eq!(merged.mini_size(), (460.0, 340.0));
-        assert_eq!(merged.mini_position(), (40.0, 50.0));
-        // 常规几何不受影响, 这是"退出迷你模式能回到原位"的前提。
-        assert_eq!(merged.width, 1180.0);
-        assert_eq!(merged.height, 820.0);
-        assert_eq!(merged.x, 100.0);
-    }
-
-    /// 常规模式下 merge 只写常规几何, 已保存的迷你几何不能被覆盖。
-    #[test]
-    fn merge_in_normal_mode_only_updates_normal_geometry() {
-        let state = WindowState {
-            mini_mode: false,
-            mini_width: Some(460.0),
-            mini_height: Some(340.0),
-            mini_x: Some(7.0),
-            mini_y: Some(8.0),
-            ..Default::default()
-        };
-        let merged = merge(state, Some(geometry(1000.0, 700.0, 20.0, 30.0)), false);
-
-        assert_eq!(merged.width, 1000.0);
-        assert_eq!(merged.y, 30.0);
-        // 迷你几何保留, 下次进入迷你模式仍用用户调好的尺寸。
-        assert_eq!(merged.mini_size(), (460.0, 340.0));
-        assert_eq!(merged.mini_position(), (7.0, 8.0));
     }
 
     /// 最大化时只翻转标志: 把最大化尺寸记成常规尺寸会让下次还原后窗口比屏幕还大。
