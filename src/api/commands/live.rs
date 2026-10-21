@@ -1,10 +1,11 @@
 use crate::api::AppState;
 use crate::error::error::{ApiResponse, AppError};
 use crate::service::live::models::{
-    LiveCategoryGroup, LivePlatform, LiveRoomDetail, LiveRoomSummary, LiveStreamInfo,
+    LiveCategoryGroup, LivePlatform, LiveRoomDetail, LiveRoomSummary, LiveStreamInfo, LiveSuperChat,
 };
 use crate::service::live::danmaku::{self, DanmakuMessage};
 use crate::service::live::follow::LiveFollow;
+use crate::service::live::history::LiveHistoryEntry;
 use crate::service::live::stats::{DailyLiveStats, LiveRoomStats, LiveStatsSummary};
 use serde::Deserialize;
 
@@ -168,18 +169,86 @@ pub async fn get_live_follows(
     ))
 }
 
-/// 观看历史: 直接取观看统计里按房间聚合的结果, 不另建历史表。
+/// 观看历史: 进房即记录(带封面/头像快照), 按最近访问倒序。
 #[tauri::command]
 pub async fn get_live_history(
     state: tauri::State<'_, AppState>,
     limit: Option<u32>,
-) -> Result<ApiResponse<Vec<LiveRoomStats>>, AppError> {
+) -> Result<ApiResponse<Vec<LiveHistoryEntry>>, AppError> {
     let user_ns = "default";
     Ok(ApiResponse::ok(
         state
-            .live_stats_service
-            .get_recent_rooms(user_ns, limit.unwrap_or(50))
+            .live_history_service
+            .list(user_ns, limit.unwrap_or(50))
             .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddLiveHistoryRequest {
+    pub platform: String,
+    pub room_id: String,
+    pub room_name: Option<String>,
+    pub anchor_name: Option<String>,
+    pub cover: Option<String>,
+    pub avatar: Option<String>,
+}
+
+/// 进房时上报一次观看历史(播放页拿到详情后调用)。
+#[tauri::command]
+pub async fn live_add_history(
+    state: tauri::State<'_, AppState>,
+    req: AddLiveHistoryRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    state
+        .live_history_service
+        .add(
+            user_ns,
+            &req.platform,
+            &req.room_id,
+            req.room_name.as_deref().unwrap_or_default(),
+            req.anchor_name.as_deref().unwrap_or_default(),
+            req.cover.as_deref().unwrap_or_default(),
+            req.avatar.as_deref().unwrap_or_default(),
+        )
+        .await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "saved": true })))
+}
+
+#[tauri::command]
+pub async fn delete_live_history_room(
+    state: tauri::State<'_, AppState>,
+    platform: String,
+    room_id: String,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let deleted = state
+        .live_history_service
+        .remove(user_ns, &platform, &room_id)
+        .await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "deleted": deleted })))
+}
+
+#[tauri::command]
+pub async fn clear_live_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+    let deleted = state.live_history_service.clear(user_ns).await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "deleted": deleted })))
+}
+
+/// 展示期内的 SC 列表(进房时读取, 与弹幕实时推送合并展示)。
+#[tauri::command]
+pub async fn get_live_superchat_history(
+    state: tauri::State<'_, AppState>,
+    platform: String,
+    room_id: String,
+) -> Result<ApiResponse<Vec<LiveSuperChat>>, AppError> {
+    Ok(ApiResponse::ok(
+        state.live_service.superchat_history(&platform, &room_id).await?,
     ))
 }
 

@@ -89,14 +89,18 @@ impl Huya {
         let is_live = value.pointer("/data/liveStatus").and_then(Value::as_str) == Some("ON");
         let mut streams = Vec::new();
         if is_live {
+            // 多线路容灾: 虎牙有多条 CDN(AL 线经常 502), 最多收集 3 条真正能拉的,
+            // 播放失败时前端可以自动换下一条。
             for url in candidate_hls_urls(&value) {
+                if streams.len() >= 3 {
+                    break;
+                }
                 if self.is_reachable(&url).await {
                     streams.push(LiveStream {
                         format: "hls".to_string(),
                         quality: "原画".to_string(),
                         url,
                     });
-                    break;
                 }
             }
         }
@@ -304,6 +308,8 @@ pub fn parse_room_detail(value: &Value, room_id: &str) -> Option<LiveRoomDetail>
         area_name: text(&live, "gameFullName"),
         parent_area_name: String::new(),
         is_live: data.get("liveStatus").and_then(Value::as_str) == Some("ON"),
+        // 虎牙公开接口未提供开播时间。
+        live_start_time: 0,
     })
 }
 

@@ -30,10 +30,10 @@
             <input
               v-model="store.keyword"
               type="search"
-              placeholder="搜索直播间 / 主播"
+              placeholder="搜索直播间 / 主播 / 粘贴房间链接"
               @focus="searchFocused = true"
               @blur="searchFocused = false"
-              @keyup.enter="store.runSearch()"
+              @keyup.enter="submitSearch"
             />
             <button v-if="store.keyword" class="search-clear" title="清空" @click="store.clearSearch()">×</button>
           </div>
@@ -104,22 +104,40 @@
       <template v-else-if="store.view === 'history'">
         <div v-if="!store.history.length" class="live-state">
           <p>还没有观看记录</p>
+          <small>进入过的直播间会出现在这里</small>
         </div>
-        <div v-else class="follow-list">
-          <button
-            v-for="item in store.history"
-            :key="`${item.platform}:${item.roomId}`"
-            class="follow-row"
-            @click="openHistory(item)"
-          >
-            <span class="follow-avatar placeholder">{{ (item.anchorName || '?').slice(0, 1) }}</span>
-            <span class="follow-text">
-              <strong>{{ item.roomName || item.anchorName || `房间 ${item.roomId}` }}</strong>
-              <small>{{ item.anchorName }} · 最近 {{ item.lastDate }}</small>
-            </span>
-            <span class="follow-platform">{{ platformName(item.platform) }}</span>
-          </button>
-        </div>
+        <template v-else>
+          <div class="history-toolbar">
+            <span>最近看过 {{ store.history.length }} 个直播间</span>
+            <button class="history-clear" @click="confirmClearHistory">清空记录</button>
+          </div>
+          <div class="follow-list">
+            <div
+              v-for="item in store.history"
+              :key="`${item.platform}:${item.roomId}`"
+              class="follow-row history-row"
+            >
+              <button class="history-main" @click="openHistory(item)">
+                <img
+                  v-if="item.cover || item.avatar"
+                  class="history-cover"
+                  :src="item.cover || item.avatar"
+                  :alt="item.roomName"
+                  referrerpolicy="no-referrer"
+                />
+                <span v-else class="history-cover placeholder">
+                  {{ (item.anchorName || item.roomName || '?').slice(0, 1) }}
+                </span>
+                <span class="follow-text">
+                  <strong>{{ item.roomName || item.anchorName || `房间 ${item.roomId}` }}</strong>
+                  <small>{{ item.anchorName }} · 最近 {{ formatVisitedAt(item.visitedAt) }}</small>
+                </span>
+                <span class="follow-platform">{{ platformName(item.platform) }}</span>
+              </button>
+              <button class="history-remove" title="删除这条记录" @click="removeHistory(item)">×</button>
+            </div>
+          </div>
+        </template>
       </template>
 
       <template v-else-if="store.view === 'category'">
@@ -188,15 +206,18 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useLiveStore, type LiveView } from '../stores/live'
+import { useLiveSettingsStore } from '../stores/liveSettings'
 import LiveRoomGrid from '../components/live/LiveRoomGrid.vue'
+import { parseLiveLink } from '../utils/liveLink'
 import type { LiveFollow } from '../api/liveFollow'
-import type { LiveRoomStats } from '../api/liveStats'
+import type { LiveHistoryEntry } from '../api/liveHistory'
 import type { LiveRoomSummary, LiveCategory, LiveCategoryGroup } from '../api/live'
 
 const store = useLiveStore()
+const liveSettings = useLiveSettingsStore()
 const router = useRouter()
 const searchFocused = ref(false)
 
@@ -255,8 +276,9 @@ const sortedFollows = computed(() =>
   }),
 )
 
-/** 首页顶部只显示「当前选中的分区」，避免和左侧「分类」页重复。 */
+/** 首页顶部只显示「用户主动选中的分区」，避免和左侧「分类」页重复。 */
 const currentArea = computed(() => {
+  if (!store.areaFilterActive) return ''
   const group = store.activeGroup
   if (!group) return ''
   const area = group.children.find((item) => item.id === store.activeAreaId)
@@ -265,13 +287,8 @@ const currentArea = computed(() => {
 })
 
 function clearArea() {
-  // 回到「该一级分区的全部房间」；B 站支持 0=全部，其它平台退回第一个子分区。
-  const group = store.activeGroup
-  store.activeAreaId = group?.children[0]?.id && store.platform !== 'bilibili'
-    ? group.children[0].id
-    : '0'
-  store.view = 'home'
-  void store.loadRooms(true)
+  // 回到该一级分区的整组列表(斗鱼走 cate1 目录, 抖音回推荐, 虎牙回首个游戏)。
+  store.clearAreaFilter()
 }
 
 function reload() {
@@ -290,6 +307,7 @@ function reload() {
 function openArea(groupId: string, areaId: string) {
   store.activeGroupId = groupId
   store.activeAreaId = areaId
+  store.areaFilterActive = true
   store.view = 'home'
   void store.loadRooms(true)
 }
@@ -305,13 +323,60 @@ function openFollow(item: LiveFollow) {
   void router.push({ name: 'live-room', query: { roomId: item.roomId, platform: item.platform } })
 }
 
-function openHistory(item: LiveRoomStats) {
+function openHistory(item: LiveHistoryEntry) {
   void router.push({ name: 'live-room', query: { roomId: item.roomId, platform: item.platform } })
+}
+
+/** 搜索框回车：先按直播间链接解析直接跳房，不是链接再走平台搜索。 */
+function submitSearch() {
+  const link = parseLiveLink(store.keyword)
+  if (link) {
+    store.clearSearch()
+    void router.push({
+      name: 'live-room',
+      query: { roomId: link.roomId, platform: link.platform },
+    })
+    return
+  }
+  void store.runSearch()
+}
+
+function removeHistory(item: LiveHistoryEntry) {
+  void store.removeHistoryRoom(item.platform, item.roomId)
+}
+
+function confirmClearHistory() {
+  if (window.confirm('确定清空全部观看记录吗？')) void store.clearAllHistory()
+}
+
+/** 历史行的「最近」时间：今天显示时分，更早显示月-日。 */
+function formatVisitedAt(visitedAt: number) {
+  if (!visitedAt) return ''
+  const date = new Date(visitedAt)
+  const now = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate()
+  if (sameDay) return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return `${date.getMonth() + 1}-${pad(date.getDate())}`
 }
 
 onMounted(() => {
   void store.loadPlatforms()
   if (!store.categories.length) void store.loadCategories()
+  // 关注列表自动刷新: 离开直播页即停止, 间隔改动即时生效。
+  store.startFollowAutoRefresh(liveSettings.followRefreshInterval)
+})
+
+watch(
+  () => liveSettings.followRefreshInterval,
+  (interval) => store.startFollowAutoRefresh(interval),
+)
+
+onBeforeUnmount(() => {
+  store.stopFollowAutoRefresh()
 })
 </script>
 
@@ -321,19 +386,17 @@ onMounted(() => {
   min-height: 0;
   overflow: hidden;
   display: flex;
-  /* 与书架/音乐页同一套布局：整页居中限宽，rail 在限宽区域内。 */
-  max-width: var(--content-max-width);
-  margin: 0 auto;
-  padding: 0 var(--space-6) var(--space-4);
+  /* 全宽铺满: 窄 rail 贴左缘, 内容列吃满剩余宽度。 */
+  padding: 0 var(--space-6) var(--space-4) 0;
 }
 
 .live-rail {
   flex-shrink: 0;
-  width: 76px;
-  padding: var(--space-4) 8px;
+  width: 56px;
+  padding: var(--space-3) 4px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   border-right: 1px solid var(--color-divider);
   overflow-y: auto;
   scrollbar-width: none;
@@ -344,20 +407,24 @@ onMounted(() => {
 }
 
 .rail-item {
+  width: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 5px;
-  padding: 10px 4px;
-  border-radius: var(--radius-lg);
+  justify-content: center;
+  text-align: center;
+  gap: 4px;
+  padding: 8px 2px;
+  border-radius: var(--radius-md);
   color: var(--color-text-tertiary);
-  font-size: 12px;
+  font-size: 11px;
   transition: all var(--duration-fast) var(--ease-out);
 }
 
 .rail-item svg {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
 }
 
 .rail-item:hover {
@@ -374,7 +441,7 @@ onMounted(() => {
 .live-content {
   flex: 1;
   min-width: 0;
-  padding: 0 0 0 var(--space-5);
+  padding: 0 0 0 var(--space-4);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -743,6 +810,88 @@ onMounted(() => {
   background: var(--color-primary-bg);
   color: var(--color-primary);
   font-weight: 600;
+}
+
+/* ── 观看历史行：方形封面 + 悬停删除 ── */
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 10px;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+}
+
+.history-clear {
+  padding: 4px 12px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border-light);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.history-clear:hover {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
+}
+
+.history-row {
+  position: relative;
+  padding: 0;
+}
+
+.history-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 40px 10px 12px;
+  border-radius: var(--radius-lg);
+  text-align: left;
+}
+
+.history-cover {
+  width: 52px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--color-bg-sunken);
+}
+
+.history-cover.placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-tertiary);
+  font-size: 14px;
+}
+
+.history-remove {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  color: var(--color-text-tertiary);
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.history-row:hover .history-remove {
+  opacity: 1;
+}
+
+.history-remove:hover {
+  background: var(--color-bg-sunken);
+  color: var(--color-text);
 }
 
 .live-state {

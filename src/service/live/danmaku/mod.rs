@@ -11,6 +11,7 @@ pub mod huya;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
@@ -26,6 +27,15 @@ pub struct DanmakuMessage {
     /// 前端直接当 CSS 颜色用的 `#rrggbb`; 空串表示用主题色。
     pub color: String,
     pub timestamp: i64,
+    /// SC 金额(元); 非 SC 消息为 0。
+    #[serde(default)]
+    pub price: i64,
+    /// SC 展示时长(秒); 非 SC 消息为 0。
+    #[serde(default)]
+    pub duration: i64,
+    /// SC 发送者头像; 非 SC 消息为空串。
+    #[serde(default)]
+    pub avatar: String,
 }
 
 impl DanmakuMessage {
@@ -36,6 +46,9 @@ impl DanmakuMessage {
             content,
             color,
             timestamp: chrono::Utc::now().timestamp_millis(),
+            price: 0,
+            duration: 0,
+            avatar: String::new(),
         }
     }
 
@@ -46,6 +59,23 @@ impl DanmakuMessage {
             content,
             color: String::new(),
             timestamp: chrono::Utc::now().timestamp_millis(),
+            price: 0,
+            duration: 0,
+            avatar: String::new(),
+        }
+    }
+
+    /// SC 消息: 带金额/展示时长/头像, 前端渲染独立的 SC 卡片横幅。
+    pub fn superchat(user: String, content: String, price: i64, duration: i64, avatar: String) -> Self {
+        Self {
+            kind: "superchat".to_string(),
+            user,
+            content,
+            color: String::new(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            price,
+            duration,
+            avatar,
         }
     }
 }
@@ -116,19 +146,46 @@ pub fn start(
     let stop = registry.register(key.clone());
     let room = room_id.clone();
     tauri::async_runtime::spawn(async move {
-        let result = match platform.as_str() {
-            huya::PLATFORM_ID => huya::run(&http, &room, &channel, stop.clone()).await,
-            douyu::PLATFORM_ID => douyu::run(&http, &room, &channel, stop.clone()).await,
-            douyin::PLATFORM_ID => douyin::run(&http, &room, &channel, stop.clone()).await,
-            _ => bilibili::run(&http, &room, &channel, stop.clone()).await,
-        };
-        if let Err(err) = result {
-            if !stop.load(Ordering::Relaxed) {
-                let _ = channel.send(vec![DanmakuMessage::system(
-                    "error",
-                    String::new(),
-                    format!("弹幕连接失败: {err}"),
-                )]);
+        // 直播平台的弹幕 WebSocket 会被服务端定期断开(也有网络抖动), 单次连接必然
+        // 出现「弹幕突然不动了」。这里做常驻监督: 断开后按退避重连, 直到用户离开房间。
+        let mut attempt: u32 = 0;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let result = match platform.as_str() {
+                huya::PLATFORM_ID => huya::run(&http, &room, &channel, stop.clone()).await,
+                douyu::PLATFORM_ID => douyu::run(&http, &room, &channel, stop.clone()).await,
+                douyin::PLATFORM_ID => douyin::run(&http, &room, &channel, stop.clone()).await,
+                _ => bilibili::run(&http, &room, &channel, stop.clone()).await,
+            };
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            // 稳定跑过一段时间才断开 = 正常会话结束, 重置退避; 连上即断才累加退避。
+            if started.elapsed() >= Duration::from_secs(30) {
+                attempt = 0;
+            }
+            if let Err(err) = result {
+                // 只在第一轮提示一次, 避免每次重连都往聊天区塞同一条错误。
+                if attempt == 0 {
+                    let _ = channel.send(vec![DanmakuMessage::system(
+                        "error",
+                        String::new(),
+                        format!("弹幕连接中断，正在自动重连: {err}"),
+                    )]);
+                }
+            }
+            attempt = attempt.saturating_add(1);
+            let delay = Duration::from_secs(std::cmp::min(1u64 << attempt.min(5), 30));
+            let deadline = tokio::time::Instant::now() + delay;
+            // 退避期间分段检查停止标志: 离开房间时不必等到退避结束。
+            while tokio::time::Instant::now() < deadline {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     });

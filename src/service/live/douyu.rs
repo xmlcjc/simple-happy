@@ -50,23 +50,50 @@ impl Douyu {
 
     pub async fn rooms(
         &self,
-        _parent: &str,
+        parent: &str,
         area: &str,
         page: u32,
     ) -> Result<Vec<LiveRoomSummary>, AppError> {
-        let cate2 = normalize_id(area, "二级分区")?;
-        let url = format!(
-            "https://www.douyu.com/gapi/rkc/directory/mixList/2_{cate2}/{}",
-            page.max(1)
-        );
+        let page = page.max(1);
+        // area 为 0/空 = 清空筛选: 斗鱼的 directory 接口 1_<cate1> 能直接返回整个
+        // 一级分区的房间(与网页「全部」一致); 落到二级分区时用 2_<cate2>。
+        let url = if area.trim().is_empty() || area.trim() == "0" {
+            let cate1 = normalize_id(parent, "一级分区")?;
+            format!("https://www.douyu.com/gapi/rkc/directory/mixList/1_{cate1}/{page}")
+        } else {
+            let cate2 = normalize_id(area, "二级分区")?;
+            format!("https://www.douyu.com/gapi/rkc/directory/mixList/2_{cate2}/{page}")
+        };
         let value = self.get_json(&url, "https://www.douyu.com/").await?;
         Ok(parse_rooms(&value))
     }
 
     pub async fn room_detail(&self, room_id: &str) -> Result<LiveRoomDetail, AppError> {
         let id = normalize_id(room_id, "房间号")?;
-        let value = self.betard(&id).await?;
-        parse_room_detail(&value, &id)
+        // betard 是详情主体; h5room 只为拿 `show_time`(开播时间), 失败不影响详情。
+        let room = self.betard(&id);
+        let show_time = async {
+            match self
+                .get_json(
+                    &format!("https://www.douyu.com/swf_api/h5room/{id}"),
+                    &format!("https://www.douyu.com/{id}"),
+                )
+                .await
+            {
+                Ok(value) => value
+                    .pointer("/data/show_time")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                Err(_) => Value::Null,
+            }
+        };
+        let (value, show_time) = tokio::try_join!(room, async { Ok::<_, AppError>(show_time.await) })?;
+        let start_time = show_time
+            .as_i64()
+            .or_else(|| show_time.as_str().and_then(|s| s.parse().ok()))
+            .filter(|v| *v > 0)
+            .unwrap_or(0);
+        parse_room_detail(&value, &id, start_time)
             .ok_or_else(|| AppError::NotFound(format!("直播间 {id} 不存在")))
     }
 
@@ -86,24 +113,20 @@ impl Douyu {
         }
 
         let sign = self.sign_query(&id).await?;
-        // 默认档位先取一次, 既拿到多清晰度列表, 也保证至少有一条可用地址。
-        let first = self.play_info(&id, &sign, -1).await?;
-        let mut rates: Vec<(i64, String)> = first
-            .pointer("/data/multirates")
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(|item| {
-                        let rate = item.get("rate").and_then(Value::as_i64)?;
-                        Some((rate, text(item, "name")))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        rates.sort_by(|a, b| a.0.cmp(&b.0));
+        // 与 simple_live 一致: 先用空 cdn 拿到 multirates 与 cdnsWithName,
+        // 再逐个 CDN 取每个码率的播放地址。
+        let first = self.play_info(&id, &sign, -1, "").await?;
+        // 清晰度列表直接沿用平台下发的 multirates(顺序即 高 -> 低),
+        // 不重排、不去重, 与 simple_live 的「切换清晰度」弹窗完全一致。
+        let rates = parse_rates(&first);
 
-        let default_quality = "默认".to_string();
-        let mut streams = vec![stream_from(&first, &default_quality)];
+        let mut cdns = parse_cdns(&first);
+        // scdn 线路放最后(与 simple_live 一致); 没有可用线路时保留空 cdn 的旧行为。
+        cdns.sort_by(|a, b| a.starts_with("scdn").cmp(&b.starts_with("scdn")));
+        if cdns.is_empty() {
+            cdns.push(String::new());
+        }
+
         let others: Vec<_> = rates
             .iter()
             .filter(|(rate, _)| *rate >= 0)
@@ -112,16 +135,38 @@ impl Douyu {
                 let name = name.clone();
                 let signs = sign.clone();
                 let id = id.clone();
-                async move { (name, self.play_info(&id, &signs, rate).await) }
+                let cdn_list = cdns.clone();
+                async move {
+                    // 多线路容灾: 每个码率最多收集 2 条可用 CDN, 失败时前端自动换线。
+                    let mut found: Vec<LiveStream> = Vec::new();
+                    for cdn in cdn_list {
+                        if found.len() >= 2 {
+                            break;
+                        }
+                        if let Ok(value) = self.play_rate(&id, &signs, rate, &cdn).await {
+                            if has_rtmp_live(&value) {
+                                found.push(stream_from(&value, &name));
+                            }
+                        }
+                    }
+                    if found.is_empty() {
+                        None
+                    } else {
+                        Some(found)
+                    }
+                }
             })
             .collect();
-        for (name, result) in join_all(others).await {
-            if let Ok(value) = result {
-                streams.push(stream_from(&value, &name));
+        let mut streams: Vec<LiveStream> = Vec::new();
+        for list in join_all(others).await.into_iter().flatten() {
+            streams.extend(list);
+        }
+        // 所有码率都取不到时退回默认线路, 避免整个房间直接判为失败。
+        if streams.is_empty() {
+            if has_rtmp_live(&first) {
+                streams.push(stream_from(&first, "默认"));
             }
         }
-        streams.retain(|item| !item.url.is_empty());
-        streams.dedup_by(|a, b| a.url == b.url);
         Ok(LiveStreamInfo {
             room_id: id,
             is_live: true,
@@ -169,8 +214,32 @@ impl Douyu {
             .await
     }
 
-    async fn play_info(&self, room_id: &str, sign: &str, rate: i64) -> Result<Value, AppError> {
-        let body = format!("{sign}&cdn=&rate={rate}&ver={PLAY_VER}&iar=1&ive=1&hevc=0&fa=0");
+    async fn play_info(
+        &self,
+        room_id: &str,
+        sign: &str,
+        rate: i64,
+        cdn: &str,
+    ) -> Result<Value, AppError> {
+        let body = format!("{sign}&cdn={cdn}&rate={rate}&ver={PLAY_VER}&iar=1&ive=1&hevc=0&fa=0");
+        self.post_play(room_id, body).await
+    }
+
+    /// 按清晰度取流。请求体必须与 simple_live 完全一致, 只带 `sign + cdn + rate`;
+    /// 多带 `ver/iar/ive/hevc/fa` 会让斗鱼把 rate 映射到错误档位
+    /// (实测「蓝光4M」回退成 _900 标清, 而只带 rate 时能正确返回 _4000)。
+    async fn play_rate(
+        &self,
+        room_id: &str,
+        sign: &str,
+        rate: i64,
+        cdn: &str,
+    ) -> Result<Value, AppError> {
+        let body = format!("{sign}&cdn={cdn}&rate={rate}");
+        self.post_play(room_id, body).await
+    }
+
+    async fn post_play(&self, room_id: &str, body: String) -> Result<Value, AppError> {
         let url = format!("https://www.douyu.com/lapi/live/getH5Play/{room_id}");
         let response = self
             .http
@@ -240,6 +309,42 @@ fn run_sign(script: &str, room_id: &str) -> anyhow::Result<String> {
         let value: String = ctx.eval(call.as_bytes())?;
         Ok(value)
     })
+}
+
+fn has_rtmp_live(value: &Value) -> bool {
+    value
+        .pointer("/data/rtmp_live")
+        .and_then(Value::as_str)
+        .is_some_and(|live| !live.is_empty())
+}
+
+/// `multirates` 的顺序就是平台给的画质顺序(高 -> 低), 保持原样。
+fn parse_rates(value: &Value) -> Vec<(i64, String)> {
+    value
+        .pointer("/data/multirates")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| {
+                    let rate = item.get("rate").and_then(Value::as_i64)?;
+                    Some((rate, text(item, "name")))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_cdns(value: &Value) -> Vec<String> {
+    value
+        .pointer("/data/cdnsWithName")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| item.get("cdn").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn stream_from(value: &Value, quality: &str) -> LiveStream {
@@ -405,7 +510,7 @@ fn parse_hot(raw: &str) -> u64 {
     raw.parse::<u64>().unwrap_or(0)
 }
 
-pub fn parse_room_detail(value: &Value, room_id: &str) -> Option<LiveRoomDetail> {
+pub fn parse_room_detail(value: &Value, room_id: &str, live_start_time: i64) -> Option<LiveRoomDetail> {
     let room = value.get("room")?;
     let id = text(room, "room_id");
     if id.is_empty() || id == "0" {
@@ -425,6 +530,7 @@ pub fn parse_room_detail(value: &Value, room_id: &str) -> Option<LiveRoomDetail>
         parent_area_name: String::new(),
         is_live: room.get("show_status").and_then(Value::as_i64) == Some(1)
             && room.get("videoLoop").and_then(Value::as_i64) != Some(1),
+        live_start_time,
     })
 }
 
@@ -531,8 +637,9 @@ mod tests {
         let value = serde_json::json!({
             "room": { "room_id": 1, "room_name": "轮播", "show_status": 1, "videoLoop": 1 }
         });
-        let detail = parse_room_detail(&value, "1").expect("parse");
+        let detail = parse_room_detail(&value, "1", 1760000000).expect("parse");
         assert!(!detail.is_live);
+        assert_eq!(detail.live_start_time, 1760000000);
     }
 
     #[test]
@@ -544,5 +651,30 @@ mod tests {
         assert_eq!(stream.format, "flv");
         assert_eq!(stream.quality, "原画");
         assert_eq!(stream.url, "https://huos3.douyucdn2.cn/live/1abc.flv?x=1");
+    }
+
+    /// 清晰度列表必须原样保留平台下发的 multirates 顺序与名称,
+    /// 这样同一个房间能像 simple_live 一样显示全部档位(原画/蓝光/超清/高清)。
+    #[test]
+    fn keeps_platform_quality_order() {
+        let value = serde_json::json!({
+            "data": {
+                "multirates": [
+                    { "name": "原画1080P60", "rate": 0 },
+                    { "name": "蓝光4M", "rate": 4 },
+                    { "name": "超清", "rate": 3 },
+                    { "name": "高清", "rate": 2 }
+                ],
+                "cdnsWithName": [
+                    { "cdn": "hw-h5" },
+                    { "cdn": "scdn-h5" }
+                ]
+            }
+        });
+        let rates = parse_rates(&value);
+        let names: Vec<&str> = rates.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, ["原画1080P60", "蓝光4M", "超清", "高清"]);
+        assert_eq!(rates.iter().map(|(rate, _)| *rate).collect::<Vec<_>>(), [0, 4, 3, 2]);
+        assert_eq!(parse_cdns(&value), ["hw-h5", "scdn-h5"]);
     }
 }

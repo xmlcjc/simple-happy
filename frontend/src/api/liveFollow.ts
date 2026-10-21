@@ -1,5 +1,4 @@
 import { invokeEnvelope } from './invoke'
-import type { LiveRoomStats } from './liveStats'
 
 export interface LiveFollow {
   platform: string
@@ -26,9 +25,4 @@ export function unfollowLiveRoom(platform: string, roomId: string): Promise<{ re
 
 export function getLiveFollows(): Promise<LiveFollow[]> {
   return invokeEnvelope('get_live_follows', {})
-}
-
-/** 观看历史复用观看统计的房间聚合，不单独建表。 */
-export function getLiveHistory(limit = 50): Promise<LiveRoomStats[]> {
-  return invokeEnvelope('get_live_history', { limit })
 }

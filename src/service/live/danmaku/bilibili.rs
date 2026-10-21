@@ -403,11 +403,20 @@ fn parse_command(value: &Value, out: &mut Vec<DanmakuMessage>) {
             .unwrap_or_default();
         let message = data.get("message").and_then(Value::as_str).unwrap_or_default();
         let price = data.get("price").and_then(Value::as_i64).unwrap_or(0);
+        // `time` 是 SC 的展示时长(秒), `start_time` 是生效时刻(unix 秒)。
+        let duration = data.get("time").and_then(Value::as_i64).unwrap_or(0).max(0);
+        let avatar = data
+            .pointer("/user_info/face")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         if !message.is_empty() {
-            out.push(DanmakuMessage::system(
-                "superchat",
+            out.push(DanmakuMessage::superchat(
                 user.to_string(),
-                format!("¥{price} {message}"),
+                message.to_string(),
+                price,
+                duration,
+                avatar,
             ));
         }
     }
@@ -471,6 +480,27 @@ mod tests {
         });
         parse_command(&enter, &mut out);
         assert_eq!(out[1].kind, "enter");
+    }
+
+    /// SC 带金额/时长/头像, 前端渲染独立的 SC 卡片横幅。
+    #[test]
+    fn parses_superchat_with_price_duration_and_avatar() {
+        let value = serde_json::json!({
+            "cmd": "SUPER_CHAT_MESSAGE",
+            "data": {
+                "user_info": { "uname": "老板", "face": "https://i0.hdslb.com/face.jpg" },
+                "message": "唱一首歌", "price": 50, "time": 120, "start_time": 1760000000
+            }
+        });
+        let mut out = Vec::new();
+        parse_command(&value, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, "superchat");
+        assert_eq!(out[0].user, "老板");
+        assert_eq!(out[0].content, "唱一首歌");
+        assert_eq!(out[0].price, 50);
+        assert_eq!(out[0].duration, 120);
+        assert_eq!(out[0].avatar, "https://i0.hdslb.com/face.jpg");
     }
 
     /// 一个帧里串联两个 JSON 包时都要解出来(服务端会合并下发)。

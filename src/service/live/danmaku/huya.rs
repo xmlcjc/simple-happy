@@ -205,10 +205,13 @@ impl Writer {
         self.buf.extend_from_slice(value);
     }
 
+    /// 仅测试用来构造嵌套结构，生产代码走 write_bytes。
+    #[cfg(test)]
     fn struct_begin(&mut self, tag: u8) {
         self.head(10, tag);
     }
 
+    #[cfg(test)]
     fn struct_end(&mut self) {
         self.head(11, 0);
     }

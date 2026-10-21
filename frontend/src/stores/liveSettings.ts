@@ -16,6 +16,33 @@ const DANMAKU_AREA_KEY = 'live-danmaku-area'
 const DANMAKU_OPACITY_KEY = 'live-danmaku-opacity'
 const DANMAKU_FONT_SIZE_KEY = 'live-danmaku-font-size'
 const DANMAKU_SPEED_KEY = 'live-danmaku-speed'
+const QUALITY_LEVEL_KEY = 'live-quality-level'
+const FOLLOW_REFRESH_INTERVAL_KEY = 'live-follow-refresh-interval'
+
+/** 关注列表自动刷新间隔（秒）；0 = 关闭。 */
+export const FOLLOW_REFRESH_INTERVAL_OPTIONS = [
+  { value: 0, label: '关闭' },
+  { value: 30, label: '30秒' },
+  { value: 60, label: '1分钟' },
+  { value: 120, label: '2分钟' },
+  { value: 300, label: '5分钟' },
+] as const
+
+/** 默认清晰度: 0=最低(列表最后一个), 1=中等, 2=最高(列表第一个)。 */
+export const QUALITY_LEVEL_OPTIONS = [
+  { value: 0, label: '最低' },
+  { value: 1, label: '中等' },
+  { value: 2, label: '最高' },
+] as const
+
+/** 按 Simple Live 的规则, 根据清晰度偏好选默认下标。
+ *  列表由后端按实际码率从高到低排好; 最高=第一个, 最低=最后一个, 中等=中间。 */
+export function pickQualityIndex(count: number, level: number): number {
+  if (count <= 0) return 0
+  if (level === 2) return 0
+  if (level === 0) return count - 1
+  return Math.floor(count / 2)
+}
 
 export const DANMAKU_AREA_OPTIONS = [25, 50, 75, 100] as const
 export const DANMAKU_SPEED_RANGE = { min: 4, max: 16 } as const
@@ -35,16 +62,21 @@ function readNumber(key: string, fallback: number) {
 
 export const useLiveSettingsStore = defineStore('liveSettings', () => {
   const danmakuOn = ref(localStorage.getItem(DANMAKU_ON_KEY) !== 'false')
-  const danmakuArea = ref(clamp(readNumber(DANMAKU_AREA_KEY, 50), 25, 100))
+  // 参考主流直播全屏的弹幕: 默认只占画面上部约 1/4, 字号略小、速度稍快。
+  const danmakuArea = ref(clamp(readNumber(DANMAKU_AREA_KEY, 25), 25, 100))
   const danmakuOpacity = ref(
     clamp(readNumber(DANMAKU_OPACITY_KEY, 1), DANMAKU_OPACITY_RANGE.min, DANMAKU_OPACITY_RANGE.max),
   )
   const danmakuFontSize = ref(
-    clamp(readNumber(DANMAKU_FONT_SIZE_KEY, 16), DANMAKU_FONT_SIZE_RANGE.min, DANMAKU_FONT_SIZE_RANGE.max),
+    clamp(readNumber(DANMAKU_FONT_SIZE_KEY, 15), DANMAKU_FONT_SIZE_RANGE.min, DANMAKU_FONT_SIZE_RANGE.max),
   )
   const danmakuSpeed = ref(
-    clamp(readNumber(DANMAKU_SPEED_KEY, 9), DANMAKU_SPEED_RANGE.min, DANMAKU_SPEED_RANGE.max),
+    clamp(readNumber(DANMAKU_SPEED_KEY, 8), DANMAKU_SPEED_RANGE.min, DANMAKU_SPEED_RANGE.max),
   )
+  /** 进入直播间默认选哪个清晰度; 默认最高, 避免一进房间就播标清。 */
+  const qualityLevel = ref(clamp(readNumber(QUALITY_LEVEL_KEY, 2), 0, 2))
+  /** 关注列表自动刷新间隔(秒), 0 = 不自动刷新。 */
+  const followRefreshInterval = ref(clamp(readNumber(FOLLOW_REFRESH_INTERVAL_KEY, 60), 0, 3600))
 
   function setDanmakuOn(value: boolean) {
     danmakuOn.value = value
@@ -79,16 +111,30 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
     localStorage.setItem(DANMAKU_SPEED_KEY, String(danmakuSpeed.value))
   }
 
+  function setQualityLevel(value: number) {
+    qualityLevel.value = clamp(Math.round(value), 0, 2)
+    localStorage.setItem(QUALITY_LEVEL_KEY, String(qualityLevel.value))
+  }
+
+  function setFollowRefreshInterval(value: number) {
+    followRefreshInterval.value = clamp(Math.round(value), 0, 3600)
+    localStorage.setItem(FOLLOW_REFRESH_INTERVAL_KEY, String(followRefreshInterval.value))
+  }
+
   return {
     danmakuOn,
     danmakuArea,
     danmakuOpacity,
     danmakuFontSize,
     danmakuSpeed,
+    qualityLevel,
+    followRefreshInterval,
     setDanmakuOn,
     setDanmakuArea,
     setDanmakuOpacity,
     setDanmakuFontSize,
     setDanmakuSpeed,
+    setQualityLevel,
+    setFollowRefreshInterval,
   }
 })

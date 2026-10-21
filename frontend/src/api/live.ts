@@ -41,6 +41,21 @@ export interface LiveRoomDetail {
   areaName: string
   parentAreaName: string
   isLive: boolean
+  /** 开播时间（unix 秒）；0 表示平台未提供，不显示开播时长。 */
+  liveStartTime: number
+}
+
+/** 一条 SuperChat（醒目留言），进房时拉取展示期内的列表。 */
+export interface LiveSuperChat {
+  user: string
+  avatar: string
+  message: string
+  /** 金额（元）。 */
+  price: number
+  /** 生效时刻（unix 秒）。 */
+  startTime: number
+  /** 失效时刻（unix 秒）。 */
+  endTime: number
 }
 
 export interface LiveStream {
@@ -96,4 +111,9 @@ export function searchLiveRooms(params: {
 
 export function getLiveStreamUrls(platform: string, roomId: string): Promise<LiveStreamInfo> {
   return invokeEnvelope('live_stream_urls', { platform, roomId })
+}
+
+/** 房间内仍在展示期内的 SC 列表（目前仅 B 站支持，其它平台返回空）。 */
+export function getLiveSuperChatHistory(platform: string, roomId: string): Promise<LiveSuperChat[]> {
+  return invokeEnvelope('get_live_superchat_history', { platform, roomId })
 }

@@ -622,6 +622,8 @@ pub fn parse_enter_detail(data: &Value, web_rid: &str) -> Option<LiveRoomDetail>
         area_name: String::new(),
         parent_area_name: String::new(),
         is_live,
+        // 抖音公开接口未提供开播时间。
+        live_start_time: 0,
     })
 }
 
@@ -656,6 +658,8 @@ pub fn parse_reflow_detail(value: &Value, room_id: &str) -> Option<LiveRoomDetai
         area_name: String::new(),
         parent_area_name: String::new(),
         is_live,
+        // 抖音公开接口未提供开播时间。
+        live_start_time: 0,
     })
 }
 
@@ -711,6 +715,8 @@ pub fn parse_html_detail(state: &Value, web_rid: &str) -> Option<LiveRoomDetail>
         area_name: String::new(),
         parent_area_name: String::new(),
         is_live,
+        // 抖音公开接口未提供开播时间。
+        live_start_time: 0,
     })
 }
 

@@ -62,6 +62,9 @@ pub struct LiveRoomDetail {
     pub area_name: String,
     pub parent_area_name: String,
     pub is_live: bool,
+    /// 开播时间(unix 秒); 0 表示平台未提供(前端不显示开播时长)。
+    #[serde(default)]
+    pub live_start_time: i64,
 }
 
 /// 一条可直接播放的流地址。
@@ -80,4 +83,19 @@ pub struct LiveStreamInfo {
     pub room_id: String,
     pub is_live: bool,
     pub streams: Vec<LiveStream>,
+}
+
+/// 一条 SuperChat(醒目留言), 由弹幕实时推送 + 进房时拉取历史合并。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSuperChat {
+    pub user: String,
+    pub avatar: String,
+    pub message: String,
+    /// 金额(元)。
+    pub price: i64,
+    /// 生效时刻(unix 秒)。
+    pub start_time: i64,
+    /// 失效时刻(unix 秒)。
+    pub end_time: i64,
 }

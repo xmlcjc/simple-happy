@@ -354,8 +354,9 @@ mod tests {
         }
         assert!(!messages.is_empty(), "should decode at least one danmaku");
         drop(messages);
-        result
-            .expect("worker join")
-            .expect("run should not fail");
+        assert!(
+            result.expect("worker join").is_ok(),
+            "run should not fail"
+        );
     }
 }

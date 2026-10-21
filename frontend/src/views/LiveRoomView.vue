@@ -1,5 +1,5 @@
 <template>
-  <div class="live-room-view">
+  <div class="live-room-view" :class="{ 'is-fullscreen': isFullscreen }">
     <header class="room-head">
       <button class="back-btn" @click="goBack">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -15,10 +15,11 @@
         <span class="room-state" :class="{ live: detail?.isLive }">
           {{ detail?.isLive ? '直播中' : '未开播' }}
         </span>
+        <span v-if="liveUptimeText" class="room-uptime" title="开播时长">已播 {{ liveUptimeText }}</span>
       </div>
     </header>
 
-    <div class="room-body">
+    <div ref="roomBodyRef" class="room-body">
       <!-- 左：播放器 + 操作行 -->
       <div class="player-column">
         <div ref="playerShellRef" class="player-shell">
@@ -33,6 +34,34 @@
             @pause="onPause"
             @play="onPlay"
           ></video>
+
+          <!-- SC 卡片横幅: 展示期内的醒目留言, 到期自动移除 -->
+          <div v-if="superchats.length" class="superchat-layer" aria-hidden="false">
+            <div
+              v-for="sc in superchats"
+              :key="sc.id"
+              class="sc-card"
+              :style="{ '--sc-accent': scAccent(sc.price) }"
+            >
+              <img
+                v-if="sc.avatar"
+                class="sc-avatar"
+                :src="sc.avatar"
+                alt=""
+                referrerpolicy="no-referrer"
+              />
+              <span v-else class="sc-avatar placeholder">{{ (sc.user || '?').slice(0, 1) }}</span>
+              <div class="sc-body">
+                <div class="sc-head">
+                  <strong>{{ sc.user }}</strong>
+                  <span class="sc-price">¥{{ sc.price }}</span>
+                  <span class="sc-remain">{{ sc.remain }}s</span>
+                </div>
+                <p class="sc-message">{{ sc.message }}</p>
+              </div>
+              <button class="sc-close" title="关闭" @click="dismissSuperchat(sc.id)">×</button>
+            </div>
+          </div>
 
           <div v-if="floatingDanmaku" class="danmaku-layer" aria-hidden="true" :style="danmakuLayerStyle">
             <span
@@ -95,17 +124,39 @@
             <span class="bar-spacer"></span>
 
             <button
-              v-if="streams.length > 1"
+              v-if="streams.length"
               class="bar-text-btn"
               :title="'画质：' + currentQuality"
-              @click="sideTab = 'settings'"
+              @click="toggleQualitySheet"
             >
               {{ currentQuality }}
+            </button>
+            <button v-if="isFullscreen" class="bar-btn" title="设置" @click="openSideTab('settings')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.64 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z" />
+              </svg>
             </button>
             <button class="bar-btn" title="全屏" @click="toggleFullscreen">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M16 21h3a2 2 0 0 0 2-2v-3M8 21H5a2 2 0 0 1-2-2v-3" />
               </svg>
+            </button>
+          </div>
+
+          <!-- 清晰度选择: 按画质分组(同档多条 CDN 线路只显示一项, 容灾自动切换) -->
+          <div v-if="qualitySheetOpen" class="quality-backdrop" @click="qualitySheetOpen = false"></div>
+          <div v-if="qualitySheetOpen" class="quality-sheet" @click.stop>
+            <div class="quality-sheet-head">清晰度</div>
+            <button
+              v-for="group in qualityGroups"
+              :key="group.quality"
+              class="quality-item"
+              :class="{ active: activeQuality === group.quality }"
+              @click="chooseQuality(group.index)"
+            >
+              <span>{{ group.quality }}</span>
+              <span v-if="activeQuality === group.quality" class="quality-check">✓</span>
             </button>
           </div>
         </div>
@@ -121,8 +172,9 @@
         </div>
       </div>
 
-      <!-- 右：常驻侧栏（聊天 / 关注 / 设置） -->
-      <aside class="room-side">
+      <!-- 右：常驻侧栏（聊天 / 关注 / 设置）；全屏时变为按需弹出的浮层 -->
+      <aside class="room-side" :class="{ 'fs-open': isFullscreen && fsPanel !== null }">
+        <button v-if="isFullscreen" class="side-close" title="关闭" @click="closeFsPanel">×</button>
         <header v-if="detail" class="side-head">
           <img
             v-if="detail.avatar"
@@ -144,7 +196,7 @@
             :key="tab.key"
             class="side-tab"
             :class="{ active: sideTab === tab.key }"
-            @click="sideTab = tab.key"
+            @click="openSideTab(tab.key)"
           >
             {{ tab.label }}
           </button>
@@ -219,26 +271,97 @@
             <section v-if="danmakuSupported" class="setting-group">
               <h3>弹幕</h3>
               <div class="setting-options">
-                <button class="setting-chip" :class="{ active: floatingDanmaku }" @click="floatingDanmaku = !floatingDanmaku">
+                <button
+                  class="setting-chip"
+                  :class="{ active: liveSettings.danmakuOn }"
+                  @click="setDanmakuEnabled(true)"
+                >
+                  弹幕开
+                </button>
+                <button
+                  class="setting-chip"
+                  :class="{ active: !liveSettings.danmakuOn }"
+                  @click="setDanmakuEnabled(false)"
+                >
+                  弹幕关
+                </button>
+                <button class="setting-chip" :class="{ active: floatingDanmaku }" @click="floatingDanmaku = true">
                   画面飘屏
                 </button>
-                <button class="setting-chip" :class="{ active: !floatingDanmaku }" @click="floatingDanmaku = !floatingDanmaku">
+                <button class="setting-chip" :class="{ active: !floatingDanmaku }" @click="floatingDanmaku = false">
                   仅列表
                 </button>
               </div>
+
+              <div class="setting-slider-row">
+                <label>显示区域</label>
+                <div class="setting-options setting-options-inline">
+                  <button
+                    v-for="option in danmakuAreaOptions"
+                    :key="option"
+                    class="setting-chip"
+                    :class="{ active: liveSettings.danmakuArea === option }"
+                    @click="liveSettings.setDanmakuArea(option)"
+                  >
+                    {{ option }}%
+                  </button>
+                </div>
+              </div>
+
+              <div class="setting-slider-row">
+                <label>不透明度</label>
+                <input
+                  type="range"
+                  :min="danmakuOpacityRange.min"
+                  :max="danmakuOpacityRange.max"
+                  step="0.05"
+                  :value="liveSettings.danmakuOpacity"
+                  @input="liveSettings.setDanmakuOpacity(($event.target as HTMLInputElement).valueAsNumber)"
+                >
+                <span class="setting-slider-value">{{ Math.round(liveSettings.danmakuOpacity * 100) }}%</span>
+              </div>
+
+              <div class="setting-slider-row">
+                <label>字号</label>
+                <input
+                  type="range"
+                  :min="danmakuFontSizeRange.min"
+                  :max="danmakuFontSizeRange.max"
+                  step="1"
+                  :value="liveSettings.danmakuFontSize"
+                  @input="liveSettings.setDanmakuFontSize(($event.target as HTMLInputElement).valueAsNumber)"
+                >
+                <span class="setting-slider-value">{{ liveSettings.danmakuFontSize }}px</span>
+              </div>
+
+              <div class="setting-slider-row">
+                <label>滚动速度</label>
+                <input
+                  type="range"
+                  :min="danmakuSpeedRange.min"
+                  :max="danmakuSpeedRange.max"
+                  step="1"
+                  :value="liveSettings.danmakuSpeed"
+                  @input="liveSettings.setDanmakuSpeed(($event.target as HTMLInputElement).valueAsNumber)"
+                >
+                <span class="setting-slider-value">{{ liveSettings.danmakuSpeed }}s</span>
+              </div>
+
+              <p v-if="danmakuError" class="setting-hint error">{{ danmakuError }}</p>
+              <p v-else class="setting-hint">滚动速度为弹幕滚过画面的秒数，越小越快。</p>
             </section>
 
             <section v-if="streams.length" class="setting-group">
               <h3>画质 / 线路</h3>
               <div class="setting-options">
                 <button
-                  v-for="(stream, index) in streams"
-                  :key="stream.url"
+                  v-for="group in qualityGroups"
+                  :key="group.quality"
                   class="setting-chip"
-                  :class="{ active: activeIndex === index }"
-                  @click="switchStream(index)"
+                  :class="{ active: activeQuality === group.quality }"
+                  @click="switchStream(group.index)"
                 >
-                  {{ stream.quality }}
+                  {{ group.quality }}
                 </button>
               </div>
             </section>
@@ -255,13 +378,24 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import Hls from 'hls.js'
 import flvjs from 'flv.js'
 import { useLiveStore } from '../stores/live'
-import { useLiveSettingsStore } from '../stores/liveSettings'
+import { useLiveShieldStore } from '../stores/liveShield'
+import {
+  DANMAKU_AREA_OPTIONS,
+  DANMAKU_FONT_SIZE_RANGE,
+  DANMAKU_OPACITY_RANGE,
+  DANMAKU_SPEED_RANGE,
+  pickQualityIndex,
+  useLiveSettingsStore,
+} from '../stores/liveSettings'
 import { addLiveStats } from '../api/liveStats'
+import { addLiveHistory } from '../api/liveHistory'
+import { getLiveSuperChatHistory } from '../api/live'
 import { startLiveDanmaku, stopLiveDanmaku, type DanmakuMessage } from '../api/liveDanmaku'
 import type { LiveRoomDetail, LiveStream } from '../api/live'
 
@@ -271,6 +405,12 @@ const route = useRoute()
 const router = useRouter()
 const store = useLiveStore()
 const liveSettings = useLiveSettingsStore()
+const shield = useLiveShieldStore()
+/** 桌面端全屏必须走 Tauri 窗口 API: WebView2 里对 DOM 调 requestFullscreen 不可靠
+ *  (用户实测完全进不去)。浏览器预览时退回 DOM 全屏。 */
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+const appWindow = isTauri ? getCurrentWindow() : null
+let unlistenWindowResize: (() => void) | undefined
 
 const videoRef = ref<HTMLVideoElement | null>(null)
 const detail = ref<LiveRoomDetail | null>(null)
@@ -282,6 +422,8 @@ const muted = ref(true)
 
 let hls: Hls | null = null
 let flv: flvjs.Player | null = null
+/** 本轮播放已试过的线路下标(容灾切换用), 每次 load() 重置。 */
+const triedIndexes = new Set<number>()
 
 /** 观看时长上报：播放中用固定间隔累加，离开页面/暂停时补一次。 */
 let watchTimer: number | undefined
@@ -289,7 +431,10 @@ let watchTickAt = 0
 let sessionCounted = false
 
 type DanmakuItem = DanmakuMessage & { id: number; track: number }
-const DANMAKU_LANES = 6
+/** 轨道数按「显示区域高度 ÷ 行高」动态计算, 默认上限 8: 全屏时行数多,
+ *  小窗时自动减少, 避免弹幕落在被裁掉的轨道上而"看不见"。 */
+const DANMAKU_MAX_LANES = 8
+const danmakuLaneCount = ref(6)
 const CHAT_LIMIT = 160
 let danmakuSeq = 0
 let danmakuLane = 0
@@ -305,18 +450,176 @@ const danmakuOn = computed({
 })
 const floatingDanmaku = ref(true)
 const danmakuError = ref('')
+const danmakuAreaOptions = DANMAKU_AREA_OPTIONS
+const danmakuOpacityRange = DANMAKU_OPACITY_RANGE
+const danmakuFontSizeRange = DANMAKU_FONT_SIZE_RANGE
+const danmakuSpeedRange = DANMAKU_SPEED_RANGE
 let danmakuRunning = false
 const danmakuTimers = new Set<number>()
 
+/** 全屏的对象是「播放器 + 信息栏」整体, 而不是只有画面:
+ *  只把画面全屏会把右侧聊天/设置挡在外面, 导致全屏时设置无法打开。 */
+const roomBodyRef = ref<HTMLElement | null>(null)
 const playerShellRef = ref<HTMLElement | null>(null)
+let playerShellObserver: ResizeObserver | null = null
 const paused = ref(false)
 const fitMode = ref<'contain' | 'cover' | 'fill'>('contain')
 const rotate = ref(0)
 const mirrored = ref(false)
 const sideTab = ref<'chat' | 'follow' | 'settings'>('chat')
+/** 底栏画质按钮弹出的清晰度列表。 */
+const qualitySheetOpen = ref(false)
+/** 全屏时侧栏默认隐藏(只留画面+弹幕), 点底栏齿轮/聊天按钮时以浮层弹出。 */
+const isFullscreen = ref(false)
+const fsPanel = ref<'chat' | 'follow' | 'settings' | null>(null)
+
+function openSideTab(tab: 'chat' | 'follow' | 'settings') {
+  sideTab.value = tab
+  if (isFullscreen.value) fsPanel.value = tab
+}
+
+function closeFsPanel() {
+  fsPanel.value = null
+}
+
+function syncFullscreenState() {
+  const active = isTauri
+    ? isFullscreen.value
+    : Boolean(document.fullscreenElement)
+  setFullscreenState(active)
+}
+
+/** 全屏 = 整个窗口全屏 + 隐藏标题栏/导航/侧栏, 只留画面和弹幕, 与 Simple Live 一致。 */
+function setFullscreenState(active: boolean) {
+  isFullscreen.value = active
+  if (!active) fsPanel.value = null
+  if (typeof document !== 'undefined') {
+    document.body.classList.toggle('live-fullscreen', active)
+  }
+}
+
+async function toggleFullscreen() {
+  // 桌面端: 窗口级全屏(WebView2 的 DOM 全屏不可靠)。
+  if (appWindow) {
+    const next = !isFullscreen.value
+    try {
+      await appWindow.setFullscreen(next)
+      setFullscreenState(next)
+    } catch {
+      // 窗口全屏失败时退回 DOM 全屏, 至少保证按钮有反馈。
+    }
+    return
+  }
+  // 浏览器预览: DOM 全屏。
+  const body = roomBodyRef.value
+  if (!body) return
+  if (document.fullscreenElement) {
+    await document.exitFullscreen().catch(() => undefined)
+    return
+  }
+  await body.requestFullscreen().catch(() => undefined)
+}
+
+/** 全屏时按 Esc 退出(与常见桌面播放器一致)。 */
+function onFullscreenEscape(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || !isFullscreen.value) return
+  event.preventDefault()
+  if (appWindow) {
+    void appWindow.setFullscreen(false).catch(() => undefined)
+  }
+  setFullscreenState(false)
+}
 const watchedSeconds = ref(0)
 const copied = ref(false)
 let watchDisplayTimer: number | undefined
+
+/** ── 开播时长: 有 live_start_time 的平台(B站/斗鱼)实时累计, 每 30 秒一跳 ── */
+const liveUptimeText = ref('')
+let liveUptimeTimer: number | undefined
+
+/** ── SC 卡片横幅: 弹幕实时推送 + 进房拉取展示期内的历史, 剩余秒数递减 ── */
+interface SuperChatCard {
+  id: number
+  user: string
+  avatar: string
+  message: string
+  price: number
+  /** 剩余展示秒数。 */
+  remain: number
+}
+const superchats = ref<SuperChatCard[]>([])
+let superchatSeq = 0
+let superchatSeen = new Set<string>()
+
+/** SC 金额分档配色(参考 B 站: 蓝→黄→红)。 */
+function scAccent(price: number) {
+  if (price >= 500) return '#c04851'
+  if (price >= 100) return '#d0762c'
+  if (price >= 50) return '#b8962e'
+  return '#1e7fbf'
+}
+
+function pushSuperChat(card: Omit<SuperChatCard, 'id' | 'remain'>, remain: number) {
+  // 同一发送者+内容的 SC 去重(历史与实时推送可能重叠)。
+  const key = `${card.user}|${card.message}`
+  if (superchatSeen.has(key)) return
+  superchatSeen.add(key)
+  superchats.value.push({ ...card, id: ++superchatSeq, remain: Math.max(1, Math.round(remain)) })
+}
+
+function dismissSuperchat(id: number) {
+  superchats.value = superchats.value.filter((item) => item.id !== id)
+}
+
+/** 每秒一跳: 开播时长累计 + SC 剩余秒数递减。 */
+function onSecondTick() {
+  // 开播时长
+  const start = detail.value?.liveStartTime ?? 0
+  if (start > 0 && detail.value?.isLive) {
+    liveUptimeText.value = formatClock(Math.max(0, Math.floor(Date.now() / 1000) - start))
+  } else {
+    liveUptimeText.value = ''
+  }
+  // SC 到期移除
+  if (superchats.value.length) {
+    superchats.value = superchats.value
+      .map((item) => ({ ...item, remain: item.remain - 1 }))
+      .filter((item) => item.remain > 0)
+  }
+}
+
+function formatClock(total: number) {
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
+}
+
+/** 进房时读取展示期内的 SC(B 站), 剩余时间按 end_time 换算。 */
+async function loadSuperchatHistory() {
+  if (platform !== 'bilibili') return
+  try {
+    const list = await getLiveSuperChatHistory(platform, roomId)
+    const now = Math.floor(Date.now() / 1000)
+    for (const item of list) {
+      const remain = item.endTime - now
+      if (remain > 0 && item.message) {
+        pushSuperChat(
+          {
+            user: item.user,
+            avatar: item.avatar,
+            message: item.message,
+            price: item.price,
+          },
+          remain,
+        )
+      }
+    }
+  } catch {
+    // SC 历史拉不到不影响观看。
+  }
+}
 
 const fitOptions: Array<{ value: 'contain' | 'cover' | 'fill'; label: string }> = [
   { value: 'contain', label: '适应' },
@@ -344,7 +647,30 @@ const danmakuLayerStyle = computed<Record<string, string | number>>(() => ({
 /** 轨道间距随字号缩放, 避免大字号弹幕上下重叠。 */
 const danmakuLaneHeight = computed(() => Math.round(liveSettings.danmakuFontSize * 1.75))
 
+/** 按播放器当前高度与显示区域重算可用轨道数。 */
+function updateDanmakuLanes() {
+  const height = playerShellRef.value?.clientHeight ?? 0
+  if (!height) return
+  const area = Math.max(1, Math.min(100, liveSettings.danmakuArea))
+  const laneHeight = Math.max(1, danmakuLaneHeight.value)
+  danmakuLaneCount.value = Math.max(
+    1,
+    Math.min(DANMAKU_MAX_LANES, Math.floor((height * area) / 100 / laneHeight)),
+  )
+}
+
 const currentQuality = computed(() => streams.value[activeIndex.value]?.quality || '默认')
+
+/** 画质分组: 后端同档位可能返回多条 CDN 线路, 列表只显示一项(容灾时自动换线路)。 */
+const qualityGroups = computed(() => {
+  const seen = new Map<string, number>()
+  streams.value.forEach((stream, index) => {
+    if (!seen.has(stream.quality)) seen.set(stream.quality, index)
+  })
+  return [...seen.entries()].map(([quality, index]) => ({ quality, index }))
+})
+
+const activeQuality = computed(() => streams.value[activeIndex.value]?.quality || '')
 
 const watchedText = computed(() => {
   const total = watchedSeconds.value
@@ -388,13 +714,32 @@ function formatOnline(count: number) {
 function pushDanmaku(messages: DanmakuMessage[]) {
   for (const message of messages) {
     if (message.kind === 'error') {
-      errorMsg.value = message.content
+      // 连接中断/重连提示只属于弹幕面板, 不能写进播放器错误(播放器还在正常出画面)。
+      danmakuError.value = message.content
       continue
     }
+    // 弹幕屏蔽: 命中屏蔽词的普通弹幕直接丢弃(付费 SC 不屏蔽)。
+    if (message.kind === 'chat' && shield.shouldBlock(message.content, message.user)) {
+      continue
+    }
+    // 收到真实弹幕后把之前的连接错误收起来。
+    danmakuError.value = ''
     const item: DanmakuItem = {
       ...message,
       id: ++danmakuSeq,
-      track: danmakuLane++ % DANMAKU_LANES,
+      track: danmakuLane++ % Math.max(1, danmakuLaneCount.value),
+    }
+    // SC 同步进播放器上方的卡片横幅, 按 duration 倒计时。
+    if (message.kind === 'superchat') {
+      pushSuperChat(
+        {
+          user: message.user,
+          avatar: message.avatar || '',
+          message: message.content,
+          price: message.price || 0,
+        },
+        message.duration || 60,
+      )
     }
     // 列表与飘屏共用同一份数据: 列表保留更久, 飘屏滚出画面(动画时长)后移除。
     chatMessages.value.push(item)
@@ -451,14 +796,32 @@ function clearDanmaku() {
 }
 
 function toggleDanmaku() {
-  danmakuOn.value = !danmakuOn.value
-  if (danmakuOn.value) {
-    void startDanmaku()
-  } else {
+  liveSettings.setDanmakuOn(!liveSettings.danmakuOn)
+}
+
+/** 设置面板的「弹幕开/关」: 与播放器底栏按钮共用同一份持久化开关。 */
+function setDanmakuEnabled(value: boolean) {
+  if (liveSettings.danmakuOn !== value) liveSettings.setDanmakuOn(value)
+}
+
+// 开关变化时同步连接状态: 关闭立即断开, 打开重新连接(后端会顶掉旧连接)。
+watch(
+  () => liveSettings.danmakuOn,
+  (enabled) => {
+    if (enabled) {
+      void startDanmaku()
+      return
+    }
     stopDanmaku()
     floatingItems.value = []
-  }
-}
+  },
+)
+
+// 显示区域/字号变化会改变可用轨道数; 全屏切换则由播放器尺寸的 ResizeObserver 触发。
+watch(
+  [() => liveSettings.danmakuArea, () => liveSettings.danmakuFontSize],
+  () => void nextTick(updateDanmakuLanes),
+)
 
 function togglePlay() {
   const video = videoRef.value
@@ -477,16 +840,6 @@ function onPause() {
 
 function rotateVideo() {
   rotate.value = (rotate.value + 90) % 360
-}
-
-function toggleFullscreen() {
-  const shell = playerShellRef.value
-  if (!shell) return
-  if (document.fullscreenElement) {
-    void document.exitFullscreen().catch(() => undefined)
-    return
-  }
-  void shell.requestFullscreen().catch(() => undefined)
 }
 
 /** 复制直播间网页地址（不是内部路由），方便分享给不在用本软件的人。 */
@@ -601,6 +954,10 @@ async function load() {
   }
   status.value = 'loading'
   errorMsg.value = ''
+  // 新一轮加载: 容灾重试与 SC 去重都从头计。
+  triedIndexes.clear()
+  superchatSeen = new Set()
+  superchats.value = []
   // 先对齐平台, 再用 store 里的取流/详情方法(它们读的是 store.platform)。
   if (store.platform !== platform) store.platform = platform
   try {
@@ -609,6 +966,17 @@ async function load() {
       store.fetchStreamUrls(roomId),
     ])
     detail.value = roomDetail
+    // 进房即记一次观看历史(带封面/头像快照, 未开播也记, 与 simple_live 一致)。
+    void addLiveHistory({
+      platform,
+      roomId,
+      roomName: roomDetail.title,
+      anchorName: roomDetail.userName,
+      cover: roomDetail.cover,
+      avatar: roomDetail.avatar,
+    }).catch(() => undefined)
+    // 进房读取展示期内的 SC(B 站), 与弹幕实时推送合并展示。
+    void loadSuperchatHistory()
     /**
      * 只有部分平台的流能在 WebView 里直接播:
      * - 虎牙/哔哩哔哩的 flv 校验 Referer(浏览器禁止脚本改这个头) → 只用 hls;
@@ -622,7 +990,8 @@ async function load() {
       status.value = 'offline'
       return
     }
-    activeIndex.value = 0
+    activeIndex.value = pickQualityIndex(streams.value.length, liveSettings.qualityLevel)
+    qualitySheetOpen.value = false
     await nextTick()
     playCurrent()
     void startDanmaku()
@@ -632,11 +1001,42 @@ async function load() {
   }
 }
 
+/** 播放失败时的线路容灾: 优先同画质下一条未试过的线路, 全试完才报错。 */
+function tryNextStream(reason: string) {
+  const current = streams.value[activeIndex.value]
+  const candidates = streams.value
+    .map((stream, index) => ({ stream, index }))
+    .filter(
+      ({ stream, index }) =>
+        !triedIndexes.has(index) &&
+        (current ? stream.quality === current.quality : true) &&
+        stream.url !== current?.url,
+    )
+  const fallbackSameQuality = candidates[0]
+  if (fallbackSameQuality) {
+    activeIndex.value = fallbackSameQuality.index
+    playCurrent()
+    return
+  }
+  // 同画质没有可用线路, 再尝试其它画质的线路(总比黑屏好)。
+  const fallbackAny = streams.value.findIndex(
+    (_stream, index) => !triedIndexes.has(index) && index !== activeIndex.value,
+  )
+  if (fallbackAny >= 0) {
+    activeIndex.value = fallbackAny
+    playCurrent()
+    return
+  }
+  status.value = 'error'
+  errorMsg.value = reason
+}
+
 function playCurrent() {
   const stream = streams.value[activeIndex.value]
   const video = videoRef.value
   if (!stream?.url || !video) return
   destroyPlayer()
+  triedIndexes.add(activeIndex.value)
   status.value = 'loading'
 
   if (stream.format === 'flv') {
@@ -656,10 +1056,9 @@ function playCurrent() {
     })
     instance.on(Hls.Events.ERROR, (_event, data) => {
       if (!data.fatal) return
-      status.value = 'error'
-      errorMsg.value = `播放中断（${data.type}: ${data.details}）`
       instance.destroy()
       hls = null
+      tryNextStream(`播放中断（${data.type}: ${data.details}）`)
     })
     instance.loadSource(stream.url)
     instance.attachMedia(video)
@@ -690,8 +1089,7 @@ function playFlv(url: string, video: HTMLVideoElement) {
   )
   flv = player
   player.on(flvjs.Events.ERROR, (type: string, detail: string) => {
-    status.value = 'error'
-    errorMsg.value = `播放中断（${type}: ${detail}）`
+    tryNextStream(`播放中断（${type}: ${detail}）`)
   })
   player.attachMediaElement(video)
   player.load()
@@ -702,6 +1100,16 @@ function switchStream(index: number) {
   if (index === activeIndex.value) return
   activeIndex.value = index
   playCurrent()
+}
+
+/** 打开/收起底栏的清晰度列表。 */
+function toggleQualitySheet() {
+  qualitySheetOpen.value = !qualitySheetOpen.value
+}
+
+function chooseQuality(index: number) {
+  qualitySheetOpen.value = false
+  switchStream(index)
 }
 
 function toggleMute() {
@@ -717,11 +1125,49 @@ function goBack() {
 }
 
 onMounted(() => {
+  document.addEventListener('fullscreenchange', syncFullscreenState)
+  window.addEventListener('keydown', onFullscreenEscape)
+  if (appWindow) {
+    void appWindow
+      .onResized(async () => {
+        const full = await appWindow.isFullscreen().catch(() => false)
+        if (full !== isFullscreen.value) setFullscreenState(full)
+      })
+      .then((unlisten) => {
+        unlistenWindowResize = unlisten
+      })
+  }
   void store.loadFollows()
   void load()
+  // 开播时长 + SC 剩余秒数共用一个 1s tick。
+  liveUptimeTimer = window.setInterval(onSecondTick, 1000)
+  onSecondTick()
+  void nextTick(() => {
+    updateDanmakuLanes()
+    const shell = playerShellRef.value
+    if (shell && typeof ResizeObserver !== 'undefined') {
+      playerShellObserver = new ResizeObserver(() => updateDanmakuLanes())
+      playerShellObserver.observe(shell)
+    }
+  })
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('fullscreenchange', syncFullscreenState)
+  window.removeEventListener('keydown', onFullscreenEscape)
+  unlistenWindowResize?.()
+  unlistenWindowResize = undefined
+  if (appWindow && isFullscreen.value) {
+    void appWindow.setFullscreen(false).catch(() => undefined)
+  }
+  setFullscreenState(false)
+  playerShellObserver?.disconnect()
+  playerShellObserver = null
+  if (liveUptimeTimer !== undefined) {
+    window.clearInterval(liveUptimeTimer)
+    liveUptimeTimer = undefined
+  }
+  superchats.value = []
   stopWatchClock()
   stopDanmaku()
   clearDanmaku()
@@ -736,8 +1182,6 @@ onBeforeUnmount(() => {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  max-width: var(--content-max-width);
-  margin: 0 auto;
   padding: 0 var(--space-6) var(--space-4);
 }
 
@@ -800,6 +1244,123 @@ onBeforeUnmount(() => {
   color: var(--color-primary);
 }
 
+.room-uptime {
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  background: var(--color-bg-sunken);
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* ── SC 卡片横幅: 播放器上方, 到期自动移除 ── */
+.superchat-layer {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.sc-card {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  max-width: 460px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--sc-accent, #1e7fbf);
+  color: #fff;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+}
+
+.sc-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  border: 2px solid rgba(255, 255, 255, 0.6);
+}
+
+.sc-avatar.placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.25);
+  font-size: 15px;
+}
+
+.sc-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.sc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.sc-head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sc-price {
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  background: rgba(255, 255, 255, 0.22);
+  font-weight: 700;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.sc-remain {
+  margin-left: auto;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.sc-message {
+  margin: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.sc-close {
+  align-self: flex-start;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.sc-close:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
 .room-head-actions {
   display: flex;
   align-items: center;
@@ -838,6 +1399,75 @@ onBeforeUnmount(() => {
   align-items: stretch;
 }
 
+/* 全屏: 整个窗口全屏, 隐藏标题栏/导航/房间头部/聊天栏, 只留画面+弹幕。
+ * 与 Simple Live 一致; 设置由播放器底栏齿轮以浮层弹出。 */
+.live-room-view.is-fullscreen {
+  position: relative;
+  padding: 0;
+}
+
+.live-room-view.is-fullscreen .room-head,
+.live-room-view.is-fullscreen .room-actions {
+  display: none;
+}
+
+.live-room-view.is-fullscreen .room-body {
+  gap: 0;
+}
+
+.live-room-view.is-fullscreen .player-shell {
+  border: none;
+  border-radius: 0;
+}
+
+.live-room-view.is-fullscreen .room-side {
+  display: none;
+}
+
+.live-room-view.is-fullscreen .room-side.fs-open {
+  display: flex;
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: min(360px, 46vw);
+  z-index: 8;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.live-room-view.is-fullscreen .room-side .side-head,
+.live-room-view.is-fullscreen .room-side .side-tabs {
+  display: none;
+}
+
+.live-room-view.is-fullscreen .room-side .side-panel {
+  padding-top: 38px;
+}
+
+.side-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--color-bg-sunken);
+  color: var(--color-text-secondary);
+  font-size: 17px;
+  line-height: 1;
+}
+
+.side-close:hover {
+  color: var(--color-text);
+}
+
 .player-column {
   flex: 1;
   min-width: 0;
@@ -850,13 +1480,14 @@ onBeforeUnmount(() => {
 .player-shell {
   position: relative;
   width: 100%;
-  aspect-ratio: 16 / 9;
-  max-height: calc(100vh - 220px);
+  /* 铺满左栏剩余高度, 与右侧信息栏等高 —— 原先是固定 16:9 小画面,
+   * 窗口高时下方留出大片空白, 和侧栏比例不协调。 */
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
   border-radius: var(--radius-lg);
   border: 1px solid var(--color-border-light);
   background: #000;
-  flex-shrink: 0;
 }
 
 .player-shell:fullscreen {
@@ -1022,6 +1653,65 @@ onBeforeUnmount(() => {
 .bar-text-btn:hover {
   background: rgba(255, 255, 255, 0.16);
   color: #fff;
+}
+
+/* 清晰度列表: 与 Simple Live 一致, 底栏画质按钮弹出, 点击即切线路。 */
+.quality-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+}
+
+.quality-sheet {
+  position: absolute;
+  right: 10px;
+  bottom: 48px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 128px;
+  max-height: min(320px, 60%);
+  padding: 6px;
+  overflow-y: auto;
+  border-radius: var(--radius-md);
+  background: rgba(22, 22, 24, 0.92);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(10px);
+}
+
+.quality-sheet-head {
+  padding: 4px 10px 6px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.quality-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  color: rgba(255, 255, 255, 0.86);
+  font-size: 12.5px;
+  text-align: left;
+  transition: background var(--duration-fast) var(--ease-out);
+}
+
+.quality-item:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.quality-item.active {
+  background: var(--color-primary);
+  color: #fff;
+  font-weight: 600;
+}
+
+.quality-check {
+  font-size: 12px;
 }
 
 .room-actions {
@@ -1271,6 +1961,45 @@ onBeforeUnmount(() => {
   margin-top: 8px;
 }
 
+.setting-options-inline {
+  flex: 1;
+  margin-top: 0 !important;
+}
+
+.setting-slider-row {
+  display: grid;
+  grid-template-columns: 58px 1fr 42px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.setting-slider-row input[type='range'] {
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--color-primary);
+}
+
+.setting-slider-value {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.setting-hint {
+  margin: 8px 0 0;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.setting-hint.error {
+  color: var(--color-danger, #c0392b);
+}
+
 .setting-chip {
   padding: 5px 11px;
   border-radius: var(--radius-full);
@@ -1318,7 +2047,8 @@ onBeforeUnmount(() => {
   }
 
   .player-shell {
-    max-height: 46vh;
+    flex: 0 0 auto;
+    aspect-ratio: 16 / 9;
   }
 
   .room-side {
@@ -1335,7 +2065,6 @@ onBeforeUnmount(() => {
 
   .player-shell {
     border-radius: var(--radius-md);
-    max-height: 36vh;
   }
 }
 </style>

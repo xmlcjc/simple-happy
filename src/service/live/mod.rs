@@ -5,6 +5,7 @@ pub mod danmaku;
 pub mod douyin;
 pub mod douyu;
 pub mod follow;
+pub mod history;
 pub mod huya;
 pub mod models;
 pub mod stats;
@@ -12,7 +13,7 @@ pub mod stats;
 use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
 use models::{
-    LiveCategoryGroup, LivePlatform, LiveRoomDetail, LiveRoomSummary, LiveStreamInfo,
+    LiveCategoryGroup, LivePlatform, LiveRoomDetail, LiveRoomSummary, LiveStreamInfo, LiveSuperChat,
 };
 
 pub struct LiveService {
@@ -132,6 +133,18 @@ impl LiveService {
             douyu::PLATFORM_ID => self.douyu.stream_urls(room_id).await,
             douyin::PLATFORM_ID => self.douyin.stream_urls(room_id).await,
             other => Err(unsupported_platform(other)),
+        }
+    }
+
+    /// 展示期内的 SC 列表。目前只有 B 站提供, 其它平台返回空列表。
+    pub async fn superchat_history(
+        &self,
+        platform: &str,
+        room_id: &str,
+    ) -> Result<Vec<LiveSuperChat>, AppError> {
+        match platform {
+            bilibili::PLATFORM_ID => self.bilibili.superchat_history(room_id).await,
+            _ => Ok(Vec::new()),
         }
     }
 }

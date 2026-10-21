@@ -347,6 +347,28 @@
           <section v-show="activeSettingsTab === 'live'" class="drawer-section">
             <h3 class="section-title">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M12 3v18M5 8l7-5 7 5M5 16l7 5 7-5" />
+              </svg>
+              直播清晰度
+            </h3>
+            <div class="live-setting-field">
+              <label>默认清晰度</label>
+              <div class="proxy-mode-toggle live-segment" role="group" aria-label="默认清晰度">
+                <button
+                  v-for="option in qualityLevelOptions"
+                  :key="option.value"
+                  type="button"
+                  :class="{ active: liveSettings.qualityLevel === option.value }"
+                  @click="liveSettings.setQualityLevel(option.value)"
+                >{{ option.label }}</button>
+              </div>
+            </div>
+            <small class="live-hint">参考 Simple Live：进入直播间自动按偏好选线路，最高=第一条（通常码率最高），最低=最后一条；播放页底栏画质按钮可随时手动切换。</small>
+          </section>
+
+          <section v-show="activeSettingsTab === 'live'" class="drawer-section">
+            <h3 class="section-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
                 <path d="M21 12a8 8 0 0 1-8 8H7l-4 3v-5.5A8 8 0 1 1 21 12z" />
               </svg>
               直播弹幕
@@ -424,6 +446,85 @@
             </div>
             <small class="live-hint">以上设置对 B 站 / 虎牙 / 斗鱼 / 抖音直播间均生效；滚动速度为弹幕滚过画面的秒数，越小越快。</small>
           </section>
+
+          <section v-show="activeSettingsTab === 'live'" class="drawer-section">
+            <h3 class="section-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" />
+              </svg>
+              关注自动刷新
+            </h3>
+            <div class="live-setting-field">
+              <label>刷新间隔</label>
+              <div class="proxy-mode-toggle live-segment" role="group" aria-label="关注刷新间隔">
+                <button
+                  v-for="option in followRefreshIntervalOptions"
+                  :key="option.value"
+                  type="button"
+                  :class="{ active: liveSettings.followRefreshInterval === option.value }"
+                  @click="liveSettings.setFollowRefreshInterval(option.value)"
+                >{{ option.label }}</button>
+              </div>
+            </div>
+            <small class="live-hint">在直播页停留时定时刷新关注列表的开播状态；「关闭」则只进入关注页时查询一次。</small>
+          </section>
+
+          <section v-show="activeSettingsTab === 'live'" class="drawer-section">
+            <h3 class="section-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M3 10 12 3l9 7" />
+                <path d="M5 9.5V21h14V9.5" />
+                <path d="m9 9 6 6M15 9l-6 6" />
+              </svg>
+              弹幕屏蔽
+            </h3>
+            <div class="shield-input-row">
+              <input
+                v-model="shieldWordDraft"
+                type="text"
+                placeholder="输入关键词或 /正则/ 后回车"
+                maxlength="60"
+                @keyup.enter="addShieldWord"
+              >
+              <button type="button" class="shield-add-btn" @click="addShieldWord">添加</button>
+            </div>
+            <div v-if="shield.words.length" class="shield-word-list">
+              <span v-for="word in shield.words" :key="word" class="shield-word">
+                {{ word }}
+                <button type="button" title="移除" @click="shield.removeWord(word)">×</button>
+              </span>
+            </div>
+            <div v-else class="shield-empty">还没有屏蔽词，命中的普通弹幕将被隐藏（付费 SC 不受影响）。</div>
+            <button
+              v-if="shield.words.length"
+              type="button"
+              class="shield-clear-btn"
+              @click="shield.clearWords()"
+            >清空全部</button>
+            <small class="live-hint">普通词按包含匹配弹幕内容或用户名；用 <code>/…/</code> 包裹则按正则匹配（忽略大小写）。</small>
+          </section>
+
+          <section v-show="activeSettingsTab === 'music'" class="drawer-section">
+            <h3 class="section-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M9 18V6l10-2v12" />
+                <circle cx="6" cy="18" r="3" />
+                <circle cx="16" cy="16" r="3" />
+              </svg>
+              音乐缓存
+            </h3>
+            <div class="live-setting-field">
+              <label>已用缓存</label>
+              <span class="music-cache-size">{{ cacheSizeLabel }}</span>
+            </div>
+            <button class="action-btn" :disabled="clearingCache" @click="clearMusicCache">
+              {{ clearingCache ? '清理中…' : '清除音乐缓存' }}
+            </button>
+            <small class="live-hint">
+              需要 Referer / UA 的音源会整块取流并写入本地缓存，重复播放无需重新下载，上限 512MB，超出后自动淘汰最久未使用的文件。
+            </small>
+          </section>
         </div>
       </aside>
     </Transition>
@@ -441,8 +542,16 @@ import {
   DANMAKU_FONT_SIZE_RANGE,
   DANMAKU_OPACITY_RANGE,
   DANMAKU_SPEED_RANGE,
+  FOLLOW_REFRESH_INTERVAL_OPTIONS,
+  QUALITY_LEVEL_OPTIONS,
   useLiveSettingsStore,
 } from '../stores/liveSettings'
+import { useLiveShieldStore } from '../stores/liveShield'
+import {
+  clearMusicCache as clearMusicCacheRequest,
+  getMusicCacheStats,
+  type MusicCacheStats,
+} from '../api/music'
 import {
   READER_BACKGROUND_OPACITY_STEP,
   normalizeReaderBackgroundOpacity,
@@ -464,10 +573,19 @@ const appStore = useAppStore()
 const shelfStore = useBookshelfStore()
 const readerStore = useReaderStore()
 const liveSettings = useLiveSettingsStore()
+const shield = useLiveShieldStore()
+const shieldWordDraft = ref('')
 const danmakuAreaOptions = DANMAKU_AREA_OPTIONS
+const qualityLevelOptions = QUALITY_LEVEL_OPTIONS
+const followRefreshIntervalOptions = FOLLOW_REFRESH_INTERVAL_OPTIONS
 const danmakuOpacityRange = DANMAKU_OPACITY_RANGE
 const danmakuFontSizeRange = DANMAKU_FONT_SIZE_RANGE
 const danmakuSpeedRange = DANMAKU_SPEED_RANGE
+
+function addShieldWord() {
+  shield.addWord(shieldWordDraft.value)
+  shieldWordDraft.value = ''
+}
 const route = useRoute()
 const appVersion = __APP_VERSION__
 const isDesktopApp = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -478,6 +596,7 @@ const settingsTabs = [
   { value: 'common', label: '常用' },
   { value: 'appearance', label: '外观' },
   { value: 'live', label: '直播' },
+  { value: 'music', label: '音乐' },
   { value: 'app', label: '应用' },
 ] as const
 const activeSettingsTab = ref<(typeof settingsTabs)[number]['value']>('common')
@@ -512,7 +631,50 @@ watch(() => props.modelValue, (visible) => {
   if (isDesktopApp && proxyModeDraft.value === 'system') {
     void appStore.applyNetworkProxy().catch(() => undefined)
   }
+  if (activeSettingsTab.value === 'music') void loadMusicCacheStats()
 })
+
+// 切到音乐页签时刷新缓存占用，避免显示过期数字。
+watch(activeSettingsTab, (tab) => {
+  if (tab === 'music' && props.modelValue) void loadMusicCacheStats()
+})
+
+const musicCacheStats = ref<MusicCacheStats | null>(null)
+const clearingCache = ref(false)
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${bytes} B`
+}
+
+const cacheSizeLabel = computed(() => {
+  if (!musicCacheStats.value) return '未加载'
+  if (!musicCacheStats.value.files) return '暂无缓存'
+  return `${formatBytes(musicCacheStats.value.bytes)} · ${musicCacheStats.value.files} 个文件（上限 ${formatBytes(musicCacheStats.value.limitBytes)}）`
+})
+
+async function loadMusicCacheStats() {
+  try {
+    musicCacheStats.value = await getMusicCacheStats()
+  } catch {
+    musicCacheStats.value = null
+  }
+}
+
+async function clearMusicCache() {
+  clearingCache.value = true
+  try {
+    const result = await clearMusicCacheRequest()
+    appStore.showToast(`已释放 ${formatBytes(result.freedBytes)}`, 'success')
+    await loadMusicCacheStats()
+  } catch (error) {
+    appStore.showToast((error as Error).message || '清理失败', 'error')
+  } finally {
+    clearingCache.value = false
+  }
+}
 
 // Single-user desktop: local WebDAV backup is always available.
 const webdavStatusTitle = computed(() => '\u6587\u4ef6\u5907\u4efd\u4e0e\u6062\u590d')
@@ -780,6 +942,12 @@ function removeBackgroundImage() {
 .drawer-section {
   padding: var(--space-5) 0;
   border-bottom: 1px solid var(--color-divider);
+}
+
+.music-cache-size {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .drawer-section:last-child {
@@ -1250,6 +1418,107 @@ function removeBackgroundImage() {
   margin-top: var(--space-3);
   color: var(--color-text-tertiary);
   font-size: var(--text-xs);
+}
+
+/* ── 弹幕屏蔽词管理 ── */
+.shield-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.shield-input-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-light);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  outline: none;
+}
+
+.shield-input-row input:focus {
+  border-color: var(--color-primary-border);
+}
+
+.shield-add-btn {
+  flex-shrink: 0;
+  padding: 0 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-light);
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+.shield-add-btn:hover {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
+}
+
+.shield-word-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.shield-word {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 4px 6px 4px 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border-light);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+}
+
+.shield-word span,
+.shield-word {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shield-word button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.shield-word button:hover {
+  background: var(--color-bg-sunken);
+  color: var(--color-text);
+}
+
+.shield-empty {
+  margin-top: 10px;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.shield-clear-btn {
+  margin-top: 10px;
+  padding: 4px 12px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border-light);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+}
+
+.shield-clear-btn:hover {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
 }
 
 /* 透明度百分比: 平时就是一段右对齐的 "35%" 文本 —— 常驻的边框与底色会让它像

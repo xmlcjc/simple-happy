@@ -15,6 +15,7 @@ use crate::error::error::AppError;
 
 use super::models::{
     LiveCategory, LiveCategoryGroup, LiveRoomDetail, LiveRoomSummary, LiveStream, LiveStreamInfo,
+    LiveSuperChat,
 };
 
 pub const PLATFORM_ID: &str = "bilibili";
@@ -104,6 +105,16 @@ impl Bilibili {
                 text(&value, "message")
             ))),
         }
+    }
+
+    /// 房间内还在展示期内的 SC 列表(进房时读取, 弹幕 WS 只推新到的)。
+    pub async fn superchat_history(&self, room_id: &str) -> Result<Vec<LiveSuperChat>, AppError> {
+        let id = normalize_id(room_id, "房间号")?;
+        let url = format!(
+            "https://api.live.bilibili.com/av/v1/SuperChat/getMessageList?room_id={id}"
+        );
+        let value = self.get_json(&url).await?;
+        Ok(parse_superchat_history(&value))
     }
 
     /// 搜索直播间。`buvid3/4` 只在首次调用时取, 之后复用(过期由站点重新下发)。
@@ -337,7 +348,21 @@ pub fn parse_room_detail(info: &Value, anchor: &Value) -> Option<LiveRoomDetail>
         area_name: text(room, "area_name"),
         parent_area_name: text(room, "parent_area_name"),
         is_live: room.get("live_status").and_then(Value::as_i64) == Some(1),
+        // `live_time` 是开播时刻的 unix 秒; 未开播/异常时为 0。
+        live_start_time: seconds(room, "live_time"),
     })
+}
+
+/// 秒级时间戳字段: 兼容数字与纯数字字符串两种下发形态。
+fn seconds(value: &Value, key: &str) -> i64 {
+    value
+        .get(key)
+        .and_then(|item| {
+            item.as_i64()
+                .or_else(|| item.as_str().and_then(|s| s.parse().ok()))
+        })
+        .filter(|v| *v > 0)
+        .unwrap_or(0)
 }
 
 /// 从 `getRoomPlayInfo` 的响应里拼出可播放地址。
@@ -345,6 +370,7 @@ pub fn parse_room_detail(info: &Value, anchor: &Value) -> Option<LiveRoomDetail>
 /// 顺序按「浏览器可直接播」优先: hls(ts) → hls(fmp4) → flv。
 /// flv 地址会校验 `Referer`, 而 Referer 是浏览器禁止脚本设置的请求头, 因此在
 /// WebView 里只有 hls 可用; flv 仍一并返回, 留给以后可能的外部播放器。
+/// `url_info` 里的每个 host 都是一条可用线路(多 CDN 容灾), 同档位会展开成多条。
 pub fn parse_play_streams(value: &Value) -> Vec<LiveStream> {
     let Some(playurl) = value.pointer("/data/playurl_info/playurl") else {
         return Vec::new();
@@ -375,7 +401,7 @@ pub fn parse_play_streams(value: &Value) -> Vec<LiveStream> {
                 if text(codec, "codec_name") != "avc" {
                     continue;
                 }
-                let Some(url) = build_stream_url(codec) else {
+                let Some(urls) = build_stream_urls(codec) else {
                     continue;
                 };
                 let qn = codec.get("current_qn").and_then(Value::as_i64).unwrap_or(0);
@@ -384,18 +410,26 @@ pub fn parse_play_streams(value: &Value) -> Vec<LiveStream> {
                     .find(|(value, _)| *value == qn)
                     .map(|(_, name)| name.clone())
                     .unwrap_or_else(|| "默认".to_string());
-                out.push((rank, LiveStream { format: kind.to_string(), quality, url }));
+                for url in urls {
+                    out.push((rank, LiveStream { format: kind.to_string(), quality: quality.clone(), url }));
+                }
             }
         }
     }
-    // 同一清晰度可能有多种封装, 先按可播优先级排序再去重, 才能留下 ts 而不是 fmp4。
+    // 同一清晰度可能有多种封装: ts 优先于 fmp4(同档有 ts 就丢掉 fmp4),
+    // 按可播优先级排序; 去重键是网址, 同档的多条 CDN 线路全部保留给「自动换线路」。
     out.sort_by_key(|(rank, _)| *rank);
+    let has_ts: std::collections::HashSet<String> = out
+        .iter()
+        .filter(|(rank, _)| *rank == 0)
+        .map(|(_, stream)| stream.quality.clone())
+        .collect();
     let mut deduped: Vec<LiveStream> = Vec::new();
-    for (_, stream) in out {
-        if deduped
-            .iter()
-            .any(|item| item.format == stream.format && item.quality == stream.quality)
-        {
+    for (rank, stream) in out {
+        if rank == 1 && has_ts.contains(&stream.quality) {
+            continue;
+        }
+        if deduped.iter().any(|item| item.url == stream.url) {
             continue;
         }
         deduped.push(stream);
@@ -403,20 +437,60 @@ pub fn parse_play_streams(value: &Value) -> Vec<LiveStream> {
     deduped
 }
 
-fn build_stream_url(codec: &Value) -> Option<String> {
+/// 一个 codec 可能有多个 CDN host(`url_info[]`), 每条 host 拼出一个完整地址。
+fn build_stream_urls(codec: &Value) -> Option<Vec<String>> {
     let base = codec.get("base_url").and_then(Value::as_str)?;
-    let host = codec
-        .pointer("/url_info/0/host")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let extra = codec
-        .pointer("/url_info/0/extra")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     if base.is_empty() {
         return None;
     }
-    Some(format!("{host}{base}{extra}"))
+    let entries = codec
+        .get("url_info")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let urls: Vec<String> = if entries.is_empty() {
+        vec![base.to_string()]
+    } else {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let host = entry.get("host").and_then(Value::as_str)?;
+                let extra = entry.get("extra").and_then(Value::as_str).unwrap_or_default();
+                Some(format!("{host}{base}{extra}"))
+            })
+            .collect()
+    };
+    if urls.is_empty() {
+        Some(vec![base.to_string()])
+    } else {
+        Some(urls)
+    }
+}
+
+/// `getMessageList` 的 `data.list` 是当前展示期内的 SC。
+pub fn parse_superchat_history(value: &Value) -> Vec<LiveSuperChat> {
+    let Some(items) = value.pointer("/data/list").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| LiveSuperChat {
+            user: item
+                .pointer("/user_info/uname")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            avatar: item
+                .pointer("/user_info/face")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            message: item.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+            price: item.get("price").and_then(Value::as_i64).unwrap_or(0),
+            start_time: item.get("start_time").and_then(Value::as_i64).unwrap_or(0),
+            end_time: item.get("end_time").and_then(Value::as_i64).unwrap_or(0),
+        })
+        .collect()
 }
 
 fn quality_names(playurl: &Value) -> Vec<(i64, String)> {
@@ -508,7 +582,8 @@ mod tests {
             "code": 0,
             "data": { "room_id": 23335083, "title": "标题", "online": 31412, "attention": 27717,
                       "live_status": 1, "description": "简介", "area_name": "颜值",
-                      "parent_area_name": "娱乐", "user_cover": "https://i0.hdslb.com/c.jpg" }
+                      "parent_area_name": "娱乐", "live_time": 1760000000,
+                      "user_cover": "https://i0.hdslb.com/c.jpg" }
         });
         let anchor = serde_json::json!({
             "code": 0,
@@ -521,6 +596,7 @@ mod tests {
         assert_eq!(detail.followers, 27717);
         assert!(detail.is_live);
         assert_eq!(detail.parent_area_name, "娱乐");
+        assert_eq!(detail.live_start_time, 1760000000);
     }
 
     #[test]
@@ -554,7 +630,11 @@ mod tests {
                                 { "codec_name": "hevc", "current_qn": 10000,
                                   "base_url": "/live/bvc/hevc.m3u8", "url_info": [{ "host": "https://d1.bilivideo.com" }] },
                                 { "codec_name": "avc", "current_qn": 10000,
-                                  "base_url": "/live/bvc/1.m3u8", "url_info": [{ "host": "https://d1.bilivideo.com" }] }
+                                  "base_url": "/live/bvc/1.m3u8",
+                                  "url_info": [
+                                    { "host": "https://d1.bilivideo.com", "extra": "&line=1" },
+                                    { "host": "https://ac1.bilivideo.com", "extra": "&line=2" }
+                                  ] }
                             ]}
                         ]}
                     ]
@@ -566,17 +646,37 @@ mod tests {
             is_live: true,
             streams: parse_play_streams(&value),
         };
-        assert_eq!(info.streams.len(), 2);
+        // ts 档展开成两条 CDN 线路(自动换线路用), fmp4 被同档 ts 顶掉, flv 兜底在最后。
+        assert_eq!(info.streams.len(), 3);
         assert_eq!(info.streams[0].format, "hls");
-        assert_eq!(info.streams[0].url, "https://d1.bilivideo.com/live/bvc/1.m3u8");
+        assert_eq!(info.streams[0].url, "https://d1.bilivideo.com/live/bvc/1.m3u8&line=1");
         assert_eq!(info.streams[0].quality, "原画");
-        assert_eq!(info.streams[1].format, "flv");
-        assert_eq!(info.streams[1].url, "https://cn.bilivideo.com/live/bvc/1.flv?x=1&y=2");
+        assert_eq!(info.streams[1].format, "hls");
+        assert_eq!(info.streams[1].url, "https://ac1.bilivideo.com/live/bvc/1.m3u8&line=2");
+        assert_eq!(info.streams[2].format, "flv");
+        assert_eq!(info.streams[2].url, "https://cn.bilivideo.com/live/bvc/1.flv?x=1&y=2");
     }
 
     #[test]
     fn offline_room_has_no_streams() {
         let value = serde_json::json!({ "code": 0, "data": { "live_status": 0, "playurl_info": null } });
         assert!(parse_play_streams(&value).is_empty());
+    }
+
+    #[test]
+    fn parses_superchat_history_list() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": { "list": [
+                { "user_info": { "uname": "老板", "face": "https://i0.hdslb.com/f.jpg" },
+                  "message": "加油", "price": 100, "start_time": 1760000000, "end_time": 1760000180 }
+            ]}
+        });
+        let list = parse_superchat_history(&value);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].user, "老板");
+        assert_eq!(list[0].price, 100);
+        assert_eq!(list[0].end_time - list[0].start_time, 180);
+        assert!(parse_superchat_history(&serde_json::json!({ "code": 0 })).is_empty());
     }
 }

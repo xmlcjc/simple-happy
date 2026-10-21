@@ -9,6 +9,12 @@ export interface DanmakuMessage {
   /** `#rrggbb`；空串表示用主题色。 */
   color: string
   timestamp: number
+  /** SC 金额（元）；非 SC 消息为 0。 */
+  price?: number
+  /** SC 展示时长（秒）；非 SC 消息为 0。 */
+  duration?: number
+  /** SC 发送者头像；非 SC 消息为空串。 */
+  avatar?: string
 }
 
 /**
