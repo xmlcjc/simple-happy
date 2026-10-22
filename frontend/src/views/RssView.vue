@@ -321,9 +321,9 @@ function goManage() {
   router.push('/rss/manage')
 }
 
-/** RSS 的阅读记录统一在「阅读历史」里，按 kind=rss 预筛选。 */
+/** RSS 阅读历史有独立页面，按篇数统计。 */
 function goHistory() {
-  router.push({ path: '/recent', query: { kind: 'rss' } })
+  router.push('/rss/history')
 }
 
 function syncViewportMode() {

@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="rss-article-view">
     <article class="article-page-card">
       <template v-if="store.activeArticle">
@@ -34,6 +34,7 @@ import { onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRssStore } from '../stores/rss'
 import { saveRecentReadBook } from '../utils/recentBooks'
+import { recordRssRead } from '../utils/rssReadHistory'
 import type { RssArticle } from '../types'
 
 const route = useRoute()
@@ -68,6 +69,12 @@ onMounted(async () => {
     rssPubDate: article.pubDate,
     durChapterTime: Date.now(),
     intro: article.description,
+  })
+  recordRssRead({
+    title: article.title || 'RSS 文章',
+    sourceUrl: source,
+    link,
+    pubDate: article.pubDate,
   })
 })
 

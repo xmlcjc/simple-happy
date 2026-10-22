@@ -44,6 +44,11 @@ const router = createRouter({
       component: () => import('../views/RssManageView.vue'),
     },
     {
+      path: '/rss/history',
+      name: 'rss-history',
+      component: () => import('../views/RssHistoryView.vue'),
+    },
+    {
       path: '/rss/article',
       name: 'rss-article',
       component: () => import('../views/RssArticleView.vue'),

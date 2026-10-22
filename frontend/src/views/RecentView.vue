@@ -3,15 +3,10 @@
     <div class="recent-content">
       <div class="recent-header">
         <h1 class="recent-title">
-          {{ historyTitle }}
+          阅读历史
           <span class="recent-count">({{ filteredRecentBooks.length }})</span>
         </h1>
         <div class="recent-actions">
-          <div class="recent-filters">
-            <button class="filter-chip" :class="{ active: activeFilter === 'all' }" @click="activeFilter = 'all'">全部</button>
-            <button class="filter-chip" :class="{ active: activeFilter === 'book' }" @click="activeFilter = 'book'">书籍</button>
-            <button class="filter-chip" :class="{ active: activeFilter === 'rss' }" @click="activeFilter = 'rss'">RSS</button>
-          </div>
           <button
             class="recent-clear-btn"
             :disabled="!shelfStore.recentBooks.length"
@@ -69,43 +64,25 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import BookDetailModal from '../components/BookDetailModal.vue'
 import BookGrid from '../components/BookGrid.vue'
 import { showContextMenu } from '../composables/useContextMenu'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
 import { getReadingStatsDaily, getReadingStatsSummary } from '../api/readingStats'
+import { recordRssReadFromBook } from '../utils/rssReadHistory'
 import type { Book, SearchBook } from '../types'
 
 const router = useRouter()
-const route = useRoute()
 const shelfStore = useBookshelfStore()
 const readerStore = useReaderStore()
 
 const showDetail = ref(false)
 const selectedBook = ref<Book | SearchBook | null>(null)
 const openingBookUrl = ref('')
-// 从 RSS 页面进入时默认只看 RSS 文章（/recent?kind=rss）。
-const initialKind = route.query.kind === 'rss' ? 'rss' : 'all'
-const activeFilter = ref<'all' | 'book' | 'rss'>(initialKind)
 const searchText = ref('')
-
-// 同一路由切换 query 时组件会被复用，标题与筛选要跟着更新。
-const entryKind = ref<'all' | 'rss'>(initialKind)
-
-watch(
-  () => route.query.kind,
-  (kind) => {
-    entryKind.value = kind === 'rss' ? 'rss' : 'all'
-    activeFilter.value = entryKind.value
-  },
-)
-
-const historyTitle = computed(() =>
-  entryKind.value === 'rss' ? 'RSS 阅读历史' : '阅读历史',
-)
 
 const stats = ref({
   todaySeconds: 0,
@@ -149,12 +126,8 @@ function formatNumber(value: number) {
 }
 
 const filteredRecentBooks = computed(() => {
-  let list = shelfStore.recentBooks
-  if (activeFilter.value === 'book') {
-    list = list.filter((book) => book.recentKind !== 'rss')
-  } else if (activeFilter.value === 'rss') {
-    list = list.filter((book) => book.recentKind === 'rss')
-  }
+  // RSS 文章有独立的历史页与统计，这里只展示书籍。
+  const list = shelfStore.recentBooks.filter((book) => book.recentKind !== 'rss')
 
   const keyword = searchText.value.trim().toLowerCase()
   if (!keyword) return list
@@ -177,6 +150,8 @@ const filteredRecentBooks = computed(() => {
 onMounted(async () => {
   await shelfStore.fetchBooks().catch(() => undefined)
   await shelfStore.refreshRecentBooks().catch(() => undefined)
+  // 旧版本的 RSS 记录只存在「最近阅读」里，迁移到 RSS 独立历史，避免统计丢失。
+  for (const book of shelfStore.recentBooks) recordRssReadFromBook(book)
   await loadStats().catch(() => undefined)
 })
 

@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { deleteRssSource, deleteRssSources, getRssArticles, getRssContent, getRssSources, saveRssSources } from '../api/rss'
 import type { RssArticle, RssSource } from '../types'
 import { saveRecentReadBook } from '../utils/recentBooks'
+import { recordRssRead } from '../utils/rssReadHistory'
 import { toRssSourceDeletePayload } from '../utils/sourceSelection'
 
 type ArticleScope = 'source' | 'group' | 'all'
@@ -224,6 +225,12 @@ export const useRssStore = defineStore('rss', () => {
         rssLink: article.link,
         rssPubDate: article.pubDate,
       })
+      recordRssRead({
+        title: article.title || 'RSS 文章',
+        sourceUrl,
+        link: article.link,
+        pubDate: article.pubDate,
+      })
       return
     }
     contentLoading.value = true
@@ -245,6 +252,12 @@ export const useRssStore = defineStore('rss', () => {
         rssSourceUrl: sourceUrl,
         rssLink: article.link,
         rssPubDate: article.pubDate,
+      })
+      recordRssRead({
+        title: article.title || 'RSS 文章',
+        sourceUrl,
+        link: article.link,
+        pubDate: article.pubDate,
       })
     } finally {
       contentLoading.value = false
