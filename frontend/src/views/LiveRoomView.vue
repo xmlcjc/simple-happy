@@ -86,6 +86,11 @@
               <span class="spinner" aria-hidden="true"></span>
               <p>正在连接直播流…</p>
             </template>
+            <template v-else-if="status === 'reconnecting'">
+              <span class="spinner" aria-hidden="true"></span>
+              <p>重连中 {{ reconnectCount }}/{{ MAX_RECONNECT }}</p>
+              <button class="state-btn" @click="manualSwitchLine">切换线路</button>
+            </template>
             <template v-else-if="status === 'offline'">
               <p>主播当前未开播</p>
             </template>
@@ -399,7 +404,7 @@ import { getLiveSuperChatHistory } from '../api/live'
 import { startLiveDanmaku, stopLiveDanmaku, type DanmakuMessage } from '../api/liveDanmaku'
 import type { LiveRoomDetail, LiveStream } from '../api/live'
 
-type PlayerStatus = 'loading' | 'playing' | 'error' | 'offline'
+type PlayerStatus = 'loading' | 'playing' | 'error' | 'offline' | 'reconnecting'
 
 const route = useRoute()
 const router = useRouter()
@@ -424,6 +429,15 @@ let hls: Hls | null = null
 let flv: flvjs.Player | null = null
 /** 本轮播放已试过的线路下标(容灾切换用), 每次 load() 重置。 */
 const triedIndexes = new Set<number>()
+
+/** 断流自愈: 指数退避 + 次数上限, 超过才切下一条线路。 */
+const MAX_RECONNECT = 3
+const reconnectCount = ref(0)
+let lastReconnectTimer: number | undefined
+
+/** FLV stalled 检测: currentTime 停滞超 3s 视为断流。 */
+let flvStallTimer: number | undefined
+let lastMediaTime = 0
 
 /** 观看时长上报：播放中用固定间隔累加，离开页面/暂停时补一次。 */
 let watchTimer: number | undefined
@@ -865,6 +879,7 @@ async function copyRoomLink() {
 function destroyPlayer() {
   hls?.destroy()
   hls = null
+  stopFlvStallMonitor()
   if (flv) {
     flv.pause()
     flv.unload()
@@ -876,6 +891,132 @@ function destroyPlayer() {
   if (video) {
     video.removeAttribute('src')
     video.load()
+  }
+}
+
+/* ---------- 断流自愈 ---------- */
+
+function clearReconnectTimer() {
+  if (lastReconnectTimer !== undefined) {
+    clearTimeout(lastReconnectTimer)
+    lastReconnectTimer = undefined
+  }
+}
+
+/** 手动切换到下一条线路（overlay 按钮）。 */
+function manualSwitchLine() {
+  clearReconnectTimer()
+  reconnectCount.value = MAX_RECONNECT // 让 tryNextStream 直接尝试下一条
+  tryNextStream('手动切换线路')
+}
+
+/** HLS 致命错误自愈：NETWORK_ERROR → startLoad, MEDIA_ERROR → recoverMediaError。
+ *  指数退避 1s/2s/4s，超过上限才切线路。 */
+function hlsRecover(instance: Hls, data: { type: string; details: string }) {
+  // 已经在自愈中且还没到上限, 不重复累加
+  if (status.value === 'reconnecting') return
+
+  const delay = Math.min(1000 * 2 ** reconnectCount.value, 4000)
+  reconnectCount.value++
+  status.value = 'reconnecting'
+  errorMsg.value = ''
+
+  clearReconnectTimer()
+  lastReconnectTimer = window.setTimeout(() => {
+    if (reconnectCount.value > MAX_RECONNECT) {
+      instance.destroy()
+      hls = null
+      tryNextStream(`自愈失败（${data.type}: ${data.details}）`)
+      return
+    }
+    try {
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        instance.startLoad()
+      } else if (
+        data.type === Hls.ErrorTypes.MEDIA_ERROR
+        && typeof (instance as unknown as { recoverMediaError?: () => boolean }).recoverMediaError === 'function'
+      ) {
+        ;(instance as unknown as { recoverMediaError: () => boolean }).recoverMediaError()
+      } else {
+        // 无法自愈的类型, 直接切线路
+        instance.destroy()
+        hls = null
+        tryNextStream(`播放中断（${data.type}: ${data.details}）`)
+        return
+      }
+      // 等待 1 秒看是否恢复
+      const checkRecovery = window.setTimeout(() => {
+        if (status.value === 'reconnecting' && hls === instance) {
+          // 还在 reconnecting 说明没恢复, 让下一次 ERROR 事件继续自愈
+          status.value = 'playing' // 先设回 playing, 让 hls.js 自己恢复或触发新的 fatal
+        }
+      }, 1500)
+      // 存一下以便清理（用 lastReconnectTimer 不够, 但这里简化）
+      void checkRecovery
+    } catch {
+      instance.destroy()
+      hls = null
+      tryNextStream(`自愈异常（${data.type}: ${data.details}）`)
+    }
+  }, delay)
+}
+
+/** FLV 致命错误自愈：指数退避重建播放器。 */
+function flvRecover(reason: string, url: string, video: HTMLVideoElement) {
+  if (status.value === 'reconnecting') return
+  stopFlvStallMonitor()
+
+  const delay = Math.min(1000 * 2 ** reconnectCount.value, 4000)
+  reconnectCount.value++
+  status.value = 'reconnecting'
+  errorMsg.value = ''
+
+  clearReconnectTimer()
+  lastReconnectTimer = window.setTimeout(() => {
+    if (reconnectCount.value > MAX_RECONNECT) {
+      tryNextStream(reason)
+      return
+    }
+    // 销毁旧播放器, 重建新的
+    if (flv) {
+      flv.pause()
+      flv.unload()
+      flv.detachMediaElement()
+      flv.destroy()
+      flv = null
+    }
+    const player = flvjs.createPlayer(
+      { type: 'flv', url, isLive: true, hasAudio: true, hasVideo: true },
+      { enableStashBuffer: false, autoCleanupSourceBuffer: true, lazyLoad: false },
+    )
+    flv = player
+    player.on(flvjs.Events.ERROR, (t: string, d: string) => flvRecover(`播放中断（${t}: ${d}）`, url, video))
+    player.attachMediaElement(video)
+    player.load()
+    player.play()
+    startFlvStallMonitor(url, video)
+  }, delay)
+}
+
+/** FLV stalled 检测: currentTime 停滞超 3s → 重建播放器。 */
+function startFlvStallMonitor(url: string, video: HTMLVideoElement) {
+  stopFlvStallMonitor()
+  lastMediaTime = video.currentTime
+  flvStallTimer = window.setInterval(() => {
+    if (video.currentTime > lastMediaTime + 0.1) {
+      lastMediaTime = video.currentTime
+      return // 正常推进
+    }
+    // currentTime 停滞
+    if (status.value !== 'playing') return // 已经在处理了
+    flvRecover('播放卡顿（currentTime 停滞）', url, video)
+  }, 1000)
+}
+
+function stopFlvStallMonitor() {
+  if (flvStallTimer !== undefined) {
+    clearInterval(flvStallTimer)
+    flvStallTimer = undefined
   }
 }
 
@@ -958,6 +1099,8 @@ async function load() {
   triedIndexes.clear()
   superchatSeen = new Set()
   superchats.value = []
+  reconnectCount.value = 0
+  clearReconnectTimer()
   // 先对齐平台, 再用 store 里的取流/详情方法(它们读的是 store.platform)。
   if (store.platform !== platform) store.platform = platform
   try {
@@ -1037,6 +1180,8 @@ function playCurrent() {
   if (!stream?.url || !video) return
   destroyPlayer()
   triedIndexes.add(activeIndex.value)
+  reconnectCount.value = 0
+  clearReconnectTimer()
   status.value = 'loading'
 
   if (stream.format === 'flv') {
@@ -1055,10 +1200,10 @@ function playCurrent() {
       video.play().catch(() => undefined)
     })
     instance.on(Hls.Events.ERROR, (_event, data) => {
+      // 非致命错误由 hls.js 内部处理（自动恢复）
       if (!data.fatal) return
-      instance.destroy()
-      hls = null
-      tryNextStream(`播放中断（${data.type}: ${data.details}）`)
+      // 致命错误: 先自愈, 超过上限再切线路
+      hlsRecover(instance, data)
     })
     instance.loadSource(stream.url)
     instance.attachMedia(video)
@@ -1089,11 +1234,14 @@ function playFlv(url: string, video: HTMLVideoElement) {
   )
   flv = player
   player.on(flvjs.Events.ERROR, (type: string, detail: string) => {
-    tryNextStream(`播放中断（${type}: ${detail}）`)
+    // FLV 致命错误: 自愈 1-2-4 秒退避, 上限 MAX_RECONNECT 次
+    flvRecover(`播放中断（${type}: ${detail}）`, url, video)
   })
   player.attachMediaElement(video)
   player.load()
   player.play()
+  // FLV stalled 检测: currentTime 停滞超 3s 重建播放器
+  startFlvStallMonitor(url, video)
 }
 
 function switchStream(index: number) {

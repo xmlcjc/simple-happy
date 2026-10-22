@@ -16,7 +16,7 @@ const router = createRouter({
     {
       path: '/recent',
       name: 'recent',
-      component: () => import('../views/RecentView.vue'),
+      redirect: '/?view=history',
     },
     {
       path: '/live',

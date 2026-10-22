@@ -37,21 +37,31 @@
         title="同时搜索全部已启用音源"
         @click="store.setSearchAll()"
       >全部 · {{ store.enabledPlugins.length }}</button>
+
+      <template v-for="plugin in displayedPlugins" :key="plugin.platform">
+        <button
+          type="button"
+          class="platform-chip"
+          :class="{
+            active: store.searchScope === 'platform' && store.activePlatform === plugin.platform,
+            failed: Boolean(store.platformErrors[plugin.platform]),
+          }"
+          :title="store.platformErrors[plugin.platform]
+            ? `${plugin.name}：${store.platformErrors[plugin.platform]}`
+            : plugin.name"
+          @click="store.setActivePlatform(plugin.platform)"
+        >
+          {{ plugin.name }}
+        </button>
+      </template>
+
       <button
-        v-for="plugin in store.enabledPlugins"
-        :key="plugin.platform"
+        v-if="store.enabledPlugins.length > MAX_COLLAPSED_SOURCES"
         type="button"
-        class="platform-chip"
-        :class="{
-          active: store.searchScope === 'platform' && store.activePlatform === plugin.platform,
-          failed: Boolean(store.platformErrors[plugin.platform]),
-        }"
-        :title="store.platformErrors[plugin.platform]
-          ? `${plugin.name}：${store.platformErrors[plugin.platform]}`
-          : plugin.name"
-        @click="store.setActivePlatform(plugin.platform)"
+        class="platform-chip more-chip"
+        @click="sourcesExpanded = !sourcesExpanded"
       >
-        {{ plugin.name }}
+        {{ sourcesExpanded ? '收起 ▴' : `更多 ▾` }}
       </button>
     </div>
 
@@ -140,7 +150,7 @@
       ></MusicCollectionList>
 
       <div v-if="store.hasMore" class="more-row">
-        <button type="button" class="state-btn" :disabled="store.searching" @click="store.loadMore()">
+        <button type="button" class="more-btn" :disabled="store.searching" @click="store.loadMore()">
           {{ store.searching ? '加载中…' : '加载更多' }}
         </button>
       </div>
@@ -181,6 +191,20 @@ const libraryStore = useMusicLibraryStore()
 const appStore = useAppStore()
 
 const warningsOpen = ref(false)
+const sourcesExpanded = ref(false)
+const MAX_COLLAPSED_SOURCES = 5
+
+const displayedPlugins = computed(() => {
+  const all = store.enabledPlugins
+  // 确保当前选中的音源始终可见
+  if (sourcesExpanded.value) return all
+  const collapsed = all.slice(0, MAX_COLLAPSED_SOURCES)
+  const active = store.enabledPlugins.find((p) => p.platform === store.activePlatform)
+  if (active && !collapsed.some((p) => p.platform === active.platform)) {
+    collapsed[collapsed.length - 1] = active
+  }
+  return collapsed
+})
 
 const failedCount = computed(() => Object.keys(store.platformErrors).length)
 
@@ -406,6 +430,17 @@ async function toggleFavorite(item: MusicItem) {
   color: var(--color-danger, #c0392b);
 }
 
+.platform-chip.more-chip {
+  background: transparent;
+  border-style: dashed;
+  color: var(--color-text-tertiary);
+}
+.platform-chip.more-chip:hover {
+  border-style: solid;
+  color: var(--color-primary);
+  border-color: var(--color-primary-border);
+}
+
 .source-warnings {
   display: flex;
   flex-direction: column;
@@ -471,8 +506,23 @@ async function toggleFavorite(item: MusicItem) {
 .more-row {
   display: flex;
   justify-content: center;
-  padding: var(--space-3) 0;
+  padding: var(--space-2) 0;
 }
+
+.more-btn {
+  padding: 5px 12px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border-light);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  transition: all var(--duration-fast);
+}
+.more-btn:hover:not(:disabled) {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
+}
+.more-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 
 .music-state {
   padding: 64px 20px;

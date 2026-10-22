@@ -23,6 +23,74 @@
     <ConfirmDialog />
     <ContextMenu />
 
+    <!-- 全局音乐播放器（单例）：任何页面都能看到。阅读页和直播全屏时隐藏。 -->
+    <MusicPlayerBar
+      v-if="current && route.name !== 'reader' && !isLiveFullscreen"
+      class="global-player-bar"
+      :current="current"
+      :playing="playing"
+      :loading="loading"
+      :current-time="currentTime"
+      :duration="duration"
+      :volume="volume"
+      :error-text="errorText"
+      :lyric-open="lyricOpen"
+      :play-mode="playerMode"
+      :playback-rate="playbackRate"
+      :queue-count="queue.length"
+      :queue-open="queueOpen"
+      :quality-label="qualityLabel"
+      :preferred-quality="preferredQuality"
+      :quality-order="qualityOrder"
+      :swapped-from="swappedFrom"
+      :sleep-mode="sleepMode"
+      :sleep-remaining="sleepRemaining"
+      @toggle="toggle"
+      @next="next"
+      @prev="prev"
+      @seek="seek"
+      @volume="setVolume"
+      @toggle-lyric="lyricOpen = !lyricOpen; if (lyricOpen) queueOpen = false"
+      @toggle-queue="queueOpen = !queueOpen; if (queueOpen) lyricOpen = false"
+      @cycle-mode="cycleMode"
+      @cycle-rate="cycleRate"
+      @set-quality="changeQuality"
+      @set-quality-order="setQualityOrder"
+      @set-sleep="player.setSleepCountdown"
+      @sleep-end="player.setSleepEndOfTrack"
+      @cancel-sleep="player.cancelSleep"
+    />
+
+    <!-- 全局歌词面板 -->
+    <MusicLyricPanel
+      v-if="lyricOpen && current && route.name !== 'reader' && !isLiveFullscreen"
+      class="global-lyric-panel"
+      :lines="lyricLines"
+      :current-index="lyricIndex"
+      :loading="lyricLoading"
+      :error="lyricError"
+      :offset-ms="settings.lyricOffsetMs"
+      :font-size-px="lyricFontPx"
+      :font-label="lyricFontLabel"
+      @close="lyricOpen = false"
+      @seek="seek"
+      @shift-offset="shiftLyricOffset"
+      @reset-offset="settings.setLyricOffsetMs(0)"
+      @cycle-font-size="cycleLyricFontSize"
+    />
+
+    <!-- 全局队列面板 -->
+    <MusicQueuePanel
+      v-if="queueOpen && route.name !== 'reader' && !isLiveFullscreen"
+      class="global-queue-panel"
+      :items="queue"
+      :current-index="queueIndex"
+      @close="queueOpen = false"
+      @jump="jumpTo"
+      @remove="removeAt"
+      @clear="clearQueue"
+    />
+
     <!-- Toast notifications -->
     <div class="toast-container">
       <TransitionGroup name="slide-up">
@@ -43,11 +111,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { listen } from '@tauri-apps/api/event'
 import { useAppStore } from './stores/app'
 import { useReaderStore } from './stores/reader'
+import { useMusicPlayer } from './composables/useMusicPlayer'
+import { useMusicLyric } from './composables/useMusicLyric'
+import { nextPlaybackRate, LYRIC_FONT_SIZE_OPTIONS, useMusicSettingsStore, type MusicQuality, type MusicQualityOrder } from './stores/musicSettings'
 import AppTopBar from './components/AppTopBar.vue'
 import SettingsDrawer from './components/SettingsDrawer.vue'
 import SourceManager from './components/SourceManager.vue'
@@ -55,12 +126,62 @@ import WebdavManager from './components/WebdavManager.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ContextMenu from './components/ContextMenu.vue'
 import TitleBar from './components/TitleBar.vue'
+import MusicPlayerBar from './components/music/MusicPlayerBar.vue'
+import MusicLyricPanel from './components/music/MusicLyricPanel.vue'
+import MusicQueuePanel from './components/music/MusicQueuePanel.vue'
 import { resolveWindowClose } from './utils/windowClose'
 import { resolveShellBackgroundImage } from './utils/readerColor'
 
 const route = useRoute()
 const appStore = useAppStore()
 const readerStore = useReaderStore()
+const player = useMusicPlayer()
+// 解构出 template 要用的响应式属性（Vue 自动 unwrap）
+const { current, playing, loading, currentTime, duration, volume, errorText, queue, index: queueIndex, effectiveQuality, swappedFrom, sleepMode, sleepRemaining, toggle, next, prev, seek, setVolume, reload, jumpTo, removeAt, clearQueue } = player
+const qualityLabel = computed(() => effectiveQuality.value || '')
+// 设置 store（播放器需要的几项）
+const settings = useMusicSettingsStore()
+const playerMode = computed(() => settings.playMode)
+const playbackRate = computed(() => settings.playbackRate)
+const preferredQuality = computed(() => settings.preferredQuality)
+const qualityOrder = computed(() => settings.qualityOrder)
+const cycleMode = () => settings.cyclePlayMode()
+const cycleRate = () => settings.setPlaybackRate(nextPlaybackRate(settings.playbackRate))
+const setQualityOrder = (order: MusicQualityOrder) => settings.setQualityOrder(order)
+
+// 歌词/队列全局面板状态
+const lyricOpen = ref(false)
+const queueOpen = ref(false)
+const { lines: lyricLines, currentIndex: lyricIndex, loading: lyricLoading, error: lyricError } = useMusicLyric(current, currentTime)
+
+const lyricFontOption = computed(
+  () => LYRIC_FONT_SIZE_OPTIONS.find((o) => o.value === settings.lyricFontSize) ?? LYRIC_FONT_SIZE_OPTIONS[1],
+)
+const lyricFontPx = computed(() => lyricFontOption.value.px)
+const lyricFontLabel = computed(() => lyricFontOption.value.label)
+
+function shiftLyricOffset(deltaMs: number) {
+  settings.setLyricOffsetMs(settings.lyricOffsetMs + deltaMs)
+}
+function cycleLyricFontSize() {
+  const idx = LYRIC_FONT_SIZE_OPTIONS.findIndex((o) => o.value === settings.lyricFontSize)
+  const next = LYRIC_FONT_SIZE_OPTIONS[(idx + 1) % LYRIC_FONT_SIZE_OPTIONS.length]
+  settings.setLyricFontSize(next.value)
+}
+function changeQuality(quality: MusicQuality) {
+  settings.setPreferredQuality(quality)
+  if (current.value) reload()
+}
+
+// 直播全屏检测
+const isLiveFullscreen = ref(false)
+onMounted(() => {
+  const check = () => { isLiveFullscreen.value = typeof document !== 'undefined' && document.body.classList.contains('live-fullscreen') }
+  check()
+  if (typeof MutationObserver !== 'undefined') {
+    new MutationObserver(check).observe(document.body, { attributes: true, attributeFilter: ['class'] })
+  }
+})
 
 const showHeader = computed(() => route.name !== 'reader')
 const titlebarSurface = computed<'settings' | 'reader-panel' | null>(() => {
@@ -127,6 +248,8 @@ let handlingCloseRequest = false
  *  "边界情况下路由离开钩子没跑完"的进度。两者都受 `resolveWindowClose` 的
  *  1.5s 上限约束, 不会把关窗拖成卡顿。 */
 async function persistBeforeClose() {
+  // 保存并清理播放器（先落库再清空，保证下次启动可恢复）。
+  player.shutdown()
   if (route.name === 'reader') {
     await readerStore.flushProgressToServerKeepalive(true)
     return
@@ -387,4 +510,34 @@ body.live-fullscreen .app-topbar {
 ) {
   top: var(--titlebar-height, 30px) !important;
 }
+
+/* 全局固定底部播放条 */
+.global-player-bar {
+  position: fixed;
+  bottom: 8px;
+  left: 12px;
+  right: 12px;
+  z-index: 99;
+  margin-top: 0 !important;
+  max-width: 1200px;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+
+/* 全局面板浮层 */
+.global-lyric-panel,
+.global-queue-panel {
+  position: fixed;
+  bottom: 80px;
+  right: 12px;
+  z-index: 98;
+  max-height: calc(100dvh - 120px);
+}
+
+/* Toast 高于播放条 */
+.toast-container {
+  z-index: 101;
+}
+
+/* 阅读页/直播全屏时播放条不占位（由 v-if 控制，无需额外 padding） */
 </style>

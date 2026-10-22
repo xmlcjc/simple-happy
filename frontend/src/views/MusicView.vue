@@ -67,32 +67,6 @@
           <p>{{ activeTitle }}功能即将上线</p>
         </div>
 
-        <MusicLyricPanel
-          v-if="lyricOpen && current"
-          :lines="lyricLines"
-          :current-index="lyricIndex"
-          :loading="lyricLoading"
-          :error="lyricError"
-          :offset-ms="settings.lyricOffsetMs"
-          :font-size-px="lyricFontPx"
-          :font-label="lyricFontLabel"
-          @close="lyricOpen = false"
-          @seek="seek"
-          @shift-offset="shiftLyricOffset"
-          @reset-offset="settings.setLyricOffsetMs(0)"
-          @cycle-font-size="cycleLyricFontSize"
-        />
-
-        <MusicQueuePanel
-          v-if="queueOpen"
-          :items="playerQueue"
-          :current-index="queueIndex"
-          @close="queueOpen = false"
-          @jump="jumpTo"
-          @remove="removeAt"
-          @clear="clearQueue"
-        />
-
         <MusicDetailPanel
           v-if="detail"
           :platform="detail.item.platform"
@@ -106,53 +80,17 @@
         />
       </div>
 
-      <MusicPlayerBar
-        :current="current"
-        :playing="playing"
-        :loading="playerLoading"
-        :current-time="currentTime"
-        :duration="duration"
-        :volume="volume"
-        :error-text="playerError"
-        :lyric-open="lyricOpen"
-        :play-mode="settings.playMode"
-        :playback-rate="settings.playbackRate"
-        :queue-count="playerQueue.length"
-        :queue-open="queueOpen"
-        :quality-label="qualityLabel"
-        :preferred-quality="settings.preferredQuality"
-        :quality-order="settings.qualityOrder"
-        :swapped-from="swappedFrom"
-        :sleep-mode="sleepMode"
-        :sleep-remaining="sleepRemaining"
-        @toggle="toggle"
-        @next="next"
-        @prev="prev"
-        @seek="seek"
-        @volume="setVolume"
-        @toggle-lyric="toggleLyric"
-        @toggle-queue="toggleQueue"
-        @cycle-mode="settings.cyclePlayMode()"
-        @cycle-rate="settings.setPlaybackRate(nextPlaybackRate(settings.playbackRate))"
-        @set-quality="changeQuality"
-        @set-quality-order="settings.setQualityOrder"
-        @set-sleep="setSleepCountdown"
-        @sleep-end="setSleepEndOfTrack"
-        @cancel-sleep="cancelSleep"
-      />
-
       <MusicPlaylistPicker v-model="pickerOpen" :items="pickerItems" />
     </section>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { listen } from '@tauri-apps/api/event'
 import { useMusicStore } from '../stores/music'
 import { useMusicLibraryStore } from '../stores/musicLibrary'
-import { nextPlaybackRate, MUSIC_QUALITY_OPTIONS, LYRIC_FONT_SIZE_OPTIONS, useMusicSettingsStore, type MusicQuality } from '../stores/musicSettings'
 import { useMusicPlayer } from '../composables/useMusicPlayer'
-import { useMusicLyric } from '../composables/useMusicLyric'
 import MusicSearchPane from '../components/music/MusicSearchPane.vue'
 import MusicDiscoverPane from '../components/music/MusicDiscoverPane.vue'
 import MusicFavoritesPane from '../components/music/MusicFavoritesPane.vue'
@@ -160,9 +98,6 @@ import MusicPlaylistsPane from '../components/music/MusicPlaylistsPane.vue'
 import MusicHistoryPane from '../components/music/MusicHistoryPane.vue'
 import MusicLocalPane from '../components/music/MusicLocalPane.vue'
 import MusicPluginPane from '../components/music/MusicPluginPane.vue'
-import MusicPlayerBar from '../components/music/MusicPlayerBar.vue'
-import MusicLyricPanel from '../components/music/MusicLyricPanel.vue'
-import MusicQueuePanel from '../components/music/MusicQueuePanel.vue'
 import MusicDetailPanel from '../components/music/MusicDetailPanel.vue'
 import MusicPlaylistPicker from '../components/music/MusicPlaylistPicker.vue'
 import type {
@@ -175,50 +110,12 @@ type MusicTab = 'search' | 'discover' | 'favorites' | 'playlists' | 'local' | 'h
 
 const store = useMusicStore()
 const libraryStore = useMusicLibraryStore()
-const settings = useMusicSettingsStore()
 const activeTab = ref<MusicTab>('search')
-const lyricOpen = ref(false)
-const queueOpen = ref(false)
 const pickerOpen = ref(false)
 const pickerItems = ref<MusicItem[]>([])
 const detail = ref<{ item: MusicCollectionItem; kind: MusicCollectionKind } | null>(null)
 
-const {
-  current,
-  playing,
-  loading: playerLoading,
-  currentTime,
-  duration,
-  volume,
-  errorText: playerError,
-  effectiveQuality,
-  swappedFrom,
-  sleepMode,
-  sleepRemaining,
-  queue: playerQueue,
-  playQueue,
-  index: queueIndex,
-  playNext,
-  jumpTo,
-  removeAt,
-  clearQueue,
-  reload,
-  setSleepCountdown,
-  setSleepEndOfTrack,
-  cancelSleep,
-  toggle,
-  next,
-  prev,
-  seek,
-  setVolume,
-} = useMusicPlayer()
-
-const {
-  lines: lyricLines,
-  currentIndex: lyricIndex,
-  loading: lyricLoading,
-  error: lyricError,
-} = useMusicLyric(current, currentTime)
+const { playQueue, playNext } = useMusicPlayer()
 
 const tabs: Array<{ key: MusicTab; label: string; paths: string[] }> = [
   {
@@ -264,32 +161,6 @@ const tabs: Array<{ key: MusicTab; label: string; paths: string[] }> = [
 
 const activeTitle = computed(() => tabs.find((tab) => tab.key === activeTab.value)?.label || '音乐')
 
-/** 播放条显示的实际音质：插件可能返回 320k 这类自定义值，不在选项里就原样显示。 */
-const qualityLabel = computed(() => {
-  const value = effectiveQuality.value || settings.preferredQuality
-  return MUSIC_QUALITY_OPTIONS.find((option) => option.value === value)?.label || value
-})
-
-const lyricFontOption = computed(
-  () =>
-    LYRIC_FONT_SIZE_OPTIONS.find((option) => option.value === settings.lyricFontSize)
-    ?? LYRIC_FONT_SIZE_OPTIONS[1],
-)
-const lyricFontPx = computed(() => lyricFontOption.value.px)
-const lyricFontLabel = computed(() => lyricFontOption.value.label)
-
-function shiftLyricOffset(deltaMs: number) {
-  settings.setLyricOffsetMs(settings.lyricOffsetMs + deltaMs)
-}
-
-function cycleLyricFontSize() {
-  const index = LYRIC_FONT_SIZE_OPTIONS.findIndex(
-    (option) => option.value === settings.lyricFontSize,
-  )
-  const next = LYRIC_FONT_SIZE_OPTIONS[(index + 1) % LYRIC_FONT_SIZE_OPTIONS.length]
-  settings.setLyricFontSize(next.value)
-}
-
 function handlePlay(item: MusicItem, queue?: MusicItem[]) {
   // 优先使用来源面板给出的列表; 搜索结果作为默认队列。
   const list = queue && queue.length ? queue : store.results
@@ -311,22 +182,9 @@ function openPickerForItems(items: MusicItem[]) {
   pickerOpen.value = true
 }
 
-// 歌词与队列共用右侧浮层，同时只开一个。
-function toggleLyric() {
-  lyricOpen.value = !lyricOpen.value
-  if (lyricOpen.value) queueOpen.value = false
-}
-
-function toggleQueue() {
-  queueOpen.value = !queueOpen.value
-  if (queueOpen.value) lyricOpen.value = false
-}
-
 /** 打开专辑/歌手/歌单详情，覆盖内容区。 */
 function openCollection(item: MusicCollectionItem, kind: MusicCollectionKind) {
   detail.value = { item, kind }
-  lyricOpen.value = false
-  queueOpen.value = false
 }
 
 /** 切 tab 时收起详情，避免详情页浮在别的分类上。 */
@@ -335,15 +193,23 @@ function selectTab(key: MusicTab) {
   detail.value = null
 }
 
-/** 切音质：记住偏好并立刻用新音质重新取流。 */
-function changeQuality(quality: MusicQuality) {
-  settings.setPreferredQuality(quality)
-  if (current.value) reload()
-}
+/** 首次启动时内置音源在后台装，装完由后端发事件，这里重新拉一次列表。 */
+let unlistenBuiltinInstalled: (() => void) | undefined
 
 onMounted(() => {
   void store.loadPlugins()
   void libraryStore.loadFavorites().catch(() => undefined)
+  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
+    void listen('builtin-music-plugins-installed', () => {
+      void store.loadPlugins()
+    }).then((unlisten) => {
+      unlistenBuiltinInstalled = unlisten
+    })
+  }
+})
+
+onBeforeUnmount(() => {
+  unlistenBuiltinInstalled?.()
 })
 </script>
 
