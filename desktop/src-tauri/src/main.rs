@@ -181,6 +181,108 @@ fn install_seed_database(app: &App, db: &std::path::Path) {
     }
 }
 
+/// 首次启动时安装随包分发的内置音乐音源。
+///
+/// 与书源种子一致：只在用户从未装过内置音源时执行一次，用标记文件记忆结果。
+/// 安装本身放到后台任务里跑 —— 60 多个插件里有 600KB 以上的混淆产物，逐个在
+/// 主线程解析会让首屏白屏数分钟；窗口先显示，装完再发事件通知前端刷新列表。
+fn install_builtin_music_plugins(
+    app: &App,
+    music_service: std::sync::Arc<reader_rust::service::music::MusicService>,
+    storage_dir: String,
+) {
+    const BUNDLED_VERSION: &str = "1";
+    let marker = std::path::Path::new(&storage_dir)
+        .join("music-plugins")
+        .join(format!(".builtin-music-plugins-v{BUNDLED_VERSION}"));
+    if marker.exists() {
+        return;
+    }
+
+    let Some(source_dir) = builtin_plugin_dir(app) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&source_dir) else {
+        return;
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("js"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return;
+    }
+
+    // 每个插件解析都要建一个 quickjs 运行时，串行装 60 多个要几分钟；
+    // 切成 4 份并行，SQLite 连接池与插件写入互不冲突。
+    let mut chunks: Vec<Vec<std::path::PathBuf>> = (0..4).map(|_| Vec::new()).collect();
+    for (index, path) in files.into_iter().enumerate() {
+        chunks[index % 4].push(path);
+    }
+
+    let handles: Vec<tauri::async_runtime::JoinHandle<usize>> = chunks
+        .into_iter()
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            let service = music_service.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut installed = 0usize;
+                for path in chunk {
+                    let Ok(source) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let file_name = path.file_name().and_then(|name| name.to_str());
+                    match service.install_plugin(&source, file_name).await {
+                        Ok(_) => installed += 1,
+                        Err(err) => {
+                            eprintln!(
+                                "内置音源 {} 安装失败: {err}",
+                                file_name.unwrap_or("unknown")
+                            );
+                        }
+                    }
+                }
+                installed
+            })
+        })
+        .collect();
+
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let mut installed = 0usize;
+        for task in handles {
+            match task.await {
+                Ok(count) => installed += count,
+                Err(err) => eprintln!("内置音源安装任务异常结束: {err}"),
+            }
+        }
+        eprintln!("内置音源安装完成: 成功 {installed}");
+        if let Err(err) = std::fs::write(&marker, format!("{installed}\n")) {
+            eprintln!("写入内置音源标记失败: {err}");
+        }
+        // 前端首次进入音乐页时可能还在安装，装完通知它重新拉一次插件列表。
+        let _ = handle.emit("builtin-music-plugins-installed", installed);
+    });
+}
+
+/// 内置音源目录：debug 构建优先读源码目录，避免命中 `target/debug` 里的旧副本。
+fn builtin_plugin_dir(app: &App) -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("builtin-music-plugins");
+        if dev.is_dir() {
+            return Some(dev);
+        }
+    }
+    app.path()
+        .resource_dir()
+        .ok()
+        .map(|dir| dir.join("builtin-music-plugins"))
+        .filter(|dir| dir.is_dir())
+}
+
 fn start(app: &mut App) -> anyhow::Result<()> {
     let paths = portable::resolve()?;
 
@@ -207,6 +309,8 @@ fn start(app: &mut App) -> anyhow::Result<()> {
     bootstrap::init_tracing(&cfg.log_level);
 
     let state = tauri::async_runtime::block_on(bootstrap::build_state(&cfg))?;
+    // 内置音源在后台安装（不阻塞首屏），装完用事件通知前端刷新插件列表。
+    install_builtin_music_plugins(app, state.music_service.clone(), cfg.storage_dir.clone());
     app.manage(state);
 
     // Load the embedded frontend assets in both debug and release. The old
