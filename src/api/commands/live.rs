@@ -1,7 +1,8 @@
 use crate::api::AppState;
 use crate::error::error::{ApiResponse, AppError};
 use crate::service::live::models::{
-    LiveCategoryGroup, LivePlatform, LiveRoomDetail, LiveRoomSummary, LiveStreamInfo, LiveSuperChat,
+    LiveCategoryGroup, LivePlatform, LiveQrCode, LiveQrCodeStatus, LiveRoomDetail, LiveRoomSummary,
+    LiveStreamInfo, LiveSuperChat,
 };
 use crate::service::live::danmaku::{self, DanmakuMessage};
 use crate::service::live::follow::LiveFollow;
@@ -79,9 +80,33 @@ pub async fn live_stream_urls(
     state: tauri::State<'_, AppState>,
     platform: String,
     room_id: String,
+    cookie: Option<String>,
+    qn: Option<i64>,
 ) -> Result<ApiResponse<LiveStreamInfo>, AppError> {
     Ok(ApiResponse::ok(
-        state.live_service.stream_urls(&platform, &room_id).await?,
+        state
+            .live_service
+            .stream_urls(&platform, &room_id, cookie.as_deref(), qn)
+            .await?,
+    ))
+}
+
+/// B 站扫码登录：生成二维码内容（前端渲染成图片）。
+#[tauri::command]
+pub async fn live_bilibili_qrcode(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<LiveQrCode>, AppError> {
+    Ok(ApiResponse::ok(state.live_service.bilibili_qrcode().await?))
+}
+
+/// B 站扫码登录：轮询扫码状态，成功后返回可直接使用的登录 Cookie。
+#[tauri::command]
+pub async fn live_bilibili_qrcode_poll(
+    state: tauri::State<'_, AppState>,
+    qrcode_key: String,
+) -> Result<ApiResponse<LiveQrCodeStatus>, AppError> {
+    Ok(ApiResponse::ok(
+        state.live_service.bilibili_qrcode_poll(&qrcode_key).await?,
     ))
 }
 

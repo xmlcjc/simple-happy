@@ -12,7 +12,7 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 项目源自 [Legado（阅读）](https://github.com/Rimchars/legado) 的桌面移植线 [reader](https://github.com/hectorqin/reader) 与 [reader-rust](https://github.com/givenge/reader-rust)，并在此基础上扩展了四平台直播、MusicFree 音乐插件宿主等模块。详见 [NOTICE.md](NOTICE.md)。
 
 > [!IMPORTANT]
-> Simple Happy 不内置任何书籍、直播源、音乐或 RSS 内容。用户需自行导入拥有合法使用权的书源、MusicFree 插件、RSS 订阅与本地文件。
+> Simple Happy 不内置任何书籍、音视频内容或 RSS 文章。安装包随附的**书源规则**（1373 条）、**MusicFree 音源插件**（28 个）与 **RSS 订阅源**（15 条）只是「来源配置模板」，用来说明去哪里取数据，本身不包含任何版权内容；用户可在应用内随时删除或替换。请确保你访问的内容已获得合法授权。
 
 ---
 
@@ -20,10 +20,10 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 
 | 模块 | 能力 |
 |------|------|
-| 📚 **书架** | Legado 书源 + 本地 TXT/EPUB/PDF、书源导入/编辑/测试、多源搜索、章节缓存、主题/排版、WebDAV 同步 |
-| 🎬 **直播** | B 站 / 虎牙 / 斗鱼 / 抖音 四平台、分区列表/搜索/房间详情、WebView2 + hls.js / flv.js 播放、实时弹幕 + 飘屏弹幕层、多线路容灾自动切换、弹幕关键词/正则屏蔽、醒目留言横幅、观看历史、直播间链接解析跳转、关注列表定时自动刷新、开播时长显示 |
-| 🎵 **音乐** | MusicFree CJS 插件宿主（每插件独立 OS 线程 + rquickjs）、插件本地批量安装/网络直链安装/`.json` 订阅清单一键更新、插件排序与说明、单曲/专辑/歌手/歌单搜索、榜单与推荐歌单发现页、播放模式/倍速/播放队列/音质降级换源/定时关闭、歌词同步（偏移/字号可调）、收藏/歌单/播放历史、链接导入、插件用户变量与在线更新、512MB LRU 音乐缓存、本地 mp3/flac/m4a 导入（lofty 元数据） |
-| 📰 **RSS** | Feed 导入与订阅、文章阅读、与书架最近阅读记录统一时间线 |
+| 📚 **书架** | Legado 书源 + 本地 TXT/EPUB/PDF、书源导入/编辑/测试、多源搜索、章节缓存、主题/排版、WebDAV 同步；左侧栏一键切换「书架 / 历史」视图，历史页含阅读统计卡片与搜索 |
+| 🎬 **直播** | B 站 / 虎牙 / 斗鱼 / 抖音 四平台、分区列表/搜索/房间详情、WebView2 + hls.js / flv.js 播放、实时弹幕 + 飘屏弹幕层、多线路容灾自动切换、**断流自愈（指数退避重连 + 同画质线路切换 + FLV 卡顿重建）**、**B 站扫码登录 + 原画/蓝光等登录清晰度**、**虎牙蓝光8M/4M 多档清晰度**、弹幕关键词/正则屏蔽、醒目留言横幅、观看历史、直播间链接解析跳转、关注列表定时自动刷新、开播时长显示 |
+| 🎵 **音乐** | MusicFree CJS 插件宿主（每插件独立 OS 线程 + rquickjs）、**随包内置 28 个音源插件（与桌面版选中的音源一致，首启自动安装，覆盖 QQ/网易云/酷狗/酷我/咪咕/汽水/B站/番茄等）**、插件本地批量安装/网络直链安装/`.json` 订阅清单一键更新、插件排序与说明、单曲/专辑/歌手/歌单搜索、榜单与推荐歌单发现页、**全局播放条（跨页面常驻 + 退出后恢复队列与进度）**、播放模式/倍速/播放队列/音质降级换源/定时关闭、歌词同步（偏移/字号可调）、收藏/歌单/播放历史、链接导入、插件用户变量与在线更新、512MB LRU 音乐缓存、本地 mp3/flac/m4a 导入（lofty 元数据）、**B 站多 P 合集自动展开成完整歌单队列** |
+| 📰 **RSS** | Feed 导入与订阅、文章阅读、与书架最近阅读记录统一时间线、**内置 15 条主流订阅源（少数派 / 阮一峰 / V2EX / IT之家 / cnBeta / 机核 / BBC 中文 / 纽约时报中文网 / The Verge 等，均实测可用）** |
 | 🛠️ **工具** | 备份/恢复（兼容 Legado ZIP + JSON）、净化规则、替换规则、桌面背景、全局老板键、窗口状态持久化 |
 
 ### 书架界面
@@ -40,10 +40,10 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 ## 🚀 快速开始
 
 1. 前往 [GitHub Releases](https://github.com/xmlcjc/simple-happy/releases) 下载当前系统对应的安装包或便携包。
-2. **便携包**首次启动即带有内置书源种子（仅用于快速体验）；**安装包**首次启动若数据目录为空，会自动复制随包分发的种子数据库。
-3. 进入「书架 → 书源」查看/管理已导入的书源；在「音乐 → 插件」处导入自己的 MusicFree 插件（如 `xxeMusic.js` 等）。
-4. 直播模块无需额外配置，打开顶部「直播」tab 即可浏览 B 站 / 虎牙 / 斗鱼 / 抖音的分区。
-5. RSS 订阅在「主页 → RSS 源」中导入。
+2. **安装包 / 便携包**首次启动都会自动准备数据：书库为空时复制随包分发的种子数据库（**1373 条书源 + 15 条 RSS 订阅源**），并安装随包的 **28 个 MusicFree 音源插件**（只装一次，之后不再覆盖你手动更新过的插件）。
+3. 进入「书架 → 书源」查看/管理已导入的书源；「音乐 → 搜索」可直接选平台搜索，也可在「音乐 → 插件」自行增删/更新音源。
+4. 直播模块无需额外配置，打开顶部「直播」tab 即可浏览 B 站 / 虎牙 / 斗鱼 / 抖音的分区；B 站可在「设置 → 直播」扫码登录解锁更高清晰度。
+5. RSS 订阅在「主页 → RSS 源」中查看，已内置少数派、IT之家、BBC 中文等 15 条可用的主流订阅源。
 
 ---
 
@@ -69,8 +69,9 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 | `src/service/` | 书架、直播（四平台适配 + 弹幕）、音乐（插件宿主 + 曲库）、RSS、听书等业务逻辑 |
 | `src/parser/` | CSS / JSONPath / XPath / 正则 / JavaScript 五合一解析引擎 |
 | `src/crawler/` | HTTP 客户端、请求头规则、Cookie 存储 |
-| `src/storage/` | SQLite + sqlx 嵌入迁移（0001~0011）、文件缓存、数据目录 |
+| `src/storage/` | SQLite + sqlx 嵌入迁移（0001~0014）、文件缓存、数据目录 |
 | `desktop/src-tauri/` | Tauri 入口、托盘、单实例、NSIS 安装脚本、平台适配 |
+| `desktop/src-tauri/builtin-music-plugins/` | 随包分发的 28 个 MusicFree 音源插件（与桌面版选中的音源一致），首启自动安装到 `${storage}/music-plugins` |
 | `scripts/` | 桌面端构建脚本 |
 | `vendor/` | 本地补丁过的第三方依赖（`pdf-extract` 补 GBK CMap、`tao` 修 Windows 全屏黑边） |
 | `seed/` | 便携包使用的书源/RSS 种子数据库（不入库，仅 Release 打包时注入） |
@@ -106,15 +107,16 @@ $env:CARGO_BUILD_JOBS = "4"  # 避免杀毒软件并行 race
 
 产物位于 `desktop/dist/`：
 - `<productName>_<ver>_x64-setup.exe` —— NSIS 安装包
-- `simple-happy-portable-v<ver>-win-x64.zip` —— 便携包（含种子数据库）
+- `simple-happy-portable-v<ver>-win-x64.zip` —— 便携包（含种子数据库与内置音源目录）
 
 ### 测试
 
 ```bash
-cargo test -j 4                   # Rust 库 400+ 单测
+cargo test -j 4                   # Rust 库 470+ 单测
 cargo test -p reader-desktop      # 桌面端便携目录逻辑
 cargo test --test music_plugin    # 音乐插件宿主集成测试（axum mock upstream）
-cd frontend && npm test           # 前端 600+ vitest 用例
+cargo test --test builtin_music_plugins_smoke -- --ignored   # 内置音源真实可用性巡检（需外网）
+cd frontend && npm test           # 前端 660+ vitest 用例
 ```
 
 ---
@@ -135,7 +137,7 @@ Simple Happy 基于若干 MIT / Apache-2.0 / BSD / ISC 许可的开源项目构�
 ## 🔒 隐私与合规
 
 - **纯单机**：没有账号系统、没有服务端、没有遥测。书架、阅读进度、书源配置、音乐收藏全部保存在本机 SQLite + 文件目录。
-- **用户即来源**：书源、音乐插件、RSS 订阅均由用户自行配置和导入；应用不内置、不推荐、不维护任何第三方来源。
+- **用户即来源**：书源、音乐插件、RSS 订阅均由用户自行配置。安装包随附的书源规则与 MusicFree 插件只是「去哪儿取数据」的配置，不含任何书籍、音频或视频文件，且可在应用内一键删除。
 - **网络直连**：书源搜索、直播流、音乐源、RSS 都是桌面端直接请求对应来源，走用户自己的系统代理。
 - **合规提醒**：请确保自行导入的书源、音乐插件、RSS、本地文件以及通过本应用访问的内容**均已获得合法授权**，版权与合规责任由用户自行承担。如任何权利人认为本项目相关内容侵犯了其合法权益，请通过 Issues 联系维护者。
 

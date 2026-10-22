@@ -90,7 +90,10 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { useMusicStore } from '../stores/music'
 import { useMusicLibraryStore } from '../stores/musicLibrary'
+import { useAppStore } from '../stores/app'
 import { useMusicPlayer } from '../composables/useMusicPlayer'
+import { getMusicCollectionDetail } from '../api/music'
+import { needsPartExpansion } from '../utils/musicCollection'
 import MusicSearchPane from '../components/music/MusicSearchPane.vue'
 import MusicDiscoverPane from '../components/music/MusicDiscoverPane.vue'
 import MusicFavoritesPane from '../components/music/MusicFavoritesPane.vue'
@@ -110,6 +113,7 @@ type MusicTab = 'search' | 'discover' | 'favorites' | 'playlists' | 'local' | 'h
 
 const store = useMusicStore()
 const libraryStore = useMusicLibraryStore()
+const appStore = useAppStore()
 const activeTab = ref<MusicTab>('search')
 const pickerOpen = ref(false)
 const pickerItems = ref<MusicItem[]>([])
@@ -162,12 +166,58 @@ const tabs: Array<{ key: MusicTab; label: string; paths: string[] }> = [
 const activeTitle = computed(() => tabs.find((tab) => tab.key === activeTab.value)?.label || '音乐')
 
 function handlePlay(item: MusicItem, queue?: MusicItem[]) {
+  void playItem(item, queue)
+}
+
+/**
+ * B 站把整张歌单放进一个视频（分P）时，搜索/历史里只有一条记录，直接播放
+ * 只能听到第一P。播放前先取一次分P列表，多于一首就把整个歌单作为队列。
+ */
+async function playItem(item: MusicItem, queue?: MusicItem[]) {
+  if (needsPartExpansion(item)) {
+    const expanded = await expandParts(item)
+    if (expanded) return
+  }
   // 优先使用来源面板给出的列表; 搜索结果作为默认队列。
   const list = queue && queue.length ? queue : store.results
   const start = list.findIndex(
     (entry) => entry.platform === item.platform && entry.id === item.id,
   )
-  void playQueue(start < 0 ? [item] : list, start < 0 ? 0 : start)
+  await playQueue(start < 0 ? [item] : list, start < 0 ? 0 : start)
+}
+
+/** 展开分P队列；单P视频或取列表失败时返回 false，交回普通播放。 */
+async function expandParts(item: MusicItem): Promise<boolean> {
+  const bvid = String(item.bvid)
+  try {
+    const detail = await getMusicCollectionDetail({
+      platform: item.platform,
+      kind: 'album',
+      item: {
+        platform: item.platform,
+        id: bvid,
+        bvid,
+        aid: item.aid,
+        title: item.title,
+        artist: item.artist,
+        artwork: item.artwork,
+      },
+      page: 1,
+      workType: 'music',
+    })
+    if (detail.items.length <= 1) return false
+    // 分P接口给的封面是 http，桌面端是安全上下文，换成 https 才能正常显示。
+    const items = detail.items.map((entry) =>
+      typeof entry.artwork === 'string' && entry.artwork.startsWith('http://')
+        ? { ...entry, artwork: entry.artwork.replace('http://', 'https://') }
+        : entry,
+    )
+    appStore.showToast(`已展开合集，共 ${items.length} 首`, 'success')
+    await playQueue(items, 0)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function openPicker(item: MusicItem) {

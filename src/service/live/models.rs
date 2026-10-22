@@ -83,6 +83,41 @@ pub struct LiveStreamInfo {
     pub room_id: String,
     pub is_live: bool,
     pub streams: Vec<LiveStream>,
+    /// 平台认可的全部清晰度(按从高到低排列)。
+    ///
+    /// B 站要单独取一次 `accept_qn` 才能拿到完整列表, 且列表随登录状态变化;
+    /// 其它平台按实际返回的线路归并, 这里留空由前端回退。
+    #[serde(default)]
+    pub qualities: Vec<LiveQuality>,
+}
+
+/// 一个可选清晰度。`qn` 是平台内部的清晰度编号, 取流时原样回传。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveQuality {
+    pub qn: i64,
+    pub name: String,
+}
+
+/// B 站扫码登录的二维码内容与轮询 key。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveQrCode {
+    /// 二维码里编码的登录地址, 前端渲染成图片。
+    pub url: String,
+    pub qrcode_key: String,
+}
+
+/// 扫码轮询结果。`status`: pending / scanned / expired / success。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveQrCodeStatus {
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+    /// 仅 `success` 时有值: 可直接写入直播设置的 Cookie。
+    #[serde(default)]
+    pub cookie: String,
 }
 
 /// 一条 SuperChat(醒目留言), 由弹幕实时推送 + 进房时拉取历史合并。

@@ -524,16 +524,6 @@ body.live-fullscreen .app-topbar {
   margin-right: auto !important;
 }
 
-/* 全局面板浮层 */
-.global-lyric-panel,
-.global-queue-panel {
-  position: fixed;
-  bottom: 80px;
-  right: 12px;
-  z-index: 98;
-  max-height: calc(100dvh - 120px);
-}
-
 /* Toast 高于播放条 */
 .toast-container {
   z-index: 101;

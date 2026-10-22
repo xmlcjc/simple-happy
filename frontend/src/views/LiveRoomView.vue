@@ -154,15 +154,18 @@
           <div v-if="qualitySheetOpen" class="quality-sheet" @click.stop>
             <div class="quality-sheet-head">清晰度</div>
             <button
-              v-for="group in qualityGroups"
-              :key="group.quality"
+              v-for="option in qualityOptions"
+              :key="option.quality"
               class="quality-item"
-              :class="{ active: activeQuality === group.quality }"
-              @click="chooseQuality(group.index)"
+              :class="{ active: activeQuality === option.quality }"
+              @click="selectQuality(option)"
             >
-              <span>{{ group.quality }}</span>
-              <span v-if="activeQuality === group.quality" class="quality-check">✓</span>
+              <span>{{ option.quality }}</span>
+              <span v-if="activeQuality === option.quality" class="quality-check">✓</span>
             </button>
+            <p v-if="showLoginQualityHint" class="quality-hint">
+              未登录最高只有「超清」，可在 设置 → 直播 填写 B 站 Cookie 解锁原画 / 蓝光。
+            </p>
           </div>
         </div>
 
@@ -360,13 +363,13 @@
               <h3>画质 / 线路</h3>
               <div class="setting-options">
                 <button
-                  v-for="group in qualityGroups"
-                  :key="group.quality"
+                  v-for="option in qualityOptions"
+                  :key="option.quality"
                   class="setting-chip"
-                  :class="{ active: activeQuality === group.quality }"
-                  @click="switchStream(group.index)"
+                  :class="{ active: activeQuality === option.quality }"
+                  @click="selectQuality(option)"
                 >
-                  {{ group.quality }}
+                  {{ option.quality }}
                 </button>
               </div>
             </section>
@@ -402,7 +405,7 @@ import { addLiveStats } from '../api/liveStats'
 import { addLiveHistory } from '../api/liveHistory'
 import { getLiveSuperChatHistory } from '../api/live'
 import { startLiveDanmaku, stopLiveDanmaku, type DanmakuMessage } from '../api/liveDanmaku'
-import type { LiveRoomDetail, LiveStream } from '../api/live'
+import type { LiveQuality, LiveRoomDetail, LiveStream } from '../api/live'
 
 type PlayerStatus = 'loading' | 'playing' | 'error' | 'offline' | 'reconnecting'
 
@@ -420,6 +423,8 @@ let unlistenWindowResize: (() => void) | undefined
 const videoRef = ref<HTMLVideoElement | null>(null)
 const detail = ref<LiveRoomDetail | null>(null)
 const streams = ref<LiveStream[]>([])
+/** 平台认可的全部清晰度(B 站登录后档位更多); 其它平台为空, 回退到按实际线路归并。 */
+const qualities = ref<LiveQuality[]>([])
 const activeIndex = ref(0)
 const status = ref<PlayerStatus>('loading')
 const errorMsg = ref('')
@@ -675,8 +680,17 @@ function updateDanmakuLanes() {
 
 const currentQuality = computed(() => streams.value[activeIndex.value]?.quality || '默认')
 
-/** 画质分组: 后端同档位可能返回多条 CDN 线路, 列表只显示一项(容灾时自动换线路)。 */
-const qualityGroups = computed(() => {
+type QualityOption = { quality: string; qn?: number; index?: number }
+
+/**
+ * 清晰度列表:
+ * - B 站用接口下发的 `accept_qn`(登录后档位更多), 选中后按 qn 重新取流;
+ * - 其它平台的 streams 本身覆盖全部档位, 按画质归并(容灾时自动换同档线路)。
+ */
+const qualityOptions = computed<QualityOption[]>(() => {
+  if (qualities.value.length) {
+    return qualities.value.map((item) => ({ quality: item.name, qn: item.qn }))
+  }
   const seen = new Map<string, number>()
   streams.value.forEach((stream, index) => {
     if (!seen.has(stream.quality)) seen.set(stream.quality, index)
@@ -684,7 +698,17 @@ const qualityGroups = computed(() => {
   return [...seen.entries()].map(([quality, index]) => ({ quality, index }))
 })
 
+/** 只有 B 站需要登录 Cookie; 其它平台忽略。 */
+const bilibiliCookie = computed(() =>
+  platform === 'bilibili' ? liveSettings.bilibiliCookie.trim() : '',
+)
+
 const activeQuality = computed(() => streams.value[activeIndex.value]?.quality || '')
+
+/** 未登录时接口只给超清: 弹窗里提示去设置里填 Cookie。 */
+const showLoginQualityHint = computed(
+  () => platform === 'bilibili' && !bilibiliCookie.value && qualities.value.length > 0,
+)
 
 const watchedText = computed(() => {
   const total = watchedSeconds.value
@@ -1106,7 +1130,7 @@ async function load() {
   try {
     const [roomDetail, streamInfo] = await Promise.all([
       store.fetchRoomDetail(roomId),
-      store.fetchStreamUrls(roomId),
+      store.fetchStreamUrls(roomId, { cookie: bilibiliCookie.value || undefined }),
     ])
     detail.value = roomDetail
     // 进房即记一次观看历史(带封面/头像快照, 未开播也记, 与 simple_live 一致)。
@@ -1126,14 +1150,22 @@ async function load() {
      * - 斗鱼只给 flv, 但其 CDN 不校验 Referer 且回了 `Access-Control-Allow-Origin: *`,
      *   交给 flv.js 播; 抖音的 flv 地址自带鉴权参数, 同样不校验 Referer。
      */
-    streams.value = streamInfo.streams.filter(
-      (item) => item.format === 'hls' || ((platform === 'douyu' || platform === 'douyin') && item.format === 'flv'),
-    )
+    qualities.value = streamInfo.qualities ?? []
+    streams.value = playableStreams(streamInfo.streams)
     if (!streamInfo.isLive || !streams.value.length) {
       status.value = 'offline'
       return
     }
-    activeIndex.value = pickQualityIndex(streams.value.length, liveSettings.qualityLevel)
+    // B 站首次请求只会拿到接口给的默认档位; 已登录时按偏好再取一次目标清晰度。
+    // 虎牙等按 qn 选档的平台同理(未登录的 B 站无论传什么 qn 都只会下发超清)。
+    const canPickQuality = platform !== 'bilibili' || Boolean(bilibiliCookie.value)
+    const target = preferredQuality()
+    if (canPickQuality && target && streams.value[0]?.quality !== target.name) {
+      await fetchQualityStreams(target.qn, false)
+    }
+    activeIndex.value = qualities.value.length
+      ? 0
+      : pickQualityIndex(streams.value.length, liveSettings.qualityLevel)
     qualitySheetOpen.value = false
     await nextTick()
     playCurrent()
@@ -1142,6 +1174,52 @@ async function load() {
     status.value = 'error'
     errorMsg.value = (e as Error).message || '加载直播间失败'
   }
+}
+
+/** 只保留 WebView 能直接播放的封装。 */
+function playableStreams(list: LiveStream[]) {
+  return list.filter(
+    (item) =>
+      item.format === 'hls' ||
+      ((platform === 'douyu' || platform === 'douyin') && item.format === 'flv'),
+  )
+}
+
+/** 按「最高/中等/最低」偏好从平台下发的清晰度里选中一档。 */
+function preferredQuality(): LiveQuality | null {
+  if (!qualities.value.length) return null
+  return qualities.value[pickQualityIndex(qualities.value.length, liveSettings.qualityLevel)] ?? null
+}
+
+/** 按 qn 重新取流; 拿不到地址时保留当前线路。 */
+async function fetchQualityStreams(qn: number, autoplay = true): Promise<boolean> {
+  try {
+    const info = await store.fetchStreamUrls(roomId, {
+      cookie: bilibiliCookie.value || undefined,
+      qn,
+    })
+    const list = playableStreams(info.streams)
+    if (!list.length) return false
+    qualities.value = info.qualities ?? qualities.value
+    streams.value = list
+    activeIndex.value = 0
+    triedIndexes.clear()
+    if (autoplay) playCurrent()
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 清晰度弹窗里选中一档: B 站按 qn 重新取流, 其它平台直接切已有线路。 */
+async function selectQuality(option: QualityOption) {
+  qualitySheetOpen.value = false
+  if (option.qn === undefined) {
+    if (option.index !== undefined) switchStream(option.index)
+    return
+  }
+  if (option.quality === activeQuality.value) return
+  await fetchQualityStreams(option.qn)
 }
 
 /** 播放失败时的线路容灾: 优先同画质下一条未试过的线路, 全试完才报错。 */
@@ -1253,11 +1331,6 @@ function switchStream(index: number) {
 /** 打开/收起底栏的清晰度列表。 */
 function toggleQualitySheet() {
   qualitySheetOpen.value = !qualitySheetOpen.value
-}
-
-function chooseQuality(index: number) {
-  qualitySheetOpen.value = false
-  switchStream(index)
 }
 
 function toggleMute() {
@@ -1860,6 +1933,15 @@ onBeforeUnmount(() => {
 
 .quality-check {
   font-size: 12px;
+}
+
+.quality-hint {
+  margin: 0;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--color-divider);
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .room-actions {

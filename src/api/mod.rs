@@ -120,6 +120,8 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::live::live_search,
         commands::live::live_room_detail,
         commands::live::live_stream_urls,
+        commands::live::live_bilibili_qrcode,
+        commands::live::live_bilibili_qrcode_poll,
         commands::live::add_live_stats,
         commands::live::get_live_stats_daily,
         commands::live::get_live_stats_summary,

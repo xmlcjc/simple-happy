@@ -358,6 +358,65 @@
           <section v-show="activeSettingsTab === 'live'" class="drawer-section">
             <h3 class="section-title">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <path d="M7 9h10M7 13h6" />
+              </svg>
+              哔哩哔哩登录
+            </h3>
+            <div class="live-login-row">
+              <button
+                type="button"
+                class="live-login-btn"
+                :disabled="qrLoading"
+                @click="startBiliQrLogin"
+              >{{ qrVisible ? '刷新二维码' : '扫码登录' }}</button>
+              <span class="live-login-state">
+                {{ liveSettings.bilibiliCookie ? '已登录，可选原画 / 蓝光' : '未登录，最高只能拿到「超清」' }}
+              </span>
+              <button
+                v-if="liveSettings.bilibiliCookie"
+                type="button"
+                class="shield-clear-btn"
+                @click="liveSettings.setBilibiliCookie('')"
+              >退出登录</button>
+            </div>
+
+            <div v-if="qrVisible" class="live-qr-box">
+              <img
+                v-if="qrImage && qrStatus !== 'expired'"
+                class="live-qr-image"
+                :src="qrImage"
+                alt="哔哩哔哩登录二维码"
+              >
+              <p class="live-qr-status" :class="{ error: qrStatus === 'expired' }">{{ qrMessage }}</p>
+              <div class="live-qr-actions">
+                <button
+                  v-if="qrStatus === 'expired'"
+                  type="button"
+                  class="live-login-btn"
+                  @click="startBiliQrLogin"
+                >重新获取</button>
+                <button type="button" class="live-qr-cancel" @click="closeBiliQr">关闭</button>
+              </div>
+            </div>
+
+            <div class="live-setting-field">
+              <label for="live-bili-cookie">或手动填写 Cookie</label>
+              <input
+                id="live-bili-cookie"
+                class="live-input"
+                type="text"
+                :value="liveSettings.bilibiliCookie"
+                placeholder="SESSDATA=...; bili_jct=...; DedeUserID=..."
+                @change="liveSettings.setBilibiliCookie(($event.target as HTMLInputElement).value)"
+              >
+            </div>
+            <small class="live-hint">扫码后会自动写入登录 Cookie；也可以从浏览器开发者工具复制完整 Cookie（至少包含 SESSDATA）手动填写。登录后直播间清晰度列表会多出原画 / 蓝光等档位。</small>
+          </section>
+
+          <section v-show="activeSettingsTab === 'live'" class="drawer-section">
+            <h3 class="section-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
                 <path d="M21 12a8 8 0 0 1-8 8H7l-4 3v-5.5A8 8 0 1 1 21 12z" />
               </svg>
               直播弹幕
@@ -521,9 +580,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import QRCode from 'qrcode'
 import { useAppStore } from '../stores/app'
+import { getBilibiliQrCode, pollBilibiliQrCode } from '../api/live'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
 import {
@@ -571,6 +632,78 @@ const danmakuOpacityRange = DANMAKU_OPACITY_RANGE
 const danmakuFontSizeRange = DANMAKU_FONT_SIZE_RANGE
 const danmakuSpeedRange = DANMAKU_SPEED_RANGE
 
+// ── B 站扫码登录 ──
+// 二维码内容由 passport 接口生成，前端用 qrcode 渲染成图片；每 2.5s 轮询一次状态。
+const qrVisible = ref(false)
+const qrLoading = ref(false)
+const qrImage = ref('')
+const qrStatus = ref('pending')
+const qrMessage = ref('')
+let qrKey = ''
+let qrTimer: number | undefined
+
+function stopQrPoll() {
+  if (qrTimer !== undefined) {
+    window.clearInterval(qrTimer)
+    qrTimer = undefined
+  }
+}
+
+function closeBiliQr() {
+  stopQrPoll()
+  qrVisible.value = false
+  qrImage.value = ''
+  qrKey = ''
+}
+
+async function pollBiliQr() {
+  if (!qrKey) return
+  try {
+    const result = await pollBilibiliQrCode(qrKey)
+    qrStatus.value = result.status
+    qrMessage.value = result.message
+    if (result.status === 'success') {
+      stopQrPoll()
+      qrKey = ''
+      qrVisible.value = false
+      qrImage.value = ''
+      liveSettings.setBilibiliCookie(result.cookie)
+      appStore.showToast('哔哩哔哩登录成功，清晰度已解锁', 'success')
+    } else if (result.status === 'expired') {
+      stopQrPoll()
+    }
+  } catch {
+    // 偶发网络错误不终止轮询，二维码过期时后端会返回 expired。
+  }
+}
+
+async function startBiliQrLogin() {
+  stopQrPoll()
+  qrVisible.value = true
+  qrLoading.value = true
+  qrStatus.value = 'pending'
+  qrMessage.value = '正在获取二维码…'
+  qrImage.value = ''
+  try {
+    const code = await getBilibiliQrCode()
+    qrKey = code.qrcodeKey
+    qrImage.value = await QRCode.toDataURL(code.url, {
+      width: 220,
+      margin: 1,
+      errorCorrectionLevel: 'M',
+    })
+    qrMessage.value = '请使用哔哩哔哩 App 扫码'
+    qrTimer = window.setInterval(() => void pollBiliQr(), 2500)
+  } catch (error) {
+    qrStatus.value = 'expired'
+    qrMessage.value = (error as Error).message || '获取二维码失败'
+  } finally {
+    qrLoading.value = false
+  }
+}
+
+onBeforeUnmount(stopQrPoll)
+
 function addShieldWord() {
   shield.addWord(shieldWordDraft.value)
   shieldWordDraft.value = ''
@@ -614,7 +747,10 @@ const proxyDescription = computed(() => {
 })
 
 watch(() => props.modelValue, (visible) => {
-  if (!visible) return
+  if (!visible) {
+    closeBiliQr()
+    return
+  }
   proxyModeDraft.value = appStore.networkProxyMode
   proxyUrlDraft.value = appStore.networkProxyUrl
   if (isDesktopApp && proxyModeDraft.value === 'system') {
@@ -1405,6 +1541,97 @@ function removeBackgroundImage() {
 .live-hint {
   display: block;
   margin-top: var(--space-3);
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+}
+
+/* B 站登录 Cookie 输入 */
+.live-input {
+  width: 100%;
+  padding: 7px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-light);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  outline: none;
+}
+
+.live-input:focus {
+  border-color: var(--color-primary-border);
+}
+
+/* B 站扫码登录 */
+.live-login-row {
+  margin-top: var(--space-2);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.live-login-btn {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border-radius: var(--radius-full);
+  background: var(--color-primary-soft-bg);
+  color: var(--color-primary-soft-text);
+  font-size: var(--text-xs);
+  font-weight: 600;
+}
+
+.live-login-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.live-login-state {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.live-qr-box {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  border: 1px dashed var(--color-border-light);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-sunken);
+}
+
+.live-qr-image {
+  width: 180px;
+  height: 180px;
+  border-radius: var(--radius-md);
+  background: #fff;
+  padding: 4px;
+}
+
+.live-qr-status {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.live-qr-status.error {
+  color: var(--color-danger, #c0392b);
+}
+
+.live-qr-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.live-qr-cancel {
+  padding: 5px 12px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border-light);
   color: var(--color-text-tertiary);
   font-size: var(--text-xs);
 }

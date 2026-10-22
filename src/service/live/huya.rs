@@ -15,7 +15,8 @@ use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
 
 use super::models::{
-    LiveCategory, LiveCategoryGroup, LiveRoomDetail, LiveRoomSummary, LiveStream, LiveStreamInfo,
+    LiveCategory, LiveCategoryGroup, LiveQuality, LiveRoomDetail, LiveRoomSummary, LiveStream,
+    LiveStreamInfo,
 };
 
 pub const PLATFORM_ID: &str = "huya";
@@ -83,22 +84,43 @@ impl Huya {
             .ok_or_else(|| AppError::NotFound(format!("直播间 {id} 不存在")))
     }
 
-    pub async fn stream_urls(&self, room_id: &str) -> Result<LiveStreamInfo, AppError> {
+    /// 取流。`qn` 为选中的码率(iBitRate), 为空时取接口给的最高档。
+    pub async fn stream_urls(
+        &self,
+        room_id: &str,
+        qn: Option<i64>,
+    ) -> Result<LiveStreamInfo, AppError> {
         let id = normalize_id(room_id, "房间号")?;
         let value = self.profile(&id).await?;
         let is_live = value.pointer("/data/liveStatus").and_then(Value::as_str) == Some("ON");
+        // 清晰度列表来自 `stream.hls.rateArray`(蓝光8M/蓝光4M/超清/流畅),
+        // 与 simple_live 一致, 取流时用 `ratio=<码率>` 选档。
+        let qualities = parse_qualities(&value);
         let mut streams = Vec::new();
         if is_live {
+            let target = qn
+                .and_then(|rate| qualities.iter().find(|item| item.qn == rate).cloned())
+                .or_else(|| qualities.first().cloned());
+            let mut candidates = target
+                .as_ref()
+                .map(|quality| hls_urls_for_quality(&value, quality.qn))
+                .unwrap_or_default();
+            if candidates.is_empty() {
+                candidates = candidate_hls_urls(&value);
+            }
             // 多线路容灾: 虎牙有多条 CDN(AL 线经常 502), 最多收集 3 条真正能拉的,
             // 播放失败时前端可以自动换下一条。
-            for url in candidate_hls_urls(&value) {
+            for url in candidates {
                 if streams.len() >= 3 {
                     break;
                 }
                 if self.is_reachable(&url).await {
                     streams.push(LiveStream {
                         format: "hls".to_string(),
-                        quality: "原画".to_string(),
+                        quality: target
+                            .as_ref()
+                            .map(|quality| quality.name.clone())
+                            .unwrap_or_else(|| "原画".to_string()),
                         url,
                     });
                 }
@@ -108,6 +130,7 @@ impl Huya {
             room_id: id,
             is_live,
             streams,
+            qualities,
         })
     }
 
@@ -313,6 +336,81 @@ pub fn parse_room_detail(value: &Value, room_id: &str) -> Option<LiveRoomDetail>
     })
 }
 
+/// 清晰度列表: `stream.hls.rateArray`(回退到 flv 的同名字段)。
+/// 与 simple_live 一致: 跳过 HDR 档, 顺序保持接口下发的高→低。
+pub fn parse_qualities(value: &Value) -> Vec<LiveQuality> {
+    let Some(list) = value
+        .pointer("/data/stream/hls/rateArray")
+        .or_else(|| value.pointer("/data/stream/flv/rateArray"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|item| {
+            let name = text(item, "sDisplayName");
+            let rate = item.get("iBitRate").and_then(|raw| {
+                raw.as_i64()
+                    .or_else(|| raw.as_str().and_then(|text| text.parse().ok()))
+            })?;
+            if name.is_empty() || rate <= 0 || name.contains("HDR") {
+                return None;
+            }
+            Some(LiveQuality { qn: rate, name })
+        })
+        .collect()
+}
+
+/// 指定码率的 HLS 线路。接口在 `multiLine[].url` 里已带 `ratio=<默认码率>`,
+/// 这里替换成目标码率; 线路按 `webPriorityRate` 从高到低排序。
+pub fn hls_urls_for_quality(value: &Value, bit_rate: i64) -> Vec<String> {
+    let Some(lines) = value
+        .pointer("/data/stream/hls/multiLine")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(u64, String)> = lines
+        .iter()
+        .filter_map(|item| {
+            let url = text(item, "url");
+            if url.is_empty() {
+                return None;
+            }
+            Some((
+                number(item, "webPriorityRate"),
+                with_ratio(&upgrade_https(&url), bit_rate),
+            ))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.into_iter().map(|(_, url)| url).collect()
+}
+
+/// 替换 URL 里的 `ratio=` 参数值; 没有该参数时追加。
+fn with_ratio(url: &str, bit_rate: i64) -> String {
+    if let Some(pos) = url.find("ratio=") {
+        let value_start = pos + "ratio=".len();
+        let value_end = url[value_start..]
+            .find('&')
+            .map(|index| value_start + index)
+            .unwrap_or(url.len());
+        return format!("{}ratio={}{}", &url[..pos], bit_rate, &url[value_end..]);
+    }
+    if url.contains('?') {
+        format!("{url}&ratio={bit_rate}")
+    } else {
+        format!("{url}?ratio={bit_rate}")
+    }
+}
+
+fn upgrade_https(raw: &str) -> String {
+    match raw.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => raw.to_string(),
+    }
+}
+
 /// 由 `baseSteamInfoList` 拼出候选 HLS 地址, 按线路优先级排序。
 /// 优先 https, 其次 http; 同一线路的两种协议都会给出, 由 `is_reachable` 决定。
 pub fn candidate_hls_urls(value: &Value) -> Vec<String> {
@@ -430,5 +528,53 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0], "https://al.hls.huya.com/src/a-b-c.m3u8?wsSecret=1&wsTime=2");
         assert_eq!(urls[1], "http://al.hls.huya.com/src/a-b-c.m3u8?wsSecret=1&wsTime=2");
+    }
+
+    #[test]
+    fn parses_quality_array_and_skips_hdr() {
+        let value = serde_json::json!({
+            "data": { "stream": { "hls": { "rateArray": [
+                { "sDisplayName": "蓝光8M", "iBitRate": 8000 },
+                { "sDisplayName": "HDR10", "iBitRate": 6000 },
+                { "sDisplayName": "蓝光4M", "iBitRate": 4000 },
+                { "sDisplayName": "超清", "iBitRate": "2000" },
+                { "sDisplayName": "", "iBitRate": 500 }
+            ]}}}
+        });
+        let qualities = parse_qualities(&value);
+        assert_eq!(
+            qualities.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(),
+            vec!["蓝光8M", "蓝光4M", "超清"]
+        );
+        assert_eq!(qualities[2].qn, 2000);
+    }
+
+    #[test]
+    fn builds_quality_urls_with_ratio_and_priority() {
+        let value = serde_json::json!({
+            "data": { "stream": { "hls": { "multiLine": [
+                { "url": "http://al.hls.huya.com/src/a.m3u8?ratio=2000&wsSecret=1",
+                  "webPriorityRate": 10 },
+                { "url": "http://tx.hls.huya.com/src/a.m3u8?ratio=2000&wsSecret=1",
+                  "webPriorityRate": 70 }
+            ]}}}
+        });
+        let urls = hls_urls_for_quality(&value, 8000);
+        assert_eq!(urls.len(), 2);
+        // 优先级高的 TX 线路排在最前, 且 ratio 被替换成目标码率。
+        assert_eq!(urls[0], "https://tx.hls.huya.com/src/a.m3u8?ratio=8000&wsSecret=1");
+        assert_eq!(urls[1], "https://al.hls.huya.com/src/a.m3u8?ratio=8000&wsSecret=1");
+    }
+
+    #[test]
+    fn appends_ratio_when_missing() {
+        assert_eq!(
+            with_ratio("https://a.com/live.m3u8?wsSecret=1", 4000),
+            "https://a.com/live.m3u8?wsSecret=1&ratio=4000"
+        );
+        assert_eq!(
+            with_ratio("https://a.com/live.m3u8", 500),
+            "https://a.com/live.m3u8?ratio=500"
+        );
     }
 }

@@ -327,8 +327,11 @@ export const useLiveStore = defineStore('live', () => {
     return getLiveRoomDetail(platform.value, roomId)
   }
 
-  async function fetchStreamUrls(roomId: string): Promise<LiveStreamInfo> {
-    return getLiveStreamUrls(platform.value, roomId)
+  async function fetchStreamUrls(
+    roomId: string,
+    options: { cookie?: string; qn?: number } = {},
+  ): Promise<LiveStreamInfo> {
+    return getLiveStreamUrls(platform.value, roomId, options)
   }
 
   return {

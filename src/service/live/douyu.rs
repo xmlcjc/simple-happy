@@ -109,6 +109,7 @@ impl Douyu {
                 room_id: id,
                 is_live: false,
                 streams: Vec::new(),
+                qualities: Vec::new(),
             });
         }
 
@@ -171,6 +172,7 @@ impl Douyu {
             room_id: id,
             is_live: true,
             streams,
+            qualities: Vec::new(),
         })
     }
 

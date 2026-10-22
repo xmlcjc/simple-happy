@@ -108,6 +108,13 @@ rmSync(stageDir, { recursive: true, force: true })
 mkdirSync(stageDir, { recursive: true })
 cpSync(exeSrc, join(stageDir, 'Simple Happy.exe'))
 writeFileSync(join(stageDir, '.simple-happy-portable'), 'Simple Happy portable package\n')
+// 便携版也要随包带上内置音源：安装版由 Tauri resources 复制，
+// 便携包只有 exe + data，缺少这个目录会导致首启装不出任何音源。
+const builtinPlugins = join(tauriDir, 'builtin-music-plugins')
+if (existsSync(builtinPlugins)) {
+  cpSync(builtinPlugins, join(stageDir, 'builtin-music-plugins'), { recursive: true })
+  console.log('已加入内置音源: builtin-music-plugins')
+}
 // 便携版预置书源/RSS 种子：首次启动即带本地书源与订阅源。
 // 安装版仍由用户在应用内导入，避免把第三方书源写进系统目录。
 const seedDb = join(repoRoot, 'seed', 'reader.db')

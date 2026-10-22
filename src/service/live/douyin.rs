@@ -200,6 +200,7 @@ impl Douyin {
             room_id: id,
             is_live,
             streams,
+            qualities: Vec::new(),
         })
     }
 

@@ -18,6 +18,8 @@ const DANMAKU_FONT_SIZE_KEY = 'live-danmaku-font-size'
 const DANMAKU_SPEED_KEY = 'live-danmaku-speed'
 const QUALITY_LEVEL_KEY = 'live-quality-level'
 const FOLLOW_REFRESH_INTERVAL_KEY = 'live-follow-refresh-interval'
+/** B 站登录 Cookie；为空表示未登录，直播只能拿到「超清」。 */
+const BILIBILI_COOKIE_KEY = 'live-bilibili-cookie'
 
 /** 关注列表自动刷新间隔（秒）；0 = 关闭。 */
 export const FOLLOW_REFRESH_INTERVAL_OPTIONS = [
@@ -77,6 +79,8 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
   const qualityLevel = ref(clamp(readNumber(QUALITY_LEVEL_KEY, 2), 0, 2))
   /** 关注列表自动刷新间隔(秒), 0 = 不自动刷新。 */
   const followRefreshInterval = ref(clamp(readNumber(FOLLOW_REFRESH_INTERVAL_KEY, 60), 0, 3600))
+  /** B 站登录 Cookie。登录后取流接口才会下发原画/蓝光等更高档位。 */
+  const bilibiliCookie = ref(localStorage.getItem(BILIBILI_COOKIE_KEY) || '')
 
   function setDanmakuOn(value: boolean) {
     danmakuOn.value = value
@@ -121,6 +125,11 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
     localStorage.setItem(FOLLOW_REFRESH_INTERVAL_KEY, String(followRefreshInterval.value))
   }
 
+  function setBilibiliCookie(value: string) {
+    bilibiliCookie.value = value.trim()
+    localStorage.setItem(BILIBILI_COOKIE_KEY, bilibiliCookie.value)
+  }
+
   return {
     danmakuOn,
     danmakuArea,
@@ -129,6 +138,7 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
     danmakuSpeed,
     qualityLevel,
     followRefreshInterval,
+    bilibiliCookie,
     setDanmakuOn,
     setDanmakuArea,
     setDanmakuOpacity,
@@ -136,5 +146,6 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
     setDanmakuSpeed,
     setQualityLevel,
     setFollowRefreshInterval,
+    setBilibiliCookie,
   }
 })

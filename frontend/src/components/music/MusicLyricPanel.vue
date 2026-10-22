@@ -97,19 +97,20 @@ watch(
 
 <style scoped>
 .lyric-panel {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(340px, 86%);
+  position: fixed;
+  right: 12px;
+  bottom: 80px;
+  z-index: 98;
+  width: min(360px, calc(100vw - 24px));
+  max-height: min(520px, calc(100dvh - 120px));
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   border: 1px solid var(--color-border-light);
   border-radius: var(--radius-lg);
   background: color-mix(in srgb, var(--color-bg-elevated) 96%, transparent);
   backdrop-filter: blur(12px);
   box-shadow: var(--shadow-lg, 0 12px 30px rgba(0, 0, 0, 0.12));
-  z-index: 2;
 }
 
 .lyric-head {

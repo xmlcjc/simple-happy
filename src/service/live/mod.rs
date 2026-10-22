@@ -13,7 +13,8 @@ pub mod stats;
 use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
 use models::{
-    LiveCategoryGroup, LivePlatform, LiveRoomDetail, LiveRoomSummary, LiveStreamInfo, LiveSuperChat,
+    LiveCategoryGroup, LivePlatform, LiveQrCode, LiveQrCodeStatus, LiveRoomDetail, LiveRoomSummary,
+    LiveStreamInfo, LiveSuperChat,
 };
 
 pub struct LiveService {
@@ -122,18 +123,32 @@ impl LiveService {
         }
     }
 
+    /// 取流。`cookie`/`qn` 目前只有 B 站会用到: 登录 Cookie 决定可选的清晰度档位,
+    /// `qn` 是用户选中的清晰度; 其它平台忽略这两个参数。
     pub async fn stream_urls(
         &self,
         platform: &str,
         room_id: &str,
+        cookie: Option<&str>,
+        qn: Option<i64>,
     ) -> Result<LiveStreamInfo, AppError> {
         match platform {
-            bilibili::PLATFORM_ID => self.bilibili.stream_urls(room_id).await,
-            huya::PLATFORM_ID => self.huya.stream_urls(room_id).await,
+            bilibili::PLATFORM_ID => self.bilibili.stream_urls(room_id, cookie, qn).await,
+            huya::PLATFORM_ID => self.huya.stream_urls(room_id, qn).await,
             douyu::PLATFORM_ID => self.douyu.stream_urls(room_id).await,
             douyin::PLATFORM_ID => self.douyin.stream_urls(room_id).await,
             other => Err(unsupported_platform(other)),
         }
+    }
+
+    /// B 站扫码登录: 生成二维码内容。
+    pub async fn bilibili_qrcode(&self) -> Result<LiveQrCode, AppError> {
+        self.bilibili.qrcode_generate().await
+    }
+
+    /// B 站扫码登录: 轮询扫码状态, 成功后返回登录 Cookie。
+    pub async fn bilibili_qrcode_poll(&self, qrcode_key: &str) -> Result<LiveQrCodeStatus, AppError> {
+        self.bilibili.qrcode_poll(qrcode_key).await
     }
 
     /// 展示期内的 SC 列表。目前只有 B 站提供, 其它平台返回空列表。

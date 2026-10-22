@@ -65,10 +65,18 @@ export interface LiveStream {
   url: string
 }
 
+/** 一个可选清晰度。`qn` 是平台内部编号，切换时原样回传给后端。 */
+export interface LiveQuality {
+  qn: number
+  name: string
+}
+
 export interface LiveStreamInfo {
   roomId: string
   isLive: boolean
   streams: LiveStream[]
+  /** 平台认可的全部清晰度（B 站登录后档位更多）；其它平台为空。 */
+  qualities?: LiveQuality[]
 }
 
 export function getLivePlatforms(): Promise<LivePlatform[]> {
@@ -109,8 +117,39 @@ export function searchLiveRooms(params: {
   })
 }
 
-export function getLiveStreamUrls(platform: string, roomId: string): Promise<LiveStreamInfo> {
-  return invokeEnvelope('live_stream_urls', { platform, roomId })
+export function getLiveStreamUrls(
+  platform: string,
+  roomId: string,
+  options: { cookie?: string; qn?: number } = {},
+): Promise<LiveStreamInfo> {
+  return invokeEnvelope('live_stream_urls', {
+    platform,
+    roomId,
+    cookie: options.cookie || undefined,
+    qn: options.qn,
+  })
+}
+
+/** B 站扫码登录二维码：`url` 由前端渲染成二维码图片。 */
+export interface LiveQrCode {
+  url: string
+  qrcodeKey: string
+}
+
+/** 扫码轮询状态：pending / scanned / expired / success。 */
+export interface LiveQrCodeStatus {
+  status: string
+  message: string
+  /** 仅 success 时有值，可直接写入直播设置的 Cookie。 */
+  cookie: string
+}
+
+export function getBilibiliQrCode(): Promise<LiveQrCode> {
+  return invokeEnvelope('live_bilibili_qrcode', {})
+}
+
+export function pollBilibiliQrCode(qrcodeKey: string): Promise<LiveQrCodeStatus> {
+  return invokeEnvelope('live_bilibili_qrcode_poll', { qrcodeKey })
 }
 
 /** 房间内仍在展示期内的 SC 列表（目前仅 B 站支持，其它平台返回空）。 */
