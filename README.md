@@ -32,8 +32,11 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 ### 阅读界面
 ![阅读](desktop/image/3.1.png)
 
-### 直播界面（示例）
+### 直播界面
 ![直播](desktop/image/5.png)
+
+### 音乐界面
+![音乐](desktop/image/6.png)
 
 ---
 
