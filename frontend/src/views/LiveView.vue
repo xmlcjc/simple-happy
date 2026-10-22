@@ -102,6 +102,24 @@
       </template>
 
       <template v-else-if="store.view === 'history'">
+        <div class="history-stats">
+          <div class="stat-card">
+            <strong>{{ formatLiveDuration(liveStats.todaySeconds) }}</strong>
+            <small>今日观看</small>
+          </div>
+          <div class="stat-card">
+            <strong>{{ formatLiveDuration(liveStats.monthSeconds) }}</strong>
+            <small>近 30 天</small>
+          </div>
+          <div class="stat-card">
+            <strong>{{ formatLiveDuration(liveStats.totalSeconds) }}</strong>
+            <small>累计观看</small>
+          </div>
+          <div class="stat-card">
+            <strong>{{ liveStats.totalSessions }}</strong>
+            <small>观看场次</small>
+          </div>
+        </div>
         <div v-if="!store.history.length" class="live-state">
           <p>还没有观看记录</p>
           <small>进入过的直播间会出现在这里</small>
@@ -215,11 +233,62 @@ import { parseLiveLink } from '../utils/liveLink'
 import type { LiveFollow } from '../api/liveFollow'
 import type { LiveHistoryEntry } from '../api/liveHistory'
 import type { LiveRoomSummary, LiveCategory, LiveCategoryGroup } from '../api/live'
+import { getLiveStatsDaily, getLiveStatsSummary } from '../api/liveStats'
 
 const store = useLiveStore()
 const liveSettings = useLiveSettingsStore()
 const router = useRouter()
 const searchFocused = ref(false)
+
+/** 观看历史页顶部的统计卡片（累计 / 今日 / 近 30 天）。 */
+const liveStats = ref({
+  todaySeconds: 0,
+  monthSeconds: 0,
+  totalSeconds: 0,
+  totalSessions: 0,
+})
+
+function dateStr(offsetDays: number) {
+  const date = new Date()
+  date.setDate(date.getDate() - offsetDays)
+  return date.toISOString().slice(0, 10)
+}
+
+function formatLiveDuration(seconds: number) {
+  if (seconds <= 0) return '0分钟'
+  if (seconds < 60) return '少于1分钟'
+  const minutes = Math.floor(seconds / 60)
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return hours > 0 ? `${hours}小时${rest}分` : `${Math.max(1, minutes)}分钟`
+}
+
+async function loadLiveStats() {
+  const end = dateStr(0)
+  const start = dateStr(29)
+  try {
+    const [daily, summary] = await Promise.all([
+      getLiveStatsDaily(start, end),
+      getLiveStatsSummary(),
+    ])
+    liveStats.value = {
+      todaySeconds: daily.find((item) => item.date === end)?.seconds ?? 0,
+      monthSeconds: daily.reduce((total, item) => total + item.seconds, 0),
+      totalSeconds: summary.totalSeconds,
+      totalSessions: summary.totalSessions,
+    }
+  } catch {
+    // 统计读取失败不影响历史列表展示。
+  }
+}
+
+watch(
+  () => store.view,
+  (view) => {
+    if (view === 'history') void loadLiveStats()
+  },
+  { immediate: true },
+)
 
 /** 分类页每组默认展示的图标数；超出后折叠成「显示全部」。 */
 const CATEGORY_PREVIEW = 12
@@ -820,6 +889,36 @@ onBeforeUnmount(() => {
   padding-bottom: 10px;
   color: var(--color-text-tertiary);
   font-size: 12px;
+}
+
+/* 观看历史页顶部统计卡片，规格与音乐/阅读历史一致。 */
+.history-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding-bottom: var(--space-3);
+}
+
+.stat-card {
+  min-width: 120px;
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border-light);
+  background: var(--color-bg-elevated);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-card strong {
+  color: var(--color-text);
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.stat-card small {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
 }
 
 .history-clear {

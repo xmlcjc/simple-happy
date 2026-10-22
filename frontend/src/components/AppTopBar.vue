@@ -45,7 +45,7 @@ import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAppStore } from '../stores/app'
 
-type NavKey = 'home' | 'rss' | 'live' | 'music' | 'stats'
+type NavKey = 'home' | 'rss' | 'live' | 'music'
 
 const router = useRouter()
 const route = useRoute()
@@ -82,18 +82,11 @@ const allItems: Array<{ key: NavKey; label: string; path: string; paths: string[
       'M18 13a3 3 0 1 0 0 6a3 3 0 1 0 0-6z',
     ],
   },
-  {
-    key: 'stats',
-    label: '统计',
-    path: '/stats',
-    paths: ['M12 7v5l3 2', 'M12 3a9 9 0 1 0 9 9'],
-  },
 ]
 
-// 隐藏功能开关沿用设置抽屉里的 'stats' / 'rss' / 'live' 键。
+// 隐藏功能开关沿用设置抽屉里的 'rss' / 'live' / 'music' 键。
 const navItems = computed(() => {
   const hidden = (key: NavKey) => {
-    if (key === 'stats') return appStore.isFeatureHidden('stats')
     if (key === 'rss') return appStore.isFeatureHidden('rss')
     if (key === 'live') return appStore.isFeatureHidden('live')
     if (key === 'music') return appStore.isFeatureHidden('music')
@@ -103,7 +96,6 @@ const navItems = computed(() => {
 })
 
 const activeKey = computed<NavKey>(() => {
-  if (route.path.startsWith('/stats')) return 'stats'
   if (route.path.startsWith('/live')) return 'live'
   if (route.path.startsWith('/music')) return 'music'
   if (route.path.startsWith('/rss')) return 'rss'

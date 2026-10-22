@@ -14,6 +14,10 @@
           </label>
         </div>
         <div class="rss-hero-actions">
+          <button class="ghost-btn icon-btn" @click="goHistory" aria-label="阅读历史" title="阅读历史">
+            <span class="btn-icon">◷</span>
+            <span class="btn-text">阅读历史</span>
+          </button>
           <button class="ghost-btn icon-btn" @click="goManage" aria-label="管理订阅源" title="管理订阅源">
             <span class="btn-icon">⚙</span>
             <span class="btn-text">管理订阅源</span>
@@ -315,6 +319,11 @@ function openExternally(url: string) {
 
 function goManage() {
   router.push('/rss/manage')
+}
+
+/** RSS 的阅读记录统一在「阅读历史」里，按 kind=rss 预筛选。 */
+function goHistory() {
+  router.push({ path: '/recent', query: { kind: 'rss' } })
 }
 
 function syncViewportMode() {

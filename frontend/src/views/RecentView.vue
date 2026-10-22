@@ -3,7 +3,7 @@
     <div class="recent-content">
       <div class="recent-header">
         <h1 class="recent-title">
-          最近阅读
+          {{ historyTitle }}
           <span class="recent-count">({{ filteredRecentBooks.length }})</span>
         </h1>
         <div class="recent-actions">
@@ -19,6 +19,25 @@
           >
             一键清空
           </button>
+        </div>
+      </div>
+
+      <div class="history-stats">
+        <div class="stat-card">
+          <strong>{{ formatDuration(stats.todaySeconds) }}</strong>
+          <small>今日阅读</small>
+        </div>
+        <div class="stat-card">
+          <strong>{{ formatDuration(stats.monthSeconds) }}</strong>
+          <small>近 30 天</small>
+        </div>
+        <div class="stat-card">
+          <strong>{{ formatDuration(stats.totalSeconds) }}</strong>
+          <small>累计阅读</small>
+        </div>
+        <div class="stat-card">
+          <strong>{{ formatNumber(stats.totalCharacters) }}</strong>
+          <small>累计字数</small>
         </div>
       </div>
 
@@ -50,24 +69,84 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import BookDetailModal from '../components/BookDetailModal.vue'
 import BookGrid from '../components/BookGrid.vue'
 import { showContextMenu } from '../composables/useContextMenu'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
+import { getReadingStatsDaily, getReadingStatsSummary } from '../api/readingStats'
 import type { Book, SearchBook } from '../types'
 
 const router = useRouter()
+const route = useRoute()
 const shelfStore = useBookshelfStore()
 const readerStore = useReaderStore()
 
 const showDetail = ref(false)
 const selectedBook = ref<Book | SearchBook | null>(null)
 const openingBookUrl = ref('')
-const activeFilter = ref<'all' | 'book' | 'rss'>('all')
+// 从 RSS 页面进入时默认只看 RSS 文章（/recent?kind=rss）。
+const initialKind = route.query.kind === 'rss' ? 'rss' : 'all'
+const activeFilter = ref<'all' | 'book' | 'rss'>(initialKind)
 const searchText = ref('')
+
+// 同一路由切换 query 时组件会被复用，标题与筛选要跟着更新。
+const entryKind = ref<'all' | 'rss'>(initialKind)
+
+watch(
+  () => route.query.kind,
+  (kind) => {
+    entryKind.value = kind === 'rss' ? 'rss' : 'all'
+    activeFilter.value = entryKind.value
+  },
+)
+
+const historyTitle = computed(() =>
+  entryKind.value === 'rss' ? 'RSS 阅读历史' : '阅读历史',
+)
+
+const stats = ref({
+  todaySeconds: 0,
+  monthSeconds: 0,
+  totalSeconds: 0,
+  totalCharacters: 0,
+})
+
+function dateStr(offsetDays: number) {
+  const date = new Date()
+  date.setDate(date.getDate() - offsetDays)
+  return date.toISOString().slice(0, 10)
+}
+
+async function loadStats() {
+  const end = dateStr(0)
+  const start = dateStr(29)
+  const [daily, summary] = await Promise.all([
+    getReadingStatsDaily(start, end),
+    getReadingStatsSummary(),
+  ])
+  stats.value = {
+    todaySeconds: daily.find((item) => item.date === end)?.seconds ?? 0,
+    monthSeconds: daily.reduce((total, item) => total + item.seconds, 0),
+    totalSeconds: summary.totalSeconds,
+    totalCharacters: summary.totalCharacters,
+  }
+}
+
+function formatDuration(seconds: number) {
+  if (seconds <= 0) return '0分钟'
+  if (seconds < 60) return '少于1分钟'
+  const minutes = Math.floor(seconds / 60)
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return hours > 0 ? `${hours}小时${rest}分` : `${Math.max(1, minutes)}分钟`
+}
+
+function formatNumber(value: number) {
+  return value >= 10000 ? `${(value / 10000).toFixed(1)}万` : String(value)
+}
 
 const filteredRecentBooks = computed(() => {
   let list = shelfStore.recentBooks
@@ -98,6 +177,7 @@ const filteredRecentBooks = computed(() => {
 onMounted(async () => {
   await shelfStore.fetchBooks().catch(() => undefined)
   await shelfStore.refreshRecentBooks().catch(() => undefined)
+  await loadStats().catch(() => undefined)
 })
 
 async function handleBookClick(book: Book | SearchBook) {
@@ -182,6 +262,37 @@ async function handleClearRecent() {
   justify-content: space-between;
   gap: var(--space-4);
   flex-shrink: 0;
+}
+
+/* 历史页顶部的统计卡片，规格与音乐历史页一致。 */
+.history-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding-bottom: var(--space-3);
+  flex-shrink: 0;
+}
+
+.stat-card {
+  min-width: 120px;
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border-light);
+  background: var(--color-bg-elevated);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-card strong {
+  color: var(--color-text);
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.stat-card small {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
 }
 
 .recent-content :deep(.book-grid) {

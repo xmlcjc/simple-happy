@@ -298,17 +298,6 @@
             </h3>
             <div class="feature-toggle-list">
               <label class="feature-toggle">
-                <span>隐藏统计</span>
-                <button
-                  class="toggle-btn"
-                  :class="{ on: appStore.isFeatureHidden('stats') }"
-                  type="button"
-                  @click="appStore.toggleHiddenFeature('stats')"
-                >
-                  {{ appStore.isFeatureHidden('stats') ? '已隐藏' : '显示' }}
-                </button>
-              </label>
-              <label class="feature-toggle">
                 <span>隐藏直播</span>
                 <button
                   class="toggle-btn"
