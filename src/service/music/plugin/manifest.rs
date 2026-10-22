@@ -21,6 +21,10 @@ pub const MAX_PLUGIN_BYTES: usize = 5 * 1024 * 1024;
 
 /// 安装阶段使用的轻量全局垫片。只覆盖插件在**加载期**常见的全局变量,
 /// 避免因 `global`/`process`/`console` 缺失而整包安装失败。
+///
+/// `require` 对第三方库返回空壳：安装只需要读 `module.exports` 上的元信息，
+/// 不必真的执行 axios / crypto-js。真实实现在 `shim.rs` 的运行时垫片里。
+/// Node 内置模块仍然报错，避免依赖文件系统的插件装进来后跑不起来。
 const PRELUDE: &str = r#"
 var globalThis = globalThis || this;
 var global = globalThis;
@@ -32,7 +36,32 @@ function setTimeout(){ return 0; }
 function clearTimeout(){}
 function setInterval(){ return 0; }
 function clearInterval(){}
-function require(name){ throw new Error('require is not available: ' + name); }
+var __mf_stub_cache = {};
+function __mf_make_stub() {
+  var stub = function () { return stub; };
+  stub.default = stub;
+  stub.get = function () { return Promise.resolve({ data: {} }); };
+  stub.post = stub.get;
+  stub.put = stub.get;
+  stub.request = stub.get;
+  stub.create = function () { return __mf_make_stub(); };
+  stub.defaults = {};
+  stub.interceptors = { request: { use: function(){} }, response: { use: function(){} } };
+  stub.parse = stub;
+  stub.stringify = stub;
+  stub.decode = stub;
+  stub.encode = stub;
+  stub.format = stub;
+  return stub;
+}
+var __mf_node_builtins = ['fs','path','child_process','os','http','https','crypto','zlib','stream','buffer','util','url','querystring','net','tls','vm','worker_threads','module'];
+function require(name) {
+  if (__mf_node_builtins.indexOf(String(name)) >= 0) {
+    throw new Error('require is not available: ' + name);
+  }
+  if (!__mf_stub_cache[name]) __mf_stub_cache[name] = __mf_make_stub();
+  return __mf_stub_cache[name];
+}
 "#;
 
 /// 解析插件元信息。失败时返回可直接展示给用户的中文错误。

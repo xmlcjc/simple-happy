@@ -25,14 +25,24 @@ pub const PRELUDE: &str = r##"
     g.console = { log: noop, warn: noop, error: noop, info: noop, debug: noop };
   }
 
-  // 定时器只用于把回调推进微任务队列, execute_pending_job 会统一驱动。
+  // 定时器不能直接当 0ms 微任务执行：插件常用
+  // `Promise.race([真实请求, 超时定时器])` 做取链竞争，若超时回调先跑，
+  // 所有源都会被判失败。这里只登记回调，由宿主在微任务耗尽后逐个执行，
+  // 效果等价于「请求先完成，超时后到」。
+  var timers = [];
   g.setTimeout = function (fn) {
-    if (typeof fn === 'function') Promise.resolve().then(function () { try { fn(); } catch (e) {} });
-    return 0;
+    if (typeof fn === 'function') timers.push(fn);
+    return timers.length;
   };
   g.clearTimeout = noop;
   g.setInterval = function () { return 0; };
   g.clearInterval = noop;
+  g.__mf_run_timer = function () {
+    if (!timers.length) return false;
+    var fn = timers.shift();
+    try { fn(); } catch (e) {}
+    return true;
+  };
 
   // ── UTF-8 ──
   function utf8Encode(str) {
@@ -317,6 +327,7 @@ pub const PRELUDE: &str = r##"
     }
     this.readyState = 4;
     this.status = res.status;
+    this.responseURL = res.url || this._url;
     this.responseText = res.body || '';
     this.response = this.responseText;
     if (typeof this.onreadystatechange === 'function') this.onreadystatechange();
@@ -325,8 +336,574 @@ pub const PRELUDE: &str = r##"
   };
   g.XMLHttpRequest.prototype.abort = noop;
 
-  // Node 内置模块不提供, 明确报错而不是让插件静默拿到 undefined。
+  // ── 内置模块 ──
+  // MusicFree 通过 require 向插件注入 axios / crypto-js / qs / he / dayjs /
+  // big-integer 等常用库。第三方插件几乎都依赖它们，缺一个就整包不可用。
+  // 这里提供行为等价的精简实现，未覆盖的 API 会显式报错，便于定位。
+  var packages = {};
+  g.__mf_packages = packages;
+
+  function toBytes(text) {
+    return Array.prototype.slice.call(utf8Encode(String(text)));
+  }
+
+  function bytesToHex(bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i++) {
+      var part = bytes[i].toString(16);
+      out += part.length === 1 ? '0' + part : part;
+    }
+    return out;
+  }
+
+  function hexToBytes(text) {
+    var out = [];
+    for (var i = 0; i < text.length; i += 2) out.push(parseInt(text.substr(i, 2), 16));
+    return out;
+  }
+
+  // ── MD5 ──
+  function md5Hex(message) {
+    var S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+             5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+             4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+             6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+    var K = [];
+    for (var k = 0; k < 64; k++) K[k] = Math.floor(Math.abs(Math.sin(k + 1)) * 4294967296) >>> 0;
+
+    var bytes = toBytes(message);
+    var bitLength = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    var high = Math.floor(bitLength / 4294967296);
+    var low = bitLength >>> 0;
+    for (var i = 0; i < 4; i++) bytes.push((low >>> (i * 8)) & 0xff);
+    for (var i2 = 0; i2 < 4; i2++) bytes.push((high >>> (i2 * 8)) & 0xff);
+
+    var state = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    for (var offset = 0; offset < bytes.length; offset += 64) {
+      var words = [];
+      for (var w = 0; w < 16; w++) {
+        words[w] = (bytes[offset + w * 4] | (bytes[offset + w * 4 + 1] << 8) |
+          (bytes[offset + w * 4 + 2] << 16) | (bytes[offset + w * 4 + 3] << 24)) >>> 0;
+      }
+      var a = state[0], b = state[1], c = state[2], d = state[3];
+      for (var step = 0; step < 64; step++) {
+        var f, g;
+        if (step < 16) { f = (b & c) | (~b & d); g = step; }
+        else if (step < 32) { f = (d & b) | (~d & c); g = (5 * step + 1) % 16; }
+        else if (step < 48) { f = b ^ c ^ d; g = (3 * step + 5) % 16; }
+        else { f = c ^ (b | ~d); g = (7 * step) % 16; }
+        f = (f + a + K[step] + words[g]) >>> 0;
+        a = d;
+        d = c;
+        c = b;
+        var rotate = S[step];
+        b = (b + ((f << rotate) | (f >>> (32 - rotate)))) >>> 0;
+      }
+      state[0] = (state[0] + a) >>> 0;
+      state[1] = (state[1] + b) >>> 0;
+      state[2] = (state[2] + c) >>> 0;
+      state[3] = (state[3] + d) >>> 0;
+    }
+
+    var result = '';
+    for (var index = 0; index < 4; index++) {
+      for (var byteIndex = 0; byteIndex < 4; byteIndex++) {
+        result += ((state[index] >>> (byteIndex * 8)) & 0xff).toString(16).padStart(2, '0');
+      }
+    }
+    return result;
+  }
+
+  var SHA256_K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+
+  function sha256Hex(message) {
+    return sha256HexBytes(toBytes(message));
+  }
+
+  /// 对原始字节做 SHA-256（HMAC 需要对二进制拼接结果求哈希）。
+  function sha256HexBytes(input) {
+    var bytes = input.slice();
+    var bitLength = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    var high = Math.floor(bitLength / 4294967296);
+    var low = bitLength >>> 0;
+    bytes.push((high >>> 24) & 0xff, (high >>> 16) & 0xff, (high >>> 8) & 0xff, high & 0xff);
+    bytes.push((low >>> 24) & 0xff, (low >>> 16) & 0xff, (low >>> 8) & 0xff, low & 0xff);
+
+    var hash = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var words = new Array(64);
+
+    function rotr(value, bits) {
+      return (value >>> bits) | (value << (32 - bits));
+    }
+
+    for (var offset = 0; offset < bytes.length; offset += 64) {
+      for (var i = 0; i < 16; i++) {
+        words[i] = ((bytes[offset + i * 4] << 24) | (bytes[offset + i * 4 + 1] << 16) |
+          (bytes[offset + i * 4 + 2] << 8) | bytes[offset + i * 4 + 3]) >>> 0;
+      }
+      for (var j = 16; j < 64; j++) {
+        var s0 = rotr(words[j - 15], 7) ^ rotr(words[j - 15], 18) ^ (words[j - 15] >>> 3);
+        var s1 = rotr(words[j - 2], 17) ^ rotr(words[j - 2], 19) ^ (words[j - 2] >>> 10);
+        words[j] = (words[j - 16] + s0 + words[j - 7] + s1) >>> 0;
+      }
+      var a = hash[0], b = hash[1], c = hash[2], d = hash[3];
+      var e = hash[4], f = hash[5], g = hash[6], h = hash[7];
+      for (var step = 0; step < 64; step++) {
+        var big1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        var choose = (e & f) ^ (~e & g);
+        var temp1 = (h + big1 + choose + SHA256_K[step] + words[step]) >>> 0;
+        var big0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        var majority = (a & b) ^ (a & c) ^ (b & c);
+        var temp2 = (big0 + majority) >>> 0;
+        h = g;
+        g = f;
+        f = e;
+        e = (d + temp1) >>> 0;
+        d = c;
+        c = b;
+        b = a;
+        a = (temp1 + temp2) >>> 0;
+      }
+      hash[0] = (hash[0] + a) >>> 0;
+      hash[1] = (hash[1] + b) >>> 0;
+      hash[2] = (hash[2] + c) >>> 0;
+      hash[3] = (hash[3] + d) >>> 0;
+      hash[4] = (hash[4] + e) >>> 0;
+      hash[5] = (hash[5] + f) >>> 0;
+      hash[6] = (hash[6] + g) >>> 0;
+      hash[7] = (hash[7] + h) >>> 0;
+    }
+
+    var result = '';
+    for (var index = 0; index < 8; index++) {
+      result += hash[index].toString(16).padStart(8, '0');
+    }
+    return result;
+  }
+
+  function hmacSha256Hex(message, key) {
+    var keyBytes = toBytes(key);
+    if (keyBytes.length > 64) keyBytes = hexToBytes(sha256Hex(key));
+    while (keyBytes.length < 64) keyBytes.push(0);
+    var inner = [], outer = [];
+    for (var i = 0; i < 64; i++) {
+      inner.push(keyBytes[i] ^ 0x36);
+      outer.push(keyBytes[i] ^ 0x5c);
+    }
+    var innerHash = hexToBytes(sha256HexBytes(inner.concat(toBytes(message))));
+    return sha256HexBytes(outer.concat(innerHash));
+  }
+
+  // ── crypto-js ──
+  function makeWordArray(bytes) {
+    return {
+      _bytes: bytes,
+      toString: function (encoder) {
+        if (encoder && typeof encoder.stringify === 'function') return encoder.stringify(this);
+        return bytesToHex(bytes);
+      }
+    };
+  }
+
+  function buildCryptoJs() {
+    var Utf8 = {
+      stringify: function (wordArray) { return utf8Decode(new Uint8Array(wordArray._bytes)); },
+      parse: function (text) { return makeWordArray(toBytes(text)); }
+    };
+    var Hex = {
+      stringify: function (wordArray) { return bytesToHex(wordArray._bytes); },
+      parse: function (text) { return makeWordArray(hexToBytes(text)); }
+    };
+    var Base64 = {
+      stringify: function (wordArray) { return base64Encode(new Uint8Array(wordArray._bytes)); },
+      parse: function (text) { return makeWordArray(Array.prototype.slice.call(base64Decode(text))); }
+    };
+    function unsupported(name) {
+      return function () {
+        throw new Error('crypto-js.' + name + ' 暂未实现, 请把该插件的用法反馈给开发者');
+      };
+    }
+    return {
+      MD5: function (message) { return makeWordArray(hexToBytes(md5Hex(message))); },
+      SHA256: function (message) { return makeWordArray(hexToBytes(sha256Hex(message))); },
+      HmacSHA256: function (message, key) { return makeWordArray(hexToBytes(hmacSha256Hex(message, key))); },
+      AES: { encrypt: unsupported('AES'), decrypt: unsupported('AES') },
+      enc: { Utf8: Utf8, Latin1: Utf8, Hex: Hex, Base64: Base64 },
+      lib: { WordArray: { create: function () { return makeWordArray([]); } } },
+      mode: { CBC: 1, ECB: 2 },
+      pad: { Pkcs7: 1 }
+    };
+  }
+
+  // ── qs ──
+  function buildQs() {
+    function stringify(obj) {
+      var parts = [];
+      function add(key, value) {
+        if (value === undefined || value === null) return;
+        if (Array.isArray(value)) {
+          for (var i = 0; i < value.length; i++) add(key + '[]', value[i]);
+        } else if (typeof value === 'object') {
+          for (var sub in value) add(key + '[' + sub + ']', value[sub]);
+        } else {
+          parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(value)));
+        }
+      }
+      for (var key in (obj || {})) add(key, obj[key]);
+      return parts.join('&');
+    }
+    function parse(text) {
+      var out = {};
+      var source = String(text || '').replace(/^\?/, '');
+      if (!source) return out;
+      source.split('&').forEach(function (pair) {
+        if (!pair) return;
+        var index = pair.indexOf('=');
+        var rawKey = index >= 0 ? pair.slice(0, index) : pair;
+        var rawValue = index >= 0 ? pair.slice(index + 1) : '';
+        var key, value;
+        try { key = decodeURIComponent(rawKey.replace(/\+/g, ' ')); } catch (e) { key = rawKey; }
+        try { value = decodeURIComponent(rawValue.replace(/\+/g, ' ')); } catch (e) { value = rawValue; }
+        if (!(key in out)) out[key] = value;
+        else if (Array.isArray(out[key])) out[key].push(value);
+        else out[key] = [out[key], value];
+      });
+      return out;
+    }
+    return { stringify: stringify, parse: parse, encode: stringify, decode: parse };
+  }
+
+  // ── he ──
+  var HTML_ENTITIES = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0',
+    copy: '\u00a9', reg: '\u00ae', hellip: '\u2026', mdash: '\u2014', ndash: '\u2013',
+    middot: '\u00b7', times: '\u00d7', divide: '\u00f7'
+  };
+  function heDecode(text) {
+    return String(text).replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, function (match, entity) {
+      if (entity.charAt(0) === '#') {
+        var code = entity.charAt(1).toLowerCase() === 'x'
+          ? parseInt(entity.slice(2), 16)
+          : parseInt(entity.slice(1), 10);
+        return isNaN(code) ? match : String.fromCodePoint(code);
+      }
+      return Object.prototype.hasOwnProperty.call(HTML_ENTITIES, entity) ? HTML_ENTITIES[entity] : match;
+    });
+  }
+  function heEncode(text) {
+    return String(text).replace(/[&<>"']/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+    });
+  }
+
+  // ── dayjs ──
+  function buildDayjs() {
+    function pad(value, length) {
+      var text = String(value);
+      while (text.length < length) text = '0' + text;
+      return text;
+    }
+    function Dayjs(value) {
+      if (value instanceof Dayjs) this.$d = new Date(value.$d.getTime());
+      else if (value === undefined || value === null) this.$d = new Date();
+      else this.$d = new Date(value);
+    }
+    Dayjs.prototype.valueOf = function () { return this.$d.getTime(); };
+    Dayjs.prototype.unix = function () { return Math.floor(this.$d.getTime() / 1000); };
+    Dayjs.prototype.toDate = function () { return this.$d; };
+    Dayjs.prototype.isValid = function () { return !isNaN(this.$d.getTime()); };
+    Dayjs.prototype.clone = function () { return new Dayjs(this.$d); };
+    Dayjs.prototype.format = function (pattern) {
+      var d = this.$d;
+      var map = {
+        YYYY: String(d.getFullYear()), YY: pad(d.getFullYear() % 100, 2),
+        MM: pad(d.getMonth() + 1, 2), M: String(d.getMonth() + 1),
+        DD: pad(d.getDate(), 2), D: String(d.getDate()),
+        HH: pad(d.getHours(), 2), H: String(d.getHours()),
+        mm: pad(d.getMinutes(), 2), m: String(d.getMinutes()),
+        ss: pad(d.getSeconds(), 2), s: String(d.getSeconds()),
+        SSS: pad(d.getMilliseconds(), 3)
+      };
+      return String(pattern || 'YYYY-MM-DDTHH:mm:ss').replace(/YYYY|YY|MM|DD|HH|mm|ss|SSS|M|D|H|m|s/g, function (token) {
+        return map[token];
+      });
+    };
+    Dayjs.prototype.add = function (amount, unit) {
+      var d = new Date(this.$d.getTime());
+      if (unit === 'day' || unit === 'd') d.setDate(d.getDate() + amount);
+      else if (unit === 'month' || unit === 'M') d.setMonth(d.getMonth() + amount);
+      else if (unit === 'year' || unit === 'y') d.setFullYear(d.getFullYear() + amount);
+      else d.setSeconds(d.getSeconds() + amount);
+      return new Dayjs(d);
+    };
+    Dayjs.prototype.subtract = function (amount, unit) { return this.add(-amount, unit); };
+    function dayjs(value) { return new Dayjs(value); }
+    dayjs.unix = function (seconds) { return new Dayjs(seconds * 1000); };
+    dayjs.extend = function () { return dayjs; };
+    dayjs.locale = function () { return dayjs; };
+    return dayjs;
+  }
+
+  // ── big-integer ──
+  function buildBigInteger() {
+    function toBig(value) {
+      if (value && typeof value === 'object' && typeof value.__big === 'bigint') return value.__big;
+      if (typeof value === 'bigint') return value;
+      var text = String(value).split('.')[0];
+      if (!text) return BigInt(0);
+      return BigInt(text);
+    }
+    function wrap(value) {
+      return {
+        __big: value,
+        add: function (other) { return wrap(value + toBig(other)); },
+        plus: function (other) { return wrap(value + toBig(other)); },
+        subtract: function (other) { return wrap(value - toBig(other)); },
+        minus: function (other) { return wrap(value - toBig(other)); },
+        multiply: function (other) { return wrap(value * toBig(other)); },
+        times: function (other) { return wrap(value * toBig(other)); },
+        divide: function (other) { return wrap(value / toBig(other)); },
+        mod: function (other) { return wrap(value % toBig(other)); },
+        modPow: function (exp, mod) {
+          var e = toBig(exp), m = toBig(mod);
+          var result = BigInt(1), base = value % m, zero = BigInt(0), two = BigInt(2);
+          while (e > zero) {
+            if (e % two === BigInt(1)) result = (result * base) % m;
+            base = (base * base) % m;
+            e = e / two;
+          }
+          return wrap(result);
+        },
+        pow: function (exp) { return wrap(value ** toBig(exp)); },
+        compare: function (other) {
+          var target = toBig(other);
+          return value < target ? -1 : value > target ? 1 : 0;
+        },
+        equals: function (other) { return value === toBig(other); },
+        greater: function (other) { return value > toBig(other); },
+        lesser: function (other) { return value < toBig(other); },
+        isZero: function () { return value === BigInt(0); },
+        isNegative: function () { return value < BigInt(0); },
+        toString: function (radix) { return value.toString(radix || 10); },
+        toJSNumber: function () { return Number(value); },
+        valueOf: function () { return Number(value); }
+      };
+    }
+    function bigInt(value) { return wrap(toBig(value === undefined ? 0 : value)); }
+    bigInt.zero = bigInt(0);
+    bigInt.one = bigInt(1);
+    return bigInt;
+  }
+
+  // ── axios（基于同步 HTTP 桥）──
+  function buildAxios(initialDefaults) {
+    var defaults = initialDefaults || {
+      headers: {},
+      timeout: 0,
+      validateStatus: function (status) { return status >= 200 && status < 300; }
+    };
+    if (!defaults.headers) defaults.headers = {};
+
+    function mergeHeaders(target, source) {
+      if (!source) return target;
+      for (var key in source) {
+        if (key === 'common' || key === 'get' || key === 'post' || key === 'put' ||
+            key === 'patch' || key === 'delete' || key === 'head' || key === 'options') {
+          var nested = source[key];
+          if (nested && typeof nested === 'object') mergeHeaders(target, nested);
+          continue;
+        }
+        if (key === 'toJSON' || key === 'set' || key === 'get' || key === 'has' ||
+            key === 'delete' || key === 'clear') {
+          if (typeof source[key] === 'function') continue;
+        }
+        var value = source[key];
+        if (value === undefined || value === null) continue;
+        if (typeof value === 'object' && typeof value.toString === 'function' && !Array.isArray(value)) {
+          target[key] = String(value);
+        } else {
+          target[key] = String(value);
+        }
+      }
+      return target;
+    }
+
+    function queryString(params) {
+      if (!params) return '';
+      if (typeof params === 'string') return params;
+      var parts = [];
+      for (var key in params) {
+        var value = params[key];
+        if (value === undefined || value === null) continue;
+        if (Array.isArray(value)) {
+          for (var i = 0; i < value.length; i++) {
+            parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(value[i])));
+          }
+        } else {
+          parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(value)));
+        }
+      }
+      return parts.join('&');
+    }
+
+    function buildUrl(config) {
+      var url = String(config.url || '');
+      if (config.baseURL && url.indexOf('http') !== 0) {
+        url = String(config.baseURL).replace(/\/+$/, '') + '/' + url.replace(/^\/+/, '');
+      }
+      var query = queryString(config.params);
+      if (query) url += (url.indexOf('?') >= 0 ? '&' : '?') + query;
+      return url;
+    }
+
+    function makeError(message, config, response) {
+      var error = new Error(message);
+      error.config = config;
+      error.response = response;
+      error.isAxiosError = true;
+      error.code = response ? 'ERR_BAD_RESPONSE' : 'ERR_NETWORK';
+      return error;
+    }
+
+    function doRequest(config) {
+      config = config || {};
+      var url = buildUrl(config);
+      var method = String(config.method || 'GET').toUpperCase();
+      var headers = mergeHeaders({}, defaults.headers);
+      mergeHeaders(headers, config.headers);
+      var body = config.data;
+      if (body !== undefined && body !== null && typeof body !== 'string') {
+        if (typeof body === 'object') {
+          body = JSON.stringify(body);
+          if (!headers['Content-Type'] && !headers['content-type']) {
+            headers['Content-Type'] = 'application/json';
+          }
+        } else {
+          body = String(body);
+        }
+      }
+      var responseType = config.responseType || defaults.responseType || 'json';
+      return new Promise(function (resolve, reject) {
+        var raw = request({
+          url: url,
+          method: method,
+          headers: headers,
+          body: body === null || body === undefined ? null : String(body)
+        });
+        if (raw.error) {
+          reject(makeError(raw.error, config, null));
+          return;
+        }
+        var data = raw.body === undefined || raw.body === null ? '' : String(raw.body);
+        if (responseType === 'arraybuffer') {
+          data = utf8Encode(data).buffer;
+        } else if (responseType !== 'text' && data) {
+          try { data = JSON.parse(data); } catch (e) { /* 不是 JSON 就保留原文 */ }
+        }
+        var response = {
+          data: data,
+          status: raw.status,
+          statusText: '',
+          headers: lowerHeaders(raw.headers),
+          config: config,
+          // 浏览器版 axios 在响应上挂着 XHR 实例，插件常用 request.responseURL
+          // 读取重定向后的最终地址；缺了它会让插件把成功的源判成失败。
+          request: {
+            responseURL: raw.url || url,
+            status: raw.status,
+            responseText: typeof data === 'string' ? data : ''
+          }
+        };
+        var validate = config.validateStatus || defaults.validateStatus;
+        if (validate(raw.status)) resolve(response);
+        else reject(makeError('Request failed with status code ' + raw.status, config, response));
+      });
+    }
+
+    function withMethod(method) {
+      return function (url, config) {
+        var merged = {};
+        if (config) for (var key in config) merged[key] = config[key];
+        merged.url = url;
+        merged.method = method;
+        return doRequest(merged);
+      };
+    }
+
+    function withBody(method) {
+      return function (url, data, config) {
+        var merged = {};
+        if (config) for (var key in config) merged[key] = config[key];
+        merged.url = url;
+        merged.method = method;
+        merged.data = data;
+        return doRequest(merged);
+      };
+    }
+
+    var axios = function (config) { return doRequest(config); };
+    axios.request = doRequest;
+    axios.get = withMethod('GET');
+    axios.delete = withMethod('DELETE');
+    axios.head = withMethod('HEAD');
+    axios.options = withMethod('OPTIONS');
+    axios.post = withBody('POST');
+    axios.put = withBody('PUT');
+    axios.patch = withBody('PATCH');
+    axios.defaults = defaults;
+    axios.interceptors = {
+      request: { use: function () { return 0; }, eject: noop, clear: noop },
+      response: { use: function () { return 0; }, eject: noop, clear: noop }
+    };
+    axios.create = function (config) {
+      var merged = {};
+      for (var key in defaults) merged[key] = defaults[key];
+      merged.headers = mergeHeaders({}, defaults.headers);
+      if (config) {
+        for (var option in config) {
+          if (option === 'headers') mergeHeaders(merged.headers, config.headers);
+          else merged[option] = config[option];
+        }
+      }
+      return buildAxios(merged);
+    };
+    axios.all = function (list) { return Promise.all(list); };
+    axios.spread = function (fn) {
+      return function (values) { return fn.apply(null, values); };
+    };
+    axios.isAxiosError = function (error) { return !!(error && error.isAxiosError); };
+    axios.default = axios;
+    return axios;
+  }
+
+  packages['axios'] = buildAxios(null);
+  packages['crypto-js'] = buildCryptoJs();
+  packages['qs'] = buildQs();
+  packages['he'] = { decode: heDecode, encode: heEncode, escape: heEncode, unescape: heDecode };
+  packages['dayjs'] = buildDayjs();
+  packages['big-integer'] = buildBigInteger();
+
+  // Node 内置模块仍然不提供；MusicFree 注入的常用包已经就绪。
   g.require = function (name) {
+    var pkg = packages[name];
+    if (pkg) {
+      if (!pkg.default) pkg.default = pkg;
+      return pkg;
+    }
     throw new Error('require is not available: ' + name);
   };
 
@@ -338,3 +915,94 @@ pub const PRELUDE: &str = r##"
   };
 })();
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rquickjs::context::EvalOptions;
+    use rquickjs::{Context, Runtime};
+
+    /// 在 shim 环境里执行一段脚本，返回其字符串结果。
+    fn eval(script: &str) -> String {
+        let runtime = Runtime::new().expect("runtime");
+        let context = Context::full(&runtime).expect("context");
+        context.with(|ctx| {
+            let mut options = EvalOptions::default();
+            options.strict = false;
+            let source = format!("{PRELUDE}\n{script}");
+            ctx.eval_with_options::<String, _>(source.as_bytes(), options)
+                .expect("eval")
+        })
+    }
+
+    #[test]
+    fn crypto_matches_known_vectors() {
+        let result = eval(
+            r#"
+            var C = require('crypto-js');
+            JSON.stringify({
+              md5: C.MD5('abc').toString(),
+              sha: C.SHA256('abc').toString(),
+              hmac: C.HmacSHA256('abc', 'key').toString(),
+              b64: C.enc.Base64.stringify(C.enc.Utf8.parse('中文abc'))
+            });
+            "#,
+        );
+        assert!(result.contains("900150983cd24fb0d6963f7d28e17f72"), "{result}");
+        assert!(
+            result.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            "{result}"
+        );
+        assert!(
+            result.contains("9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab"),
+            "{result}"
+        );
+        assert!(result.contains("5Lit5paHYWJj"), "{result}");
+    }
+
+    #[test]
+    fn helper_packages_cover_common_usage() {
+        let result = eval(
+            r#"
+            var qs = require('qs');
+            var he = require('he');
+            var dayjs = require('dayjs');
+            var bigInt = require('big-integer');
+            JSON.stringify({
+              qs: qs.stringify({ a: 1, b: [2, 3] }),
+              parsed: qs.parse('x=1&y=2'),
+              entity: he.decode('a&amp;b&lt;c'),
+              date: dayjs.unix(1700000000).format('YYYY-MM-DD HH:mm:ss'),
+              big: bigInt('9007199254740993').add(1).toString()
+            });
+            "#,
+        );
+        assert!(result.contains("a=1&b%5B%5D=2&b%5B%5D=3"), "{result}");
+        assert!(result.contains("\"y\":\"2\""), "{result}");
+        assert!(result.contains("a&b<c"), "{result}");
+        assert!(result.contains("2023-11-1"), "{result}");
+        assert!(result.contains("9007199254740994"), "{result}");
+    }
+
+    #[test]
+    fn axios_exposes_the_common_surface() {
+        // 只验证 API 形状；真实请求由集成测试覆盖。
+        let result = eval(
+            r#"
+            var axios = require('axios');
+            var instance = axios.create({ baseURL: 'https://example.com' });
+            JSON.stringify({
+              hasGet: typeof axios.get === 'function',
+              hasPost: typeof axios.post === 'function',
+              hasRequest: typeof instance.request === 'function',
+              hasInterceptors: typeof axios.interceptors.response.use === 'function',
+              baseURL: instance.getUri ? instance.getUri() : instance.defaults.baseURL
+            });
+            "#,
+        );
+        assert!(result.contains("\"hasGet\":true"), "{result}");
+        assert!(result.contains("\"hasPost\":true"), "{result}");
+        assert!(result.contains("\"hasRequest\":true"), "{result}");
+        assert!(result.contains("\"hasInterceptors\":true"), "{result}");
+    }
+}

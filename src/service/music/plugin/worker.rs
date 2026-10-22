@@ -228,8 +228,33 @@ globalThis.__mf_result = undefined;
                 options.strict = false;
                 ctx.eval_with_options::<(), _>(script.as_bytes(), options)?;
 
-                for _ in 0..MAX_PENDING_JOBS {
-                    if !ctx.execute_pending_job() {
+                // 先驱动微任务；微任务耗尽但结果还没出来时，逐个执行插件登记的
+                // 定时器回调（超时竞争、重试延迟等），再继续驱动微任务。
+                let mut steps = 0usize;
+                'drive: loop {
+                    let mut progressed = false;
+                    while ctx.execute_pending_job() {
+                        progressed = true;
+                        steps += 1;
+                        if steps >= MAX_PENDING_JOBS * 2 {
+                            break 'drive;
+                        }
+                    }
+                    if ctx
+                        .globals()
+                        .get::<_, Option<String>>("__mf_result")?
+                        .is_some()
+                    {
+                        break;
+                    }
+                    let ran_timer: bool = ctx
+                        .eval("globalThis.__mf_run_timer ? globalThis.__mf_run_timer() : false")
+                        .unwrap_or(false);
+                    steps += 1;
+                    if !ran_timer && !progressed {
+                        break;
+                    }
+                    if steps >= MAX_PENDING_JOBS * 2 {
                         break;
                     }
                 }
