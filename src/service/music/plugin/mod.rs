@@ -20,7 +20,9 @@ use sqlx::{Row, SqlitePool};
 use crate::crawler::fetcher::{self, HttpMethod, RequestSpec};
 use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
-use crate::service::music::model::{MusicPlugin, PluginVariable};
+use crate::service::music::model::{
+    MusicPlugin, PluginInstallResult, PluginSubscription, PluginVariable,
+};
 
 use self::manifest::parse_manifest;
 use self::worker::PluginWorker;
@@ -54,8 +56,8 @@ impl PluginRegistry {
 
     pub async fn list(&self) -> Result<Vec<MusicPlugin>, AppError> {
         let rows = sqlx::query(
-            "SELECT platform, name, version, author, src_url, file_path, enabled, created_at, updated_at
-             FROM music_plugin ORDER BY created_at ASC",
+            "SELECT platform, name, version, author, src_url, file_path, enabled, description, created_at, updated_at
+             FROM music_plugin ORDER BY sort_order ASC, created_at ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -64,7 +66,7 @@ impl PluginRegistry {
 
     pub async fn get(&self, platform: &str) -> Result<Option<MusicPlugin>, AppError> {
         let row = sqlx::query(
-            "SELECT platform, name, version, author, src_url, file_path, enabled, created_at, updated_at
+            "SELECT platform, name, version, author, src_url, file_path, enabled, description, created_at, updated_at
              FROM music_plugin WHERE platform = ?1",
         )
         .bind(platform)
@@ -150,14 +152,33 @@ impl PluginRegistry {
         source: &str,
         original_name: Option<&str>,
     ) -> Result<MusicPlugin, AppError> {
-        let manifest = parse_manifest(source)?;
+        self.install_with_fallback(source, original_name, None).await
+    }
+
+    /// `fallback_src_url` 用于按 URL 安装：插件本身没写 `srcUrl` 时用下载地址补齐，
+    /// 否则装完就永远没有可更新的源。
+    async fn install_with_fallback(
+        &self,
+        source: &str,
+        original_name: Option<&str>,
+        fallback_src_url: Option<&str>,
+    ) -> Result<MusicPlugin, AppError> {
+        let mut manifest = parse_manifest(source)?;
+        if manifest.src_url.is_empty() {
+            manifest.src_url = fallback_src_url.unwrap_or("").trim().to_string();
+        }
         let existing = self.get(&manifest.platform).await?;
         if let Some(current) = &existing {
-            if version_cmp(&manifest.version, &current.version) <= 0 {
+            // 与 MusicFree 一致: 只拒绝降级, 同版本允许覆盖安装(便于修复损坏的脚本)。
+            if version_cmp(&manifest.version, &current.version) < 0 {
                 return Err(AppError::BadRequest(format!(
-                    "已安装相同或更高版本的插件（{} {}）",
+                    "已安装更新版本的插件（{} {}）",
                     current.platform, current.version
                 )));
+            }
+            // 本地重装同版本时插件源码可能没写 srcUrl, 不应丢掉原有的更新地址。
+            if manifest.src_url.is_empty() {
+                manifest.src_url = current.src_url.clone();
             }
         }
 
@@ -191,8 +212,10 @@ impl PluginRegistry {
 
         sqlx::query(
             "INSERT INTO music_plugin
-               (platform, name, version, author, src_url, file_path, enabled, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)
+               (platform, name, version, author, src_url, file_path, enabled, description,
+                sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7,
+               COALESCE((SELECT MAX(sort_order) + 1 FROM music_plugin), 0), ?8, ?9)
              ON CONFLICT(platform) DO UPDATE SET
                name = excluded.name,
                version = excluded.version,
@@ -200,6 +223,7 @@ impl PluginRegistry {
                src_url = excluded.src_url,
                file_path = excluded.file_path,
                enabled = 1,
+               description = excluded.description,
                updated_at = excluded.updated_at",
         )
         .bind(&manifest.platform)
@@ -208,6 +232,7 @@ impl PluginRegistry {
         .bind(&manifest.author)
         .bind(&manifest.src_url)
         .bind(&path_text)
+        .bind(&manifest.description)
         .bind(created_at)
         .bind(now)
         .execute(&self.pool)
@@ -224,6 +249,7 @@ impl PluginRegistry {
             src_url: manifest.src_url,
             file_path: path_text,
             enabled: true,
+            description: manifest.description,
             created_at,
             updated_at: now,
         })
@@ -368,7 +394,7 @@ impl PluginRegistry {
             )));
         }
         let source = response.body;
-        let manifest = parse_manifest(&source)?;
+        let mut manifest = parse_manifest(&source)?;
         // 防止 srcUrl 指向别的插件，覆盖掉当前插件。
         if manifest.platform != platform {
             return Err(AppError::BadRequest(format!(
@@ -376,11 +402,16 @@ impl PluginRegistry {
                 manifest.platform
             )));
         }
+        // 更新文件没写 srcUrl 时沿用旧地址，避免下次无法更新。
+        if manifest.src_url.is_empty() {
+            manifest.src_url = current.src_url.clone();
+        }
         std::fs::write(&current.file_path, &source)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("写入插件文件失败: {e}")))?;
         let now = chrono::Utc::now().timestamp_millis();
         sqlx::query(
-            "UPDATE music_plugin SET name = ?2, version = ?3, author = ?4, src_url = ?5, updated_at = ?6
+            "UPDATE music_plugin SET name = ?2, version = ?3, author = ?4, src_url = ?5,
+               description = ?6, updated_at = ?7
              WHERE platform = ?1",
         )
         .bind(platform)
@@ -388,6 +419,7 @@ impl PluginRegistry {
         .bind(&manifest.version)
         .bind(&manifest.author)
         .bind(&manifest.src_url)
+        .bind(&manifest.description)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -411,6 +443,259 @@ impl PluginRegistry {
             }
         }
         Ok((updated, failures))
+    }
+
+    /// 卸载全部插件（保留订阅源，与 MusicFree 一致）。
+    pub async fn uninstall_all(&self) -> Result<u64, AppError> {
+        let plugins = self.list().await?;
+        for plugin in &plugins {
+            self.drop_worker(&plugin.platform);
+            if !plugin.file_path.is_empty() {
+                let _ = std::fs::remove_file(&plugin.file_path);
+            }
+        }
+        let result = sqlx::query("DELETE FROM music_plugin")
+            .execute(&self.pool)
+            .await?;
+        let _ = sqlx::query("DELETE FROM music_plugin_variable")
+            .execute(&self.pool)
+            .await;
+        Ok(result.rows_affected())
+    }
+
+    /// 按传入顺序重写 `sort_order`（未列出的插件排在其后）。
+    pub async fn reorder(&self, platforms: &[String]) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        for (index, platform) in platforms.iter().enumerate() {
+            sqlx::query("UPDATE music_plugin SET sort_order = ?2 WHERE platform = ?1")
+                .bind(platform)
+                .bind(index as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 按 URL 安装。输入可以是单个 `.js` 直链，也可以是 `.json` 订阅清单。
+    ///
+    /// 与 MusicFree 一致：失败不中断后续地址，逐条返回结果，由前端汇总展示。
+    pub async fn install_from_urls(
+        &self,
+        input: &str,
+    ) -> Result<Vec<PluginInstallResult>, AppError> {
+        let urls = self.resolve_plugin_urls(input).await?;
+        let mut results = Vec::with_capacity(urls.len());
+        for url in urls {
+            results.push(self.install_from_url(&url).await);
+        }
+        Ok(results)
+    }
+
+    /// 安装单个地址；失败写进结果而不是抛错。
+    pub async fn install_from_url(&self, url: &str) -> PluginInstallResult {
+        let mut result = PluginInstallResult {
+            url: url.to_string(),
+            ..Default::default()
+        };
+        match self.try_install_from_url(url).await {
+            Ok(plugin) => {
+                result.success = true;
+                result.platform = plugin.platform;
+                result.name = plugin.name;
+                result.version = plugin.version;
+            }
+            Err(err) => result.error = err.to_string(),
+        }
+        result
+    }
+
+    async fn try_install_from_url(&self, url: &str) -> Result<MusicPlugin, AppError> {
+        let source = self.fetch_plugin_source(url).await?;
+        self.install_with_fallback(&source, None, Some(url)).await
+    }
+
+    /// 把输入解析成待安装地址列表：`.json` 订阅清单展开成多个 URL。
+    async fn resolve_plugin_urls(&self, input: &str) -> Result<Vec<String>, AppError> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(AppError::BadRequest("请输入插件地址".to_string()));
+        }
+        let lower = input.to_ascii_lowercase();
+        if !(lower.ends_with(".json") || lower.contains(".json?")) {
+            return Ok(vec![input.to_string()]);
+        }
+
+        let body = self.fetch_plugin_source(input).await?;
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| AppError::BadRequest("订阅清单不是有效的 JSON".to_string()))?;
+        let list = value
+            .get("plugins")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| value.as_array())
+            .or_else(|| value.get("urls").and_then(serde_json::Value::as_array))
+            .ok_or_else(|| {
+                AppError::BadRequest("订阅清单格式无效，应为 {plugins:[{url}]}".to_string())
+            })?;
+
+        let mut urls: Vec<String> = Vec::new();
+        for item in list {
+            let url = match item {
+                serde_json::Value::String(text) => text.trim().to_string(),
+                other => other
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            };
+            if !url.is_empty() && !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        if urls.is_empty() {
+            return Err(AppError::BadRequest(
+                "订阅清单里没有可用的插件地址".to_string(),
+            ));
+        }
+        Ok(urls)
+    }
+
+    /// 下载插件脚本。显式禁用缓存，避免拿到 CDN 上的旧版本。
+    async fn fetch_plugin_source(&self, url: &str) -> Result<String, AppError> {
+        let spec = RequestSpec {
+            url: url.to_string(),
+            method: HttpMethod::GET,
+            retry: 1,
+            timeout: Some(Duration::from_secs(30)),
+            headers: vec![
+                ("Cache-Control".to_string(), "no-cache".to_string()),
+                ("Pragma".to_string(), "no-cache".to_string()),
+            ],
+            ..Default::default()
+        };
+        let response = fetcher::fetch(&self.http, spec)
+            .await
+            .map_err(|e| AppError::BadRequest(format!("下载插件失败: {e}")))?;
+        if response.status == 404 {
+            return Err(AppError::BadRequest(
+                "插件不存在，请联系插件作者".to_string(),
+            ));
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(AppError::BadRequest(format!(
+                "下载插件失败（HTTP {}）",
+                response.status
+            )));
+        }
+        Ok(response.body)
+    }
+
+    /// 订阅源列表（按添加顺序）。
+    pub async fn subscriptions(&self) -> Result<Vec<PluginSubscription>, AppError> {
+        let rows = sqlx::query(
+            "SELECT id, name, url, created_at FROM music_plugin_subscription
+             WHERE user_ns = 'default' ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PluginSubscription {
+                id: row.get("id"),
+                name: row.get("name"),
+                url: row.get("url"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// 新增订阅源。地址必须是 `.js` 或 `.json`（与 MusicFree 的订阅校验一致）。
+    pub async fn add_subscription(
+        &self,
+        name: &str,
+        url: &str,
+    ) -> Result<PluginSubscription, AppError> {
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(AppError::BadRequest("请输入订阅地址".to_string()));
+        }
+        let lower = url.to_ascii_lowercase();
+        if !(lower.ends_with(".js") || lower.ends_with(".json")) {
+            return Err(AppError::BadRequest(
+                "订阅地址必须以 .js 或 .json 结尾".to_string(),
+            ));
+        }
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM music_plugin_subscription WHERE url = ?1")
+                .bind(url)
+                .fetch_optional(&self.pool)
+                .await?;
+        if existing.is_some() {
+            return Err(AppError::BadRequest("该订阅地址已存在".to_string()));
+        }
+        let name = if name.trim().is_empty() {
+            url.rsplit('/').next().unwrap_or(url).to_string()
+        } else {
+            name.trim().to_string()
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "INSERT INTO music_plugin_subscription (user_ns, name, url, created_at)
+             VALUES ('default', ?1, ?2, ?3)",
+        )
+        .bind(&name)
+        .bind(url)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(PluginSubscription {
+            id: result.last_insert_rowid(),
+            name,
+            url: url.to_string(),
+            created_at: now,
+        })
+    }
+
+    pub async fn remove_subscription(&self, id: i64) -> Result<bool, AppError> {
+        let result = sqlx::query("DELETE FROM music_plugin_subscription WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 拉取单个订阅（`.js` 清单或 `.json` 清单都可能）。
+    pub async fn update_subscription(
+        &self,
+        id: i64,
+    ) -> Result<Vec<PluginInstallResult>, AppError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT url FROM music_plugin_subscription WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let (url,) = row.ok_or_else(|| AppError::NotFound("订阅不存在".to_string()))?;
+        self.install_from_urls(&url).await
+    }
+
+    /// 更新全部订阅源，结果合并返回。
+    pub async fn update_all_subscriptions(
+        &self,
+    ) -> Result<Vec<PluginInstallResult>, AppError> {
+        let mut results = Vec::new();
+        for subscription in self.subscriptions().await? {
+            match self.install_from_urls(&subscription.url).await {
+                Ok(mut items) => results.append(&mut items),
+                Err(err) => results.push(PluginInstallResult {
+                    url: subscription.url,
+                    success: false,
+                    error: err.to_string(),
+                    ..Default::default()
+                }),
+            }
+        }
+        Ok(results)
     }
 
     pub async fn set_enabled(&self, platform: &str, enabled: bool) -> Result<bool, AppError> {
@@ -459,6 +744,7 @@ fn row_to_plugin(row: sqlx::sqlite::SqliteRow) -> MusicPlugin {
         src_url: row.get("src_url"),
         file_path: row.get("file_path"),
         enabled: row.get::<i64, _>("enabled") != 0,
+        description: row.get("description"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -528,5 +814,141 @@ mod tests {
     fn sanitizes_platform_for_file_name() {
         assert_eq!(sanitize_file_stem("测试音源"), "plugin");
         assert_eq!(sanitize_file_stem("demo-plugin_1"), "demo-plugin_1");
+    }
+
+    async fn test_registry() -> (PluginRegistry, PathBuf) {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("open memory db");
+        sqlx::migrate!("src/storage/db/migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        let dir = std::env::temp_dir().join(format!("reader-plugin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let http = HttpClient::new(5, None).expect("http client");
+        let registry = PluginRegistry::new(pool, dir.to_str().expect("utf8 path"), http);
+        (registry, dir)
+    }
+
+    fn plugin_script(platform: &str, version: &str, src_url: &str) -> String {
+        format!(
+            r#"module.exports = {{ platform: "{platform}", name: "{platform}", version: "{version}", srcUrl: "{src_url}" }};"#
+        )
+    }
+
+    #[tokio::test]
+    async fn allows_same_version_reinstall_but_rejects_downgrade() {
+        let (registry, dir) = test_registry().await;
+        registry
+            .install(&plugin_script("demo", "1.1.0", ""), None)
+            .await
+            .expect("first install");
+        // 同版本允许覆盖安装。
+        registry
+            .install(
+                &plugin_script("demo", "1.1.0", "https://example.com/demo.js"),
+                None,
+            )
+            .await
+            .expect("reinstall same version");
+        assert_eq!(
+            registry.get("demo").await.expect("get").expect("plugin").src_url,
+            "https://example.com/demo.js"
+        );
+        // 降级被拒绝。
+        assert!(registry
+            .install(&plugin_script("demo", "1.0.0", ""), None)
+            .await
+            .is_err());
+        // 本地重装（源码没写 srcUrl）不应丢掉已有的更新地址。
+        registry
+            .install(&plugin_script("demo", "1.1.0", ""), None)
+            .await
+            .expect("reinstall local");
+        assert_eq!(
+            registry.get("demo").await.expect("get").expect("plugin").src_url,
+            "https://example.com/demo.js"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_validate_urls_and_reject_duplicates() {
+        let (registry, dir) = test_registry().await;
+        let first = registry
+            .add_subscription("测试订阅", "https://example.com/plugins.json")
+            .await
+            .expect("add subscription");
+        assert_eq!(first.name, "测试订阅");
+        assert!(registry
+            .add_subscription("", "https://example.com/plugins.json")
+            .await
+            .is_err());
+        assert!(registry
+            .add_subscription("bad", "https://example.com/plugins.zip")
+            .await
+            .is_err());
+
+        // 未填名称时用文件名兜底。
+        let second = registry
+            .add_subscription("", "https://example.com/single.js")
+            .await
+            .expect("add js subscription");
+        assert_eq!(second.name, "single.js");
+        assert_eq!(registry.subscriptions().await.expect("list").len(), 2);
+
+        assert!(registry
+            .remove_subscription(first.id)
+            .await
+            .expect("remove"));
+        assert_eq!(registry.subscriptions().await.expect("list").len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reorders_plugins_by_given_order() {
+        let (registry, dir) = test_registry().await;
+        for platform in ["a", "b", "c"] {
+            registry
+                .install(&plugin_script(platform, "1.0.0", ""), None)
+                .await
+                .expect("install");
+        }
+        registry
+            .reorder(&["c".to_string(), "a".to_string(), "b".to_string()])
+            .await
+            .expect("reorder");
+        let order: Vec<String> = registry
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|plugin| plugin.platform)
+            .collect();
+        assert_eq!(order, vec!["c", "a", "b"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn uninstall_all_removes_records_and_files() {
+        let (registry, dir) = test_registry().await;
+        for platform in ["a", "b"] {
+            registry
+                .install(&plugin_script(platform, "1.0.0", ""), None)
+                .await
+                .expect("install");
+        }
+        let files: Vec<PathBuf> = registry
+            .list()
+            .await
+            .expect("list")
+            .iter()
+            .map(|plugin| PathBuf::from(&plugin.file_path))
+            .collect();
+        assert_eq!(registry.uninstall_all().await.expect("uninstall"), 2);
+        assert!(registry.list().await.expect("list").is_empty());
+        assert!(files.iter().all(|path| !path.exists()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

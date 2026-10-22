@@ -179,6 +179,8 @@ pub struct MusicPlugin {
     pub src_url: String,
     pub file_path: String,
     pub enabled: bool,
+    /// 插件自述(支持 Markdown), 展示在插件列表的说明弹窗里。
+    pub description: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -192,8 +194,33 @@ pub struct PluginManifest {
     pub version: String,
     pub author: String,
     pub src_url: String,
+    /// 插件要求的最低宿主版本(MusicFree 的 `appVersion` 语义, 支持 semver 区间)。
+    pub app_version: String,
+    pub description: String,
     /// 插件声明支持的搜索类型, 例如 ["music", "album"]。
     pub supported_search_type: Vec<String>,
+}
+
+/// 插件订阅源: `.js` 直链或 `.json` 订阅清单。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSubscription {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub created_at: i64,
+}
+
+/// 一次按 URL 安装的结果。失败不抛错, 由前端汇总展示。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstallResult {
+    pub url: String,
+    pub success: bool,
+    pub platform: String,
+    pub name: String,
+    pub version: String,
+    pub error: String,
 }
 
 /// 插件声明需要用户填写的变量（登录 token、cookie 等）。

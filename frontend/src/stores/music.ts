@@ -1,21 +1,31 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import {
+  addMusicPluginSubscription,
   getMusicLyric,
   getMusicMediaSource,
+  getMusicPluginSubscriptions,
   getMusicPlugins,
   installMusicPlugin,
+  installMusicPluginFromUrl,
+  removeMusicPluginSubscription,
+  reorderMusicPlugins,
   searchMusic,
   searchMusicCollections,
   setMusicPluginEnabled,
+  uninstallAllMusicPlugins,
   uninstallMusicPlugin,
+  updateAllMusicPluginSubscriptions,
   updateAllMusicPlugins,
   updateMusicPlugin,
+  updateMusicPluginSubscription,
   type MusicCollectionItem,
   type MusicItem,
   type MusicLyric,
   type MusicMediaSource,
   type MusicPlugin,
+  type MusicPluginInstallResult,
+  type MusicPluginSubscription,
   type MusicSearchType,
 } from '../api/music'
 
@@ -99,6 +109,72 @@ export const useMusicStore = defineStore('music', () => {
     if (activePlatform.value === platform) {
       activePlatform.value = enabledPlugins.value[0]?.platform ?? ''
     }
+  }
+
+  /** 按 URL 安装；支持 `.json` 订阅清单，返回逐条结果。 */
+  async function installPluginFromUrl(url: string): Promise<MusicPluginInstallResult[]> {
+    const results = await installMusicPluginFromUrl(url)
+    if (results.some((item) => item.success)) {
+      await loadPlugins()
+    }
+    return results
+  }
+
+  async function uninstallAllPlugins() {
+    const result = await uninstallAllMusicPlugins()
+    await loadPlugins()
+    return result
+  }
+
+  /** 把插件移到指定下标，落库后按服务端顺序回读。 */
+  async function movePlugin(platform: string, offset: number) {
+    const order = plugins.value.map((item) => item.platform)
+    const from = order.indexOf(platform)
+    const to = from + offset
+    if (from < 0 || to < 0 || to >= order.length) return
+    order.splice(from, 1)
+    order.splice(to, 0, platform)
+    await reorderMusicPlugins(order)
+    await loadPlugins()
+  }
+
+  const subscriptions = ref<MusicPluginSubscription[]>([])
+  const subscriptionsLoading = ref(false)
+
+  async function loadSubscriptions() {
+    subscriptionsLoading.value = true
+    try {
+      subscriptions.value = await getMusicPluginSubscriptions()
+    } finally {
+      subscriptionsLoading.value = false
+    }
+  }
+
+  async function addSubscription(name: string, url: string) {
+    const item = await addMusicPluginSubscription(name, url)
+    subscriptions.value = [...subscriptions.value, item]
+    return item
+  }
+
+  async function removeSubscription(id: number) {
+    await removeMusicPluginSubscription(id)
+    subscriptions.value = subscriptions.value.filter((item) => item.id !== id)
+  }
+
+  async function updateSubscription(id: number) {
+    const results = await updateMusicPluginSubscription(id)
+    if (results.some((item) => item.success)) {
+      await loadPlugins()
+    }
+    return results
+  }
+
+  async function updateAllSubscriptions() {
+    const results = await updateAllMusicPluginSubscriptions()
+    if (results.some((item) => item.success)) {
+      await loadPlugins()
+    }
+    return results
   }
 
   /** 更新单个插件，并同步本地列表里的版本信息。 */
@@ -269,7 +345,17 @@ export const useMusicStore = defineStore('music', () => {
     activePlugin,
     loadPlugins,
     installPlugin,
+    installPluginFromUrl,
     uninstallPlugin,
+    uninstallAllPlugins,
+    movePlugin,
+    subscriptions,
+    subscriptionsLoading,
+    loadSubscriptions,
+    addSubscription,
+    removeSubscription,
+    updateSubscription,
+    updateAllSubscriptions,
     togglePlugin,
     updatePlugin,
     updateAllPlugins,

@@ -69,6 +69,8 @@ pub fn parse_manifest(source: &str) -> Result<PluginManifest, AppError> {
       version: m.version || '',
       author: m.author || '',
       srcUrl: m.srcUrl || '',
+      appVersion: m.appVersion || '',
+      description: m.description || '',
       supportedSearchType: Array.isArray(m.supportedSearchType) ? m.supportedSearchType : []
     }});
   }} catch (e) {{
@@ -98,11 +100,14 @@ pub fn parse_manifest(source: &str) -> Result<PluginManifest, AppError> {
     manifest.version = manifest.version.trim().to_string();
     manifest.author = manifest.author.trim().to_string();
     manifest.src_url = manifest.src_url.trim().to_string();
+    manifest.app_version = manifest.app_version.trim().to_string();
+    manifest.description = manifest.description.trim().to_string();
     if manifest.platform.is_empty() {
         return Err(AppError::BadRequest(
             "插件缺少 platform 字段，不是有效的 MusicFree 插件".to_string(),
         ));
     }
+    check_app_version(&manifest)?;
     Ok(manifest)
 }
 
@@ -126,6 +131,8 @@ pub fn manifest_from_value(value: &Value) -> PluginManifest {
         version: text("version"),
         author: text("author"),
         src_url: text("srcUrl"),
+        app_version: text("appVersion"),
+        description: text("description"),
         supported_search_type: value
             .get("supportedSearchType")
             .and_then(Value::as_array)
@@ -137,6 +144,120 @@ pub fn manifest_from_value(value: &Value) -> PluginManifest {
             })
             .unwrap_or_default(),
     }
+}
+
+/// 宿主当前兼容的 MusicFree 版本。
+///
+/// 插件 `appVersion` 声明的是 **MusicFree** 对宿主 API 的要求，不是 Simple Happy 的
+/// 版本号。这里用本项目已对齐的上游版本参与比较，避免拿 `1.1.0` 去比 `^0.6.0`
+/// 这类区间而误判。
+pub const HOST_COMPAT_VERSION: &str = "0.6.2";
+
+/// 校验插件声明的宿主版本要求。插件不写 `appVersion` 视为不限制。
+fn check_app_version(manifest: &PluginManifest) -> Result<(), AppError> {
+    if manifest.app_version.is_empty()
+        || version_satisfies(HOST_COMPAT_VERSION, &manifest.app_version)
+    {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "插件要求宿主版本 {}，当前兼容版本 {}，请更新 Simple Happy 或更换插件",
+        manifest.app_version, HOST_COMPAT_VERSION
+    )))
+}
+
+/// npm semver 的常用子集：`*`/空、`>=` `>` `<=` `<` `=` `^` `~`、`1.2.x`，
+/// 空格表示 AND，`||` 表示 OR。
+pub fn version_satisfies(host: &str, requirement: &str) -> bool {
+    let requirement = requirement.trim();
+    if requirement.is_empty() {
+        return true;
+    }
+    requirement.split("||").any(|group| {
+        let tokens = requirement_tokens(group);
+        // 无法解析的区间按「不限制」处理，宁放行也不误拒。
+        tokens.is_empty() || tokens.iter().all(|(op, version)| match_requirement(host, op, version))
+    })
+}
+
+/// 提取 `[(op, version)]`，兼容 `>= 0.6.0` 这种操作符与版本号之间带空格的写法。
+fn requirement_tokens(group: &str) -> Vec<(String, String)> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(>=|<=|>|<|=|\^|~)?\s*([0-9xX*]+(?:\.[0-9xX*]+)*)").expect("valid regex")
+    });
+    re.captures_iter(group)
+        .filter_map(|caps| {
+            let version = caps.get(2)?.as_str().to_string();
+            Some((caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string(), version))
+        })
+        .collect()
+}
+
+fn numeric_parts(value: &str) -> Vec<u64> {
+    value
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn match_requirement(host: &str, op: &str, version: &str) -> bool {
+    if version.is_empty() {
+        return true;
+    }
+    if version.contains(['x', 'X', '*']) {
+        return wildcard_matches(host, version);
+    }
+    let cmp = super::version_cmp(host, version);
+    match op {
+        ">=" => cmp >= 0,
+        ">" => cmp > 0,
+        "<=" => cmp <= 0,
+        "<" => cmp < 0,
+        "^" => cmp >= 0 && caret_compatible(host, version),
+        "~" => cmp >= 0 && tilde_compatible(host, version),
+        _ => cmp == 0,
+    }
+}
+
+/// `^0.6.0` → minor 相同；`^1.2.0` → major 相同。
+fn caret_compatible(host: &str, version: &str) -> bool {
+    let host = numeric_parts(host);
+    let want = numeric_parts(version);
+    match (want.first().copied().unwrap_or(0), want.get(1).copied().unwrap_or(0)) {
+        (0, 0) => host.get(2) == want.get(2),
+        (0, _) => host.get(1) == want.get(1),
+        _ => host.first() == want.first(),
+    }
+}
+
+/// `~1.2.3` → major.minor 相同；`~1` → major 相同。
+fn tilde_compatible(host: &str, version: &str) -> bool {
+    let host = numeric_parts(host);
+    let want = numeric_parts(version);
+    if want.len() >= 2 {
+        host.first() == want.first() && host.get(1) == want.get(1)
+    } else {
+        host.first() == want.first()
+    }
+}
+
+/// 处理 `1.2.x` / `1.x` 这类通配区间。
+fn wildcard_matches(host: &str, pattern: &str) -> bool {
+    let host = numeric_parts(host);
+    pattern.split('.').enumerate().all(|(index, part)| {
+        is_wildcard_segment(part) || host.get(index).copied().unwrap_or(0) == part.parse::<u64>().unwrap_or(0)
+    })
+}
+
+fn is_wildcard_segment(part: &str) -> bool {
+    part.eq_ignore_ascii_case("x") || part == "*"
 }
 
 #[cfg(test)]
@@ -174,5 +295,58 @@ mod tests {
     fn reports_node_require_dependency() {
         let err = parse_manifest("var fs = require('fs'); module.exports = {};").unwrap_err();
         assert!(err.to_string().contains("Node"));
+    }
+
+    #[test]
+    fn satisfies_common_semver_ranges() {
+        // 宿主兼容版本 0.6.2
+        assert!(version_satisfies("0.6.2", ""));
+        assert!(version_satisfies("0.6.2", "*"));
+        assert!(version_satisfies("0.6.2", ">=0.5.0"));
+        assert!(version_satisfies("0.6.2", ">= 0.5.0"));
+        assert!(version_satisfies("0.6.2", "^0.6.0"));
+        assert!(version_satisfies("0.6.2", "~0.6.0"));
+        assert!(version_satisfies("0.6.2", "0.6.2"));
+        assert!(version_satisfies("0.6.2", "0.6.x"));
+        assert!(version_satisfies("0.6.2", ">=0.5.0 <0.7.0"));
+        assert!(version_satisfies("0.6.2", "0.4.0 || >=0.6.0"));
+
+        assert!(!version_satisfies("0.6.2", ">=0.7.0"));
+        assert!(!version_satisfies("0.6.2", "^0.5.0"));
+        assert!(!version_satisfies("0.6.2", "~0.7.0"));
+        assert!(!version_satisfies("0.6.2", "<0.6.0"));
+        assert!(!version_satisfies("0.6.2", ">=0.6.3"));
+    }
+
+    #[test]
+    fn rejects_incompatible_app_version() {
+        let err = parse_manifest(
+            r#"
+            module.exports = {
+              platform: "未来音源",
+              version: "1.0.0",
+              appVersion: ">=9.0.0",
+            };
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("宿主版本"));
+    }
+
+    #[test]
+    fn accepts_compatible_app_version_and_description() {
+        let manifest = parse_manifest(
+            r#"
+            module.exports = {
+              platform: "正常音源",
+              version: "1.0.0",
+              appVersion: "^0.6.0",
+              description: "示例插件",
+            };
+            "#,
+        )
+        .expect("compatible plugin");
+        assert_eq!(manifest.app_version, "^0.6.0");
+        assert_eq!(manifest.description, "示例插件");
     }
 }

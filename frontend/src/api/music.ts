@@ -22,6 +22,8 @@ export interface MusicPlugin {
   srcUrl: string
   filePath: string
   enabled: boolean
+  /** 插件自述（支持 Markdown），用于说明弹窗。 */
+  description: string
   createdAt: number
   updatedAt: number
 }
@@ -110,6 +112,59 @@ export function installMusicPlugin(source: string, fileName?: string): Promise<M
 
 export function uninstallMusicPlugin(platform: string): Promise<{ removed: boolean }> {
   return invokeEnvelope('music_plugin_uninstall', { platform })
+}
+
+/** 按 URL 安装：单个 `.js` 直链或 `.json` 订阅清单，逐条返回结果。 */
+export interface MusicPluginInstallResult {
+  url: string
+  success: boolean
+  platform: string
+  name: string
+  version: string
+  error: string
+}
+
+export function installMusicPluginFromUrl(url: string): Promise<MusicPluginInstallResult[]> {
+  return invokeEnvelope('music_plugin_install_url', { url })
+}
+
+export function uninstallAllMusicPlugins(): Promise<{ removed: number }> {
+  return invokeEnvelope('music_plugin_uninstall_all', {})
+}
+
+export function reorderMusicPlugins(platforms: string[]): Promise<{ reordered: number }> {
+  return invokeEnvelope('music_plugin_reorder', { platforms })
+}
+
+/** 插件订阅源：`.js` 直链或 `.json` 订阅清单。 */
+export interface MusicPluginSubscription {
+  id: number
+  name: string
+  url: string
+  createdAt: number
+}
+
+export function getMusicPluginSubscriptions(): Promise<MusicPluginSubscription[]> {
+  return invokeEnvelope('music_plugin_subscriptions', {})
+}
+
+export function addMusicPluginSubscription(
+  name: string,
+  url: string,
+): Promise<MusicPluginSubscription> {
+  return invokeEnvelope('music_plugin_add_subscription', { req: { name, url } })
+}
+
+export function removeMusicPluginSubscription(id: number): Promise<{ removed: boolean }> {
+  return invokeEnvelope('music_plugin_remove_subscription', { id })
+}
+
+export function updateMusicPluginSubscription(id: number): Promise<MusicPluginInstallResult[]> {
+  return invokeEnvelope('music_plugin_update_subscription', { id })
+}
+
+export function updateAllMusicPluginSubscriptions(): Promise<MusicPluginInstallResult[]> {
+  return invokeEnvelope('music_plugin_update_all_subscriptions', {})
 }
 
 export function updateMusicPlugin(platform: string): Promise<MusicPlugin> {

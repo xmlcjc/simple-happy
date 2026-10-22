@@ -30,7 +30,7 @@ use self::local::MusicLocalLibrary;
 use self::model::{
     MusicCollectionDetail, MusicCollectionItem, MusicCollectionPage, MusicItem, MusicLyric,
     MusicMediaSource, MusicPlugin, MusicRecommendTags, MusicSearchPage, MusicSheetGroup, MusicTag,
-    MusicTagGroup, PluginVariable,
+    MusicTagGroup, PluginInstallResult, PluginSubscription, PluginVariable,
 };
 use self::plugin::PluginRegistry;
 
@@ -102,6 +102,51 @@ impl MusicService {
         file_name: Option<&str>,
     ) -> Result<MusicPlugin, AppError> {
         self.plugins.install(source, file_name).await
+    }
+
+    /// 按 URL 安装插件（支持 `.json` 订阅清单），返回逐条结果。
+    pub async fn install_plugins_from_url(
+        &self,
+        url: &str,
+    ) -> Result<Vec<PluginInstallResult>, AppError> {
+        self.plugins.install_from_urls(url).await
+    }
+
+    pub async fn uninstall_all_plugins(&self) -> Result<u64, AppError> {
+        self.plugins.uninstall_all().await
+    }
+
+    pub async fn reorder_plugins(&self, platforms: &[String]) -> Result<(), AppError> {
+        self.plugins.reorder(platforms).await
+    }
+
+    pub async fn plugin_subscriptions(&self) -> Result<Vec<PluginSubscription>, AppError> {
+        self.plugins.subscriptions().await
+    }
+
+    pub async fn add_plugin_subscription(
+        &self,
+        name: &str,
+        url: &str,
+    ) -> Result<PluginSubscription, AppError> {
+        self.plugins.add_subscription(name, url).await
+    }
+
+    pub async fn remove_plugin_subscription(&self, id: i64) -> Result<bool, AppError> {
+        self.plugins.remove_subscription(id).await
+    }
+
+    pub async fn update_plugin_subscription(
+        &self,
+        id: i64,
+    ) -> Result<Vec<PluginInstallResult>, AppError> {
+        self.plugins.update_subscription(id).await
+    }
+
+    pub async fn update_all_plugin_subscriptions(
+        &self,
+    ) -> Result<Vec<PluginInstallResult>, AppError> {
+        self.plugins.update_all_subscriptions().await
     }
 
     pub async fn uninstall_plugin(&self, platform: &str) -> Result<bool, AppError> {

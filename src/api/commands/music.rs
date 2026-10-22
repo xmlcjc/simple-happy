@@ -16,7 +16,7 @@ use crate::service::music::local::LocalTrack;
 use crate::service::music::model::{
     MusicCollectionDetail, MusicCollectionItem, MusicCollectionPage, MusicItem, MusicLyric,
     MusicMediaSource, MusicPlugin, MusicRecommendTags, MusicSearchPage, MusicSheetGroup, MusicTag,
-    PluginVariable,
+    PluginInstallResult, PluginSubscription, PluginVariable,
 };
 
 /// 当前为单用户桌面应用; 数据表仍保留 user_ns 维度, 便于日后多用户扩展。
@@ -58,6 +58,96 @@ pub async fn music_plugin_uninstall(
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let removed = state.music_service.uninstall_plugin(&platform).await?;
     Ok(ApiResponse::ok(serde_json::json!({ "removed": removed })))
+}
+
+/// 按 URL 安装：单个 `.js` 直链或 `.json` 订阅清单，逐条返回结果。
+#[tauri::command]
+pub async fn music_plugin_install_url(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<ApiResponse<Vec<PluginInstallResult>>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.install_plugins_from_url(&url).await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_plugin_uninstall_all(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let removed = state.music_service.uninstall_all_plugins().await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "removed": removed })))
+}
+
+/// 按传入顺序重排插件。
+#[tauri::command]
+pub async fn music_plugin_reorder(
+    state: tauri::State<'_, AppState>,
+    platforms: Vec<String>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    state.music_service.reorder_plugins(&platforms).await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "reordered": platforms.len() })))
+}
+
+#[tauri::command]
+pub async fn music_plugin_subscriptions(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<Vec<PluginSubscription>>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.plugin_subscriptions().await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicPluginSubscriptionRequest {
+    #[serde(default)]
+    pub name: String,
+    pub url: String,
+}
+
+#[tauri::command]
+pub async fn music_plugin_add_subscription(
+    state: tauri::State<'_, AppState>,
+    req: MusicPluginSubscriptionRequest,
+) -> Result<ApiResponse<PluginSubscription>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .add_plugin_subscription(&req.name, &req.url)
+            .await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_plugin_remove_subscription(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let removed = state.music_service.remove_plugin_subscription(id).await?;
+    Ok(ApiResponse::ok(serde_json::json!({ "removed": removed })))
+}
+
+#[tauri::command]
+pub async fn music_plugin_update_subscription(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<ApiResponse<Vec<PluginInstallResult>>, AppError> {
+    Ok(ApiResponse::ok(
+        state.music_service.update_plugin_subscription(id).await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn music_plugin_update_all_subscriptions(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<Vec<PluginInstallResult>>, AppError> {
+    Ok(ApiResponse::ok(
+        state
+            .music_service
+            .update_all_plugin_subscriptions()
+            .await?,
+    ))
 }
 
 #[tauri::command]
