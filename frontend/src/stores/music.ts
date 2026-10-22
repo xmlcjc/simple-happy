@@ -74,6 +74,15 @@ export const useMusicStore = defineStore('music', () => {
   const hasMore = ref(false)
   const searchHistory = ref<string[]>(readSearchHistory())
 
+  /** 搜索范围：'all' 聚合全部已启用音源，'platform' 只搜当前音源。 */
+  const searchScope = ref<'all' | 'platform'>('all')
+  /** 聚合搜索的进度与失败来源（平台 -> 错误信息）。 */
+  const searchProgress = ref({ done: 0, total: 0 })
+  const platformErrors = ref<Record<string, string>>({})
+  /** 聚合搜索时每个音源的翻页状态。 */
+  const platformPages = ref<Record<string, number>>({})
+  const platformHasMore = ref<Record<string, boolean>>({})
+
   const enabledPlugins = computed(() => plugins.value.filter((item) => item.enabled))
   const activePlugin = computed(
     () => plugins.value.find((item) => item.platform === activePlatform.value) ?? null,
@@ -202,6 +211,8 @@ export const useMusicStore = defineStore('music', () => {
   }
 
   function setActivePlatform(platform: string) {
+    // 选中具体音源时切换为单源模式；"全部"由 setSearchAll 切回。
+    searchScope.value = 'platform'
     if (activePlatform.value === platform) return
     activePlatform.value = platform
     results.value = []
@@ -209,6 +220,20 @@ export const useMusicStore = defineStore('music', () => {
     searchError.value = ''
     hasMore.value = false
     page.value = 1
+    if (keyword.value.trim()) void search()
+  }
+
+  /** 切回"全部音源"聚合搜索。 */
+  function setSearchAll() {
+    if (searchScope.value === 'all') return
+    searchScope.value = 'all'
+    results.value = []
+    collections.value = []
+    searchError.value = ''
+    platformErrors.value = {}
+    hasMore.value = false
+    page.value = 1
+    if (keyword.value.trim()) void search()
   }
 
   /** 切换搜索类型；已有搜索结果时立即用新类型重搜。 */
@@ -220,7 +245,9 @@ export const useMusicStore = defineStore('music', () => {
     searchError.value = ''
     hasMore.value = false
     page.value = 1
-    if (keyword.value.trim() && activePlatform.value) void search()
+    if (keyword.value.trim() && (searchScope.value === 'all' || activePlatform.value)) {
+      void search()
+    }
   }
 
   function persistSearchHistory(next: string[]) {
@@ -253,6 +280,125 @@ export const useMusicStore = defineStore('music', () => {
     persistSearchHistory([])
   }
 
+  /** 单源请求，失败自动重试一次；仍失败则记录到 platformErrors。 */
+  async function fetchSource(
+    platform: string,
+    text: string,
+    type: MusicSearchType,
+    targetPage: number,
+  ) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        if (type === 'music') {
+          const result = await searchMusic({ platform, keyword: text, page: targetPage })
+          return { items: result.items, collections: [], isEnd: result.isEnd }
+        }
+        const result = await searchMusicCollections({
+          platform,
+          keyword: text,
+          page: targetPage,
+          searchType: type,
+        })
+        return { items: [], collections: result.items, isEnd: result.isEnd }
+      } catch (error) {
+        if (attempt === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 350))
+          continue
+        }
+        platformErrors.value = {
+          ...platformErrors.value,
+          [platform]: (error as Error).message || '搜索失败',
+        }
+        return null
+      }
+    }
+    return null
+  }
+
+  /**
+   * 聚合搜索：并发请求全部已启用音源（4 路并发），谁先返回谁先显示；
+   * 单个音源失败不影响其它音源。
+   */
+  async function searchAllSources(reset: boolean) {
+    const text = keyword.value.trim()
+    const plugins = enabledPlugins.value.slice()
+    const type = searchType.value
+
+    if (reset) {
+      results.value = []
+      collections.value = []
+      page.value = 1
+      hasMore.value = false
+      platformErrors.value = {}
+      platformPages.value = {}
+      platformHasMore.value = {}
+    }
+
+    const seen = new Set(
+      (type === 'music' ? results.value : collections.value).map(
+        (item) => `${item.platform}:${item.id}`,
+      ),
+    )
+    searchProgress.value = { done: 0, total: plugins.length }
+    searching.value = true
+    searchError.value = ''
+
+    let cursor = 0
+    let done = 0
+    let anyMore = false
+
+    const runWorker = async () => {
+      while (cursor < plugins.length) {
+        const plugin = plugins[cursor]
+        cursor += 1
+        const targetPage = reset ? 1 : (platformPages.value[plugin.platform] ?? 0) + 1
+        const data = await fetchSource(plugin.platform, text, type, targetPage)
+        if (data) {
+          platformPages.value = { ...platformPages.value, [plugin.platform]: targetPage }
+          platformHasMore.value = {
+            ...platformHasMore.value,
+            [plugin.platform]: !data.isEnd,
+          }
+          if (!data.isEnd) anyMore = true
+          if (type === 'music') {
+            const fresh: MusicItem[] = []
+            for (const item of data.items) {
+              const key = `${item.platform}:${item.id}`
+              if (seen.has(key)) continue
+              seen.add(key)
+              fresh.push(item)
+            }
+            if (fresh.length) results.value = [...results.value, ...fresh]
+          } else {
+            const fresh: MusicCollectionItem[] = []
+            for (const item of data.collections) {
+              const key = `${item.platform}:${item.id}`
+              if (seen.has(key)) continue
+              seen.add(key)
+              fresh.push(item)
+            }
+            if (fresh.length) collections.value = [...collections.value, ...fresh]
+          }
+        }
+        done += 1
+        searchProgress.value = { done, total: plugins.length }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(4, plugins.length) }, () => runWorker()),
+    )
+
+    hasMore.value = anyMore
+    if (!results.value.length && !collections.value.length) {
+      const failed = Object.keys(platformErrors.value).length
+      if (failed >= plugins.length) {
+        searchError.value = '所有音源搜索失败，请检查插件状态或网络'
+      }
+    }
+    searching.value = false
+  }
+
   async function search(reset = true) {
     const text = keyword.value.trim()
     if (!text) {
@@ -261,11 +407,20 @@ export const useMusicStore = defineStore('music', () => {
       hasMore.value = false
       return
     }
-    if (!activePlatform.value) {
+    if (!enabledPlugins.value.length) {
       searchError.value = '请先安装并启用一个音乐插件'
       return
     }
     rememberSearch(text)
+
+    if (searchScope.value === 'all') {
+      await searchAllSources(reset)
+      return
+    }
+
+    if (!activePlatform.value) {
+      activePlatform.value = enabledPlugins.value[0]?.platform ?? ''
+    }
     if (reset) {
       page.value = 1
       results.value = []
@@ -316,6 +471,10 @@ export const useMusicStore = defineStore('music', () => {
     results.value = []
     collections.value = []
     searchError.value = ''
+    platformErrors.value = {}
+    searchProgress.value = { done: 0, total: 0 }
+    platformPages.value = {}
+    platformHasMore.value = {}
     hasMore.value = false
     page.value = 1
   }
@@ -341,6 +500,10 @@ export const useMusicStore = defineStore('music', () => {
     page,
     hasMore,
     searchHistory,
+    searchScope,
+    searchProgress,
+    platformErrors,
+    setSearchAll,
     enabledPlugins,
     activePlugin,
     loadPlugins,

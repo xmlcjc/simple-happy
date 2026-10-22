@@ -100,11 +100,11 @@ describe('music store', () => {
 
   it('appends results and advances the page until the plugin reports the end', async () => {
     vi.mocked(getMusicPlugins).mockResolvedValue([plugin('demo')])
-    vi.mocked(searchMusic).mockResolvedValue({
-      items: [{ platform: 'demo', id: '1', title: '第一首', artist: 'A' }],
+    vi.mocked(searchMusic).mockImplementation(async ({ page }) => ({
+      items: [{ platform: 'demo', id: String(page ?? 1), title: `第${page}首`, artist: 'A' }],
       isEnd: false,
       platform: 'demo',
-    })
+    }))
     const store = useMusicStore()
     await store.loadPlugins()
 
@@ -115,6 +115,59 @@ describe('music store', () => {
     expect(store.results).toHaveLength(2)
     expect(store.hasMore).toBe(true)
     expect(vi.mocked(searchMusic).mock.calls.map((call) => call[0].page)).toEqual([1, 2])
+  })
+
+  it('searches every enabled plugin in aggregate mode and merges results', async () => {
+    vi.mocked(getMusicPlugins).mockResolvedValue([plugin('a'), plugin('b')])
+    vi.mocked(searchMusic).mockImplementation(async ({ platform }) => ({
+      items: [{ platform, id: '1', title: `${platform}-歌曲`, artist: 'A' }],
+      isEnd: true,
+      platform,
+    }))
+    const store = useMusicStore()
+    await store.loadPlugins()
+
+    store.keyword = 'test'
+    await store.search()
+
+    expect(store.searchScope).toBe('all')
+    expect(vi.mocked(searchMusic)).toHaveBeenCalledTimes(2)
+    expect(store.results.map((item) => item.platform).sort()).toEqual(['a', 'b'])
+    expect(store.platformErrors).toEqual({})
+    expect(store.searchProgress).toEqual({ done: 2, total: 2 })
+  })
+
+  it('retries a failing source once and marks it when it still fails', async () => {
+    vi.mocked(getMusicPlugins).mockResolvedValue([plugin('bad')])
+    vi.mocked(searchMusic).mockRejectedValue(new Error('network down'))
+    const store = useMusicStore()
+    await store.loadPlugins()
+
+    store.keyword = 'test'
+    await store.search()
+
+    // 首次失败后重试一次，共两次调用。
+    expect(vi.mocked(searchMusic)).toHaveBeenCalledTimes(2)
+    expect(store.platformErrors.bad).toContain('network down')
+    expect(store.results).toEqual([])
+    expect(store.searchError).toContain('所有音源')
+  })
+
+  it('switches between aggregate and single-source search', async () => {
+    vi.mocked(getMusicPlugins).mockResolvedValue([plugin('a'), plugin('b')])
+    vi.mocked(searchMusic).mockResolvedValue({
+      items: [{ platform: 'a', id: '1', title: 'x', artist: 'A' }],
+      isEnd: true,
+      platform: 'a',
+    })
+    const store = useMusicStore()
+    await store.loadPlugins()
+
+    store.setActivePlatform('a')
+    expect(store.searchScope).toBe('platform')
+
+    store.setSearchAll()
+    expect(store.searchScope).toBe('all')
   })
 
   it('records search history with dedupe, delete and clear', () => {

@@ -890,7 +890,396 @@ pub const PRELUDE: &str = r##"
     return axios;
   }
 
+  // ── cheerio（jQuery 子集）──
+  // DJ / 相声类插件用它解析站点 HTML。这里实现够用的 DOM 树 + CSS 选择器，
+  // 覆盖 find/attr/text/html/each/map/eq 等常见调用。
+  function buildCheerio() {
+    var VOID_TAGS = {
+      area: 1, base: 1, br: 1, col: 1, embed: 1, hr: 1, img: 1, input: 1,
+      link: 1, meta: 1, param: 1, source: 1, track: 1, wbr: 1
+    };
+
+    function makeNode(type, name, attrs, parent) {
+      return { type: type, name: name, attrs: attrs || {}, children: [], parent: parent || null, data: '' };
+    }
+
+    function appendText(parent, text) {
+      if (!text) return;
+      parent.children.push({ type: 'text', name: '', attrs: {}, children: [], parent: parent, data: text });
+    }
+
+    function findTagEnd(source, from) {
+      var quote = '';
+      for (var i = from; i < source.length; i++) {
+        var ch = source.charAt(i);
+        if (quote) {
+          if (ch === quote) quote = '';
+        } else if (ch === '"' || ch === "'") {
+          quote = ch;
+        } else if (ch === '>') {
+          return i;
+        }
+      }
+      return -1;
+    }
+
+    function parseAttrs(text) {
+      var attrs = {};
+      var re = /([^\s"'=<>\/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+      var match;
+      while ((match = re.exec(text)) !== null) {
+        var value = match[2] !== undefined ? match[2] : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ''));
+        attrs[match[1].toLowerCase()] = value;
+      }
+      return attrs;
+    }
+
+    function parseHtml(html) {
+      var root = makeNode('root', '#root', {}, null);
+      var stack = [root];
+      var source = String(html === undefined || html === null ? '' : html);
+      var cursor = 0;
+      while (cursor < source.length) {
+        var lt = source.indexOf('<', cursor);
+        if (lt < 0) {
+          appendText(stack[stack.length - 1], source.slice(cursor));
+          break;
+        }
+        if (lt > cursor) appendText(stack[stack.length - 1], source.slice(cursor, lt));
+        if (source.substr(lt, 4) === '<!--') {
+          var commentEnd = source.indexOf('-->', lt + 4);
+          cursor = commentEnd < 0 ? source.length : commentEnd + 3;
+          continue;
+        }
+        if (source.charAt(lt + 1) === '!' || source.charAt(lt + 1) === '?') {
+          var declEnd = source.indexOf('>', lt);
+          cursor = declEnd < 0 ? source.length : declEnd + 1;
+          continue;
+        }
+        var gt = findTagEnd(source, lt + 1);
+        if (gt < 0) {
+          appendText(stack[stack.length - 1], source.slice(lt));
+          break;
+        }
+        var inside = source.slice(lt + 1, gt);
+        var closing = inside.charAt(0) === '/';
+        var selfClose = inside.charAt(inside.length - 1) === '/';
+        var body = closing ? inside.slice(1) : inside;
+        if (selfClose) body = body.slice(0, -1);
+        var spaceAt = body.search(/\s/);
+        var tagName = (spaceAt < 0 ? body : body.slice(0, spaceAt)).toLowerCase();
+        var attrText = spaceAt < 0 ? '' : body.slice(spaceAt + 1);
+        if (closing) {
+          for (var depth = stack.length - 1; depth > 0; depth--) {
+            if (stack[depth].name === tagName) {
+              stack.length = depth;
+              break;
+            }
+          }
+        } else if (tagName) {
+          var parent = stack[stack.length - 1];
+          var node = makeNode('tag', tagName, parseAttrs(attrText), parent);
+          parent.children.push(node);
+          if (!VOID_TAGS[tagName] && !selfClose) stack.push(node);
+        }
+        cursor = gt + 1;
+      }
+      return root;
+    }
+
+    function textOf(node) {
+      if (!node) return '';
+      if (node.type === 'text') return node.data;
+      var out = '';
+      for (var i = 0; i < node.children.length; i++) out += textOf(node.children[i]);
+      return out;
+    }
+
+    function innerHtml(node) {
+      if (!node || !node.children) return '';
+      var out = '';
+      for (var i = 0; i < node.children.length; i++) out += serialize(node.children[i]);
+      return out;
+    }
+
+    function serialize(node) {
+      if (!node) return '';
+      if (node.type === 'text') return node.data;
+      if (node.type === 'root') return innerHtml(node);
+      var out = '<' + node.name;
+      for (var key in node.attrs) {
+        out += ' ' + key + '="' + String(node.attrs[key]).replace(/"/g, '&quot;') + '"';
+      }
+      out += '>';
+      if (VOID_TAGS[node.name]) return out;
+      return out + innerHtml(node) + '</' + node.name + '>';
+    }
+
+    function parseCompound(token) {
+      var tagMatch = token.match(/^([a-zA-Z][\w-]*|\*)/);
+      var tag = tagMatch ? tagMatch[1].toLowerCase() : '*';
+      var result = { tag: tag, id: '', classes: [], attrs: [] };
+      var re = /#([\w-]+)|\.([\w-]+)|\[\s*([\w:.-]+)\s*(?:([~|^$*]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+)))?\s*\]/g;
+      var match;
+      while ((match = re.exec(token)) !== null) {
+        if (match[1]) {
+          result.id = match[1];
+        } else if (match[2]) {
+          result.classes.push(match[2]);
+        } else if (match[3]) {
+          var value = match[5] !== undefined ? match[5] : (match[6] !== undefined ? match[6] : (match[7] !== undefined ? match[7] : ''));
+          result.attrs.push({ name: match[3].toLowerCase(), op: match[4] || '', value: value });
+        }
+      }
+      return result;
+    }
+
+    function parseSelector(selector) {
+      var groups = [];
+      var parts = String(selector).split(',');
+      for (var i = 0; i < parts.length; i++) {
+        var trimmed = parts[i].trim();
+        if (!trimmed) continue;
+        var tokens = trimmed.split(/\s+/);
+        var chain = [];
+        for (var j = 0; j < tokens.length; j++) {
+          if (tokens[j] === '>' || tokens[j] === '+' || tokens[j] === '~') continue;
+          chain.push(parseCompound(tokens[j]));
+        }
+        if (chain.length) groups.push(chain);
+      }
+      return groups;
+    }
+
+    function matchesCompound(node, compound) {
+      if (!node || node.type !== 'tag') return false;
+      if (compound.tag !== '*' && node.name !== compound.tag) return false;
+      if (compound.id && node.attrs.id !== compound.id) return false;
+      if (compound.classes.length) {
+        var classText = ' ' + (node.attrs['class'] || '') + ' ';
+        for (var i = 0; i < compound.classes.length; i++) {
+          if (classText.indexOf(' ' + compound.classes[i] + ' ') < 0) return false;
+        }
+      }
+      for (var a = 0; a < compound.attrs.length; a++) {
+        var spec = compound.attrs[a];
+        var actual = node.attrs[spec.name];
+        if (actual === undefined) return false;
+        if (!spec.op) continue;
+        actual = String(actual);
+        if (spec.op === '=' && actual !== spec.value) return false;
+        if (spec.op === '~=' && (' ' + actual + ' ').indexOf(' ' + spec.value + ' ') < 0) return false;
+        if (spec.op === '^=' && actual.indexOf(spec.value) !== 0) return false;
+        if (spec.op === '$=' && actual.slice(-spec.value.length) !== spec.value) return false;
+        if (spec.op === '*=' && actual.indexOf(spec.value) < 0) return false;
+        if (spec.op === '|=' && actual !== spec.value && actual.indexOf(spec.value + '-') !== 0) return false;
+      }
+      return true;
+    }
+
+    function matchChain(node, chain, index) {
+      if (!matchesCompound(node, chain[index])) return false;
+      if (index === 0) return true;
+      var parent = node.parent;
+      while (parent) {
+        if (matchChain(parent, chain, index - 1)) return true;
+        parent = parent.parent;
+      }
+      return false;
+    }
+
+    function matchesSelector(node, groups) {
+      for (var i = 0; i < groups.length; i++) {
+        if (matchChain(node, groups[i], groups[i].length - 1)) return true;
+      }
+      return false;
+    }
+
+    function collect(node, out) {
+      var list = node.children || [];
+      for (var i = 0; i < list.length; i++) {
+        var child = list[i];
+        if (child.type === 'tag') out.push(child);
+        collect(child, out);
+      }
+      return out;
+    }
+
+    function Cheerio(nodes) {
+      this._nodes = nodes || [];
+      this.length = this._nodes.length;
+    }
+
+    Cheerio.prototype.each = function (fn) {
+      for (var i = 0; i < this._nodes.length; i++) {
+        if (fn.call(this._nodes[i], i, this._nodes[i]) === false) break;
+      }
+      return this;
+    };
+    Cheerio.prototype.map = function (fn) {
+      var out = [];
+      for (var i = 0; i < this._nodes.length; i++) {
+        var value = fn.call(this._nodes[i], i, this._nodes[i]);
+        if (value !== null && value !== undefined) out.push(value);
+      }
+      return new Cheerio(out);
+    };
+    Cheerio.prototype.get = function (index) {
+      return index === undefined ? this._nodes.slice() : this._nodes[index];
+    };
+    Cheerio.prototype.toArray = function () { return this._nodes.slice(); };
+    Cheerio.prototype.find = function (selector) {
+      var groups = parseSelector(selector);
+      var out = [];
+      for (var i = 0; i < this._nodes.length; i++) {
+        var candidates = collect(this._nodes[i], []);
+        for (var j = 0; j < candidates.length; j++) {
+          if (matchesSelector(candidates[j], groups) && out.indexOf(candidates[j]) < 0) {
+            out.push(candidates[j]);
+          }
+        }
+      }
+      return new Cheerio(out);
+    };
+    Cheerio.prototype.filter = function (selector) {
+      var groups = parseSelector(selector);
+      var out = [];
+      for (var i = 0; i < this._nodes.length; i++) {
+        if (matchesSelector(this._nodes[i], groups)) out.push(this._nodes[i]);
+      }
+      return new Cheerio(out);
+    };
+    Cheerio.prototype.is = function (selector) {
+      var groups = parseSelector(selector);
+      for (var i = 0; i < this._nodes.length; i++) {
+        if (matchesSelector(this._nodes[i], groups)) return true;
+      }
+      return false;
+    };
+    Cheerio.prototype.first = function () { return new Cheerio(this._nodes.slice(0, 1)); };
+    Cheerio.prototype.last = function () { return new Cheerio(this._nodes.slice(-1)); };
+    Cheerio.prototype.eq = function (index) {
+      var real = index < 0 ? this._nodes.length + index : index;
+      return new Cheerio(real >= 0 && real < this._nodes.length ? [this._nodes[real]] : []);
+    };
+    Cheerio.prototype.slice = function (start, end) { return new Cheerio(this._nodes.slice(start, end)); };
+    Cheerio.prototype.text = function () {
+      var out = '';
+      for (var i = 0; i < this._nodes.length; i++) out += textOf(this._nodes[i]);
+      return out;
+    };
+    Cheerio.prototype.html = function () {
+      return this._nodes.length ? innerHtml(this._nodes[0]) : null;
+    };
+    Cheerio.prototype.attr = function (name) {
+      if (this._nodes.length === 0) return undefined;
+      return this._nodes[0].attrs[name];
+    };
+    Cheerio.prototype.val = function () { return this.attr('value'); };
+    Cheerio.prototype.data = function (name) {
+      if (!this._nodes.length) return undefined;
+      return this._nodes[0].attrs['data-' + name];
+    };
+    Cheerio.prototype.children = function (selector) {
+      var groups = selector ? parseSelector(selector) : null;
+      var out = [];
+      for (var i = 0; i < this._nodes.length; i++) {
+        var list = this._nodes[i].children || [];
+        for (var j = 0; j < list.length; j++) {
+          if (list[j].type === 'tag' && (!groups || matchesSelector(list[j], groups))) out.push(list[j]);
+        }
+      }
+      return new Cheerio(out);
+    };
+    Cheerio.prototype.parent = function () {
+      var out = [];
+      for (var i = 0; i < this._nodes.length; i++) {
+        var parent = this._nodes[i].parent;
+        if (parent && parent.type === 'tag' && out.indexOf(parent) < 0) out.push(parent);
+      }
+      return new Cheerio(out);
+    };
+    Cheerio.prototype.next = function () {
+      var out = [];
+      for (var i = 0; i < this._nodes.length; i++) {
+        var parent = this._nodes[i].parent;
+        if (!parent) continue;
+        var index = parent.children.indexOf(this._nodes[i]);
+        for (var j = index + 1; j < parent.children.length; j++) {
+          if (parent.children[j].type === 'tag') { out.push(parent.children[j]); break; }
+        }
+      }
+      return new Cheerio(out);
+    };
+    Cheerio.prototype.prev = function () {
+      var out = [];
+      for (var i = 0; i < this._nodes.length; i++) {
+        var parent = this._nodes[i].parent;
+        if (!parent) continue;
+        var index = parent.children.indexOf(this._nodes[i]);
+        for (var j = index - 1; j >= 0; j--) {
+          if (parent.children[j].type === 'tag') { out.push(parent.children[j]); break; }
+        }
+      }
+      return new Cheerio(out);
+    };
+    Cheerio.prototype.hasClass = function (name) {
+      for (var i = 0; i < this._nodes.length; i++) {
+        if ((' ' + (this._nodes[i].attrs['class'] || '') + ' ').indexOf(' ' + name + ' ') >= 0) return true;
+      }
+      return false;
+    };
+
+    function createQuery(root) {
+      function $(target, context) {
+        if (target === undefined || target === null) return new Cheerio([]);
+        if (typeof target === 'string') {
+          if (target.charAt(0) === '<') return new Cheerio(parseHtml(target).children);
+          var groups = parseSelector(target);
+          var scope;
+          if (context) {
+            scope = context instanceof Cheerio ? context._nodes : (context.type === 'tag' ? [context] : root.children);
+          } else {
+            scope = root.children;
+          }
+          var out = [];
+          for (var i = 0; i < scope.length; i++) {
+            if (matchesSelector(scope[i], groups) && out.indexOf(scope[i]) < 0) out.push(scope[i]);
+            var candidates = collect(scope[i], []);
+            for (var j = 0; j < candidates.length; j++) {
+              if (matchesSelector(candidates[j], groups) && out.indexOf(candidates[j]) < 0) {
+                out.push(candidates[j]);
+              }
+            }
+          }
+          return new Cheerio(out);
+        }
+        if (target instanceof Cheerio) return target;
+        if (Array.isArray(target)) return new Cheerio(target);
+        if (target.type === 'tag') return new Cheerio([target]);
+        return new Cheerio([]);
+      }
+      $.load = function (html) { return createQuery(parseHtml(html)); };
+      $.html = function (target) {
+        if (target instanceof Cheerio) return innerHtml(target._nodes[0]);
+        if (target) return serialize(target);
+        return serialize(root);
+      };
+      $.root = function () { return new Cheerio([root]); };
+      $.parseHTML = function (html) { return parseHtml(html).children; };
+      $.text = function () { return textOf(root); };
+      return $;
+    }
+
+    return {
+      load: function (html) { return createQuery(parseHtml(html)); },
+      html: function (html) { return createQuery(parseHtml(html)).html(); },
+      parseHTML: function (html) { return parseHtml(html).children; }
+    };
+  }
+
   packages['axios'] = buildAxios(null);
+  packages['cheerio'] = buildCheerio();
   packages['crypto-js'] = buildCryptoJs();
   packages['qs'] = buildQs();
   packages['he'] = { decode: heDecode, encode: heEncode, escape: heEncode, unescape: heDecode };
@@ -982,6 +1371,31 @@ mod tests {
         assert!(result.contains("a&b<c"), "{result}");
         assert!(result.contains("2023-11-1"), "{result}");
         assert!(result.contains("9007199254740994"), "{result}");
+    }
+
+    #[test]
+    fn cheerio_parses_and_queries_html() {
+        let result = eval(
+            r#"
+            var cheerio = require('cheerio');
+            var $ = cheerio.load('<div class="a"><a href="/x">标题</a><span>副</span></div><ul><li>1</li><li>2</li></ul>');
+            var items = [];
+            $('li').each(function (i, el) { items.push($(el).text()); });
+            JSON.stringify({
+              text: $('.a a').text(),
+              href: $('a').attr('href'),
+              count: $('div').length,
+              items: items,
+              inner: $('.a').html(),
+              attrQuery: $('[href="/x"]').length
+            });
+            "#,
+        );
+        assert!(result.contains("\"text\":\"标题\""), "{result}");
+        assert!(result.contains("\"href\":\"/x\""), "{result}");
+        assert!(result.contains("\"count\":1"), "{result}");
+        assert!(result.contains("\"items\":[\"1\",\"2\"]"), "{result}");
+        assert!(result.contains("\"attrQuery\":1"), "{result}");
     }
 
     #[test]

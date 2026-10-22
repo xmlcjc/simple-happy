@@ -129,14 +129,62 @@ async fn real_subscription_install_smoke() {
     let registry = PluginRegistry::new(pool, dir.to_str().expect("utf8 path"), http.clone());
 
     let results = registry.install_from_urls(&url).await.expect("install");
-    let ok = results.iter().filter(|item| item.success).count();
-    println!("订阅安装: 共 {} 个, 成功 {ok} 个", results.len());
-    for item in results.iter().filter(|item| !item.success).take(8) {
-        println!("  失败 {}: {}", item.url, item.error);
+    let mut ok = 0;
+    println!("==== 安装明细 ====");
+    for (index, item) in results.iter().enumerate() {
+        if item.success {
+            ok += 1;
+        }
+        let label = if item.success { "成功" } else { "失败" };
+        println!(
+            "{:>2}. [{label}] {} ({}) {}",
+            index + 1,
+            if item.name.is_empty() { &item.url } else { &item.name },
+            item.platform,
+            item.error
+        );
     }
-    assert!(ok > 0, "订阅清单没有安装成功任何插件");
+    println!("安装汇总: 清单地址 {} 条, 成功 {ok} 条", results.len());
+    assert_eq!(ok, results.len(), "有插件安装失败");
 
     let plugins = registry.list().await.expect("list");
+    println!("==== 加载检查 ==== 入库 {} 个", plugins.len());
+
+    let mut loaded = 0;
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for plugin in &plugins {
+        let label = if plugin.name.is_empty() {
+            plugin.platform.clone()
+        } else {
+            plugin.name.clone()
+        };
+        let source = match std::fs::read_to_string(&plugin.file_path) {
+            Ok(source) => source,
+            Err(err) => {
+                failures.push((label, format!("文件不可读: {err}")));
+                continue;
+            }
+        };
+        let worker = PluginWorker::spawn(&plugin.platform, &source, http.clone(), Default::default());
+        // 只读取插件导出的元信息，不发网络请求：验证脚本能在宿主垫片里成功挂载。
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            call(&worker, "__mf_user_variables", json!([])),
+        )
+        .await
+        {
+            Ok(Ok(_)) => loaded += 1,
+            Ok(Err(err)) => failures.push((label, err)),
+            Err(_) => failures.push((label, "加载超时".to_string())),
+        }
+    }
+    println!("加载汇总: 成功 {loaded} / {}", plugins.len());
+    for (name, err) in &failures {
+        println!("  加载失败 {name}: {err}");
+    }
+    // 这里只做诊断输出：部分插件依赖尚未实现的库（如 cheerio），
+    // 不阻塞门禁，失败项会逐条列出便于后续补齐。
+
     for plugin in plugins.iter().take(3) {
         let source = std::fs::read_to_string(&plugin.file_path).expect("read plugin");
         let worker = PluginWorker::spawn(&plugin.platform, &source, http.clone(), Default::default());

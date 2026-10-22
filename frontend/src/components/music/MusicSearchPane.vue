@@ -12,7 +12,7 @@
         aria-label="搜索音乐"
       />
       <button type="submit" class="search-submit" :disabled="store.searching || !store.keyword.trim()">
-        {{ store.searching ? '搜索中…' : '搜索' }}
+        {{ searchButtonText }}
       </button>
     </form>
 
@@ -31,16 +31,40 @@
 
     <div v-if="store.enabledPlugins.length" class="platform-chips">
       <button
+        type="button"
+        class="platform-chip all-chip"
+        :class="{ active: store.searchScope === 'all' }"
+        title="同时搜索全部已启用音源"
+        @click="store.setSearchAll()"
+      >全部 · {{ store.enabledPlugins.length }}</button>
+      <button
         v-for="plugin in store.enabledPlugins"
         :key="plugin.platform"
         type="button"
         class="platform-chip"
-        :class="{ active: store.activePlatform === plugin.platform }"
-        :title="plugin.name"
+        :class="{
+          active: store.searchScope === 'platform' && store.activePlatform === plugin.platform,
+          failed: Boolean(store.platformErrors[plugin.platform]),
+        }"
+        :title="store.platformErrors[plugin.platform]
+          ? `${plugin.name}：${store.platformErrors[plugin.platform]}`
+          : plugin.name"
         @click="store.setActivePlatform(plugin.platform)"
       >
         {{ plugin.name }}
       </button>
+    </div>
+
+    <div v-if="failedCount" class="source-warnings">
+      <button type="button" class="warning-toggle" @click="warningsOpen = !warningsOpen">
+        {{ failedCount }} 个音源本次搜索失败{{ warningsOpen ? '收起' : '查看原因' }}
+      </button>
+      <ul v-if="warningsOpen" class="warning-list">
+        <li v-for="(message, platform) in store.platformErrors" :key="platform">
+          <strong>{{ platformName(String(platform)) }}</strong>
+          <span>{{ message }}</span>
+        </li>
+      </ul>
     </div>
 
     <div v-if="!store.enabledPlugins.length" class="music-state">
@@ -55,7 +79,10 @@
 
     <div v-else-if="!hasItems && !store.searching" class="music-state">
       <p>{{ store.keyword.trim() ? emptyText : '输入关键词开始搜索' }}</p>
-      <small>搜索由已启用的插件提供，结果质量取决于插件本身。</small>
+      <small v-if="failedCount">
+        本次有 {{ failedCount }} 个音源失败，已跳过；其余音源没有匹配结果。
+      </small>
+      <small v-else>搜索由已启用的插件提供，结果质量取决于插件本身。</small>
 
       <div v-if="store.searchHistory.length" class="history-block">
         <div class="history-head">
@@ -122,7 +149,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useMusicStore } from '../../stores/music'
 import { useMusicLibraryStore } from '../../stores/musicLibrary'
 import { useAppStore } from '../../stores/app'
@@ -152,6 +179,24 @@ const SEARCH_TYPES: Array<{ value: MusicSearchType; label: string }> = [
 const store = useMusicStore()
 const libraryStore = useMusicLibraryStore()
 const appStore = useAppStore()
+
+const warningsOpen = ref(false)
+
+const failedCount = computed(() => Object.keys(store.platformErrors).length)
+
+const searchButtonText = computed(() => {
+  if (!store.searching) return '搜索'
+  if (store.searchScope === 'all' && store.searchProgress.total) {
+    return `搜索中 ${store.searchProgress.done}/${store.searchProgress.total}`
+  }
+  return '搜索中…'
+})
+
+function platformName(platform: string) {
+  return (
+    store.enabledPlugins.find((plugin) => plugin.platform === platform)?.name || platform
+  )
+}
 
 const hasItems = computed(() =>
   store.searchType === 'music' ? store.results.length > 0 : store.collections.length > 0,
@@ -348,6 +393,53 @@ async function toggleFavorite(item: MusicItem) {
   border-color: var(--color-primary-border);
   background: var(--color-primary-bg);
   color: var(--color-primary);
+  font-weight: 600;
+}
+
+.platform-chip.all-chip {
+  font-weight: 600;
+}
+
+.platform-chip.failed {
+  border-style: dashed;
+  border-color: var(--color-danger-border, rgba(192, 57, 43, 0.45));
+  color: var(--color-danger, #c0392b);
+}
+
+.source-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--color-danger-border, rgba(192, 57, 43, 0.4));
+  background: var(--color-danger-bg, rgba(220, 80, 80, 0.06));
+}
+
+.warning-toggle {
+  align-self: flex-start;
+  color: var(--color-danger, #c0392b);
+  font-size: 12px;
+}
+
+.warning-list {
+  margin: 0;
+  padding: 0 0 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.warning-list li {
+  word-break: break-word;
+}
+
+.warning-list strong {
+  margin-right: 6px;
+  color: var(--color-text-secondary);
   font-weight: 600;
 }
 
