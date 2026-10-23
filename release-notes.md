@@ -1,3 +1,26 @@
+# Simple Happy v1.4.4
+
+虎牙直播"每十秒重连"的真正根因修复 + RSS 宽屏阅读布局修复。
+
+## 🎯 本版本亮点
+
+### 🎬 虎牙 FLV 断流（v1.4.3 遗留）真正修复
+- **根因**：接口下发的 `sFlvAntiCode` 只是签名原料（`fm/wsTime/ctype/t/fs`），其中的 `wsSecret` 绑定了下发时那一次的 `seqid`。**直接拼进播放地址，CDN 只回一小段缓冲数据就 EOF**，播放器播完缓冲便判定断流，于是每隔十来秒提示"重连中 1/3"
+- **实测对比（同一房间、同一 CDN 线路）**：
+  | 请求方式 | 结果 |
+  |---|---|
+  | anti-code 原样请求 | `200`，451 KB，0.4 秒后服务端 EOF |
+  | 按当前时间重算 `seqid`/`wsSecret` | `200`，20 秒持续传输 8.65 MB（我方超时主动断开） |
+- **修复**：对齐 [dart_simple_live](https://github.com/xiaoyaocz/dart_simple_live) 的 `buildAntiCode`，每次取流时重算 `seqid = uid + 当前毫秒`、`wsSecret = md5("{fm前缀}_{rotl64(uid)}_{stream}_{md5(seqid|ctype|t)}_{wsTime}")`，并补 `ver=1` / `u` / `codec=264`
+- **前端断流续拉**：断流后不再复用旧地址，改为**重新取流拿新签名地址**再重建播放器；监听 `LOADING_COMPLETE` 无缝续拉；网络错误换下一条 CDN 线路；停滞检测由 1 秒放宽到 3 秒
+- 新增 3 个单测，其中含固定输入的签名向量，防止算法被无意改坏
+
+### 📰 RSS 宽屏阅读修复
+- **根因**：两列网格下把列宽改成 `0 minmax(0,1fr)` 并把文章列表 `display:none` 后，列表不再是 grid item，正文会自动落到**第一条 0 宽的列**里，看起来就像"点了没反应/正文消失"
+- **修复**：宽屏模式改为单列 `minmax(0, 1fr)`，并给正文显式 `grid-column: 1 / -1`，列表收起后正文真正铺满
+
+---
+
 # Simple Happy v1.4.3
 
 虎牙直播修复（改走 FLV 直连，根治断流）+ 弹幕飘屏轨道避让 + RSS 全文抓取增强。

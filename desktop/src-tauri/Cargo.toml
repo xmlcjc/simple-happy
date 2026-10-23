@@ -1,6 +1,6 @@
 [package]
 name = "reader-desktop"
-version = "1.4.3"
+version = "1.4.4"
 edition = "2021"
 description = "Simple Happy — 阅读 + 直播 + 音乐 + RSS 一体化桌面客户端"
 publish = false
