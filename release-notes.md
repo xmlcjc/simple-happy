@@ -1,3 +1,39 @@
+# Simple Happy v1.4.3
+
+虎牙直播修复（改走 FLV 直连，根治断流）+ 弹幕飘屏轨道避让 + RSS 全文抓取增强。
+
+## 🎯 本版本亮点
+
+### 🎬 虎牙断流根治（二）：HLS → FLV 直连
+- **根因修正**：v1.4.2 的 `/liveHls` 代理建立在"虎牙 CDN 随机 403、可重试"的错误前提上；实测虎牙 HLS 在任何 UA/Referer 下恒定 403，代理方案无效，已整体移除
+- **改为 FLV**：从 `baseSteamInfoList` 下发全部 FLV 线路（`sFlvUrl/sStreamName/sFlvAntiCode`），按 `iWebPriorityRate` 降序、URL 去重，按 `bit_rate>0` 追加 `&ratio=` 清晰度参数
+- **FLV 已验证**：CDN 返回合法 FLV 流且 `Access-Control-Allow-Origin: *`，Web 端可直连，无需代理
+- **前端换线路策略**：flv.js 触发 `NETWORK_ERROR` 时立刻切到未试过的下一条线路，全部试过后再走一轮，最多 3 轮才换清晰度
+- **初始选档修复**：斗鱼/抖音没有 qualities 列表时，偏好清晰度先按画质归并再映射到该档第一条线路，不再落到备用线路
+- 对齐参考实现 [dart_simple_live](https://github.com/xiaoyaocz/dart_simple_live) 的做法
+
+### 🎬 其余平台取流对照
+- **B 站**：`mcdn`（P2P 线路，稳定性差）统一排到末位，对齐 dart_simple_live
+- 斗鱼（H5Play 签名 + scdn 排序）与抖音（stream_data/sdk_key + flv/hls 回退）与参考实现一致，未改动
+
+### 💬 弹幕飘屏修复
+- **轨道碰撞避让**：按上一条弹幕尾部是否完全进场判定轨道空闲（对齐 canvas_danmaku），不再互相叠字；全忙时选最早释放的轨道
+- **只飘 chat**：礼物/进房通知不再飘屏（B 站 INTERACT_WORD 每秒数条会把轨道占满），留在右侧列表；SC 走横幅
+
+### 📰 RSS 全文抓取增强
+- **触发判定放宽**：订阅源只给 description（无 content:encoded）、或正文含指回文章自身的"查看全文"链接时，一律抓全文
+- **站内链接拦截加强**：窗口捕获阶段兜底拦截正文 `<a>` 点击，相对链接按当前文章地址补全，彻底杜绝跳系统浏览器
+- **提取器增强**：容器选择器扩充（`#js_content`、`.Post-RichText`、`.article__content` 等），容器提取结果过短时自动用 body 兜底取更长的一份
+
+## 📦 产物
+
+| 文件 | 说明 |
+|------|------|
+| `Simple Happy_1.4.3_x64-setup.exe` | NSIS 安装包（首启写入 701 条书源 + 13 条 RSS + 安装 24 个音源） |
+| `simple-happy-portable-v1.4.3-win-x64.zip` | 便携包（解压即运行，自带种子数据库与内置音源目录） |
+
+---
+
 # Simple Happy v1.4.2
 
 虎牙断流根治 + RSS 全文 + 音乐播放条升级 + 分类页视觉对齐。

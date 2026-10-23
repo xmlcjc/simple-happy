@@ -1,6 +1,6 @@
 [package]
 name = "reader-rust"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2021"
 description = "Simple Happy — 阅读 + 直播 + 音乐 + RSS 一体化桌面客户端的本地核心"
 
