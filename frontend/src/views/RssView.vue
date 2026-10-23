@@ -214,6 +214,8 @@ import { showContextMenu } from '../composables/useContextMenu'
 import { useAppStore } from '../stores/app'
 import { openRssSourcePanel, type RssSourcePanel } from '../api/rss'
 import { readerOrigin } from '../api/scheme'
+import { resolveContentClickLink } from '../utils/rssLinks'
+import { formatRelativeTime } from '../utils/time'
 import type { RssArticle } from '../types'
 
 const router = useRouter()
@@ -232,31 +234,11 @@ function toggleWideReading() {
 /** 正文里的链接一律在应用内打开(外链会命中 Tauri 的 on_navigation 跳系统浏览器)。 */
 function handleContentClick(event: MouseEvent) {
   // 窗口级捕获监听与容器上的 @click 都会进来, 只处理一次。
-  if (event.defaultPrevented) return
-  const anchor = (event.target as HTMLElement | null)?.closest('a')
-  if (!anchor) return
-  // 先拦下默认导航: 否则 WebView2 会把请求交给 Tauri 的 on_navigation,
-  // 非白名单域名一律丢给系统浏览器 —— 这正是"点查看全文跳浏览器"的来源。
-  event.preventDefault()
-  event.stopPropagation()
-  const href = resolveContentLink(anchor.getAttribute('href'))
-  if (!href) return
-  const title = (anchor.textContent || '').trim() || undefined
-  void store.openLinkedPage(href, title)
+  const link = resolveContentClickLink(event, store.activeArticle?.link || '')
+  if (!link) return
+  void store.openLinkedPage(link.href, link.title)
 }
 
-/** 正文里的 `href` 可能是相对地址(甚至只有一个路径), 按当前文章链接补全。 */
-function resolveContentLink(raw: string | null): string {
-  const value = (raw || '').trim()
-  if (!value || value.startsWith('#') || /^javascript:/i.test(value)) return ''
-  if (/^https?:\/\//i.test(value)) return value
-  const base = store.activeArticle?.link || ''
-  try {
-    return new URL(value, base).toString()
-  } catch {
-    return ''
-  }
-}
 /** 单 URL 源的内嵌网页面板(由后端抓页面后托管)。 */
 const panelRequest = ref<RssSourcePanel | null>(null)
 const panelLoading = ref(false)
@@ -414,28 +396,6 @@ function toPlainPreview(html: string) {
     .replace(/&gt;/gi, '>')
     .replace(/\s+/g, ' ')
     .trim()
-}
-
-function formatRelativeTime(value?: string) {
-  if (!value) return ''
-  const timestamp = Date.parse(value)
-  if (Number.isNaN(timestamp)) return value
-
-  const diff = Date.now() - timestamp
-  if (diff < 0) return '刚刚'
-
-  const minute = 60 * 1000
-  const hour = 60 * minute
-  const day = 24 * hour
-  const month = 30 * day
-  const year = 365 * day
-
-  if (diff < minute) return '刚刚'
-  if (diff < hour) return `${Math.floor(diff / minute)} 分钟前`
-  if (diff < day) return `${Math.floor(diff / hour)} 小时前`
-  if (diff < month) return `${Math.floor(diff / day)} 天前`
-  if (diff < year) return `${Math.floor(diff / month)} 个月前`
-  return `${Math.floor(diff / year)} 年前`
 }
 
 async function handleReaderSourceChange() {

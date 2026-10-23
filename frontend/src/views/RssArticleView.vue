@@ -39,7 +39,9 @@ import { onBeforeUnmount, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRssStore } from '../stores/rss'
 import { saveRecentReadBook } from '../utils/recentBooks'
+import { resolveContentClickLink } from '../utils/rssLinks'
 import { recordRssRead } from '../utils/rssReadHistory'
+import { formatRelativeTime } from '../utils/time'
 import type { RssArticle } from '../types'
 
 const route = useRoute()
@@ -96,50 +98,9 @@ onBeforeUnmount(() => {
 /** 正文链接在应用内打开, 不交给系统浏览器。 */
 function handleContentClick(event: MouseEvent) {
   // 窗口级捕获监听与容器上的 @click 都会进来, 只处理一次。
-  if (event.defaultPrevented) return
-  const anchor = (event.target as HTMLElement | null)?.closest('a')
-  if (!anchor) return
-  // 先拦下默认导航, 避免 WebView2 把它交给系统浏览器打开。
-  event.preventDefault()
-  event.stopPropagation()
-  const href = resolveContentLink(anchor.getAttribute('href'))
-  if (!href) return
-  void store.openLinkedPage(href, (anchor.textContent || '').trim() || undefined)
-}
-
-/** 正文里的 `href` 可能是相对地址, 按当前文章链接补全后再走站内阅读。 */
-function resolveContentLink(raw: string | null): string {
-  const value = (raw || '').trim()
-  if (!value || value.startsWith('#') || /^javascript:/i.test(value)) return ''
-  if (/^https?:\/\//i.test(value)) return value
-  const base = store.activeArticle?.link || ''
-  try {
-    return new URL(value, base).toString()
-  } catch {
-    return ''
-  }
-}
-
-function formatRelativeTime(value?: string) {
-  if (!value) return ''
-  const timestamp = Date.parse(value)
-  if (Number.isNaN(timestamp)) return value
-
-  const diff = Date.now() - timestamp
-  if (diff < 0) return '刚刚'
-
-  const minute = 60 * 1000
-  const hour = 60 * minute
-  const day = 24 * hour
-  const month = 30 * day
-  const year = 365 * day
-
-  if (diff < minute) return '刚刚'
-  if (diff < hour) return `${Math.floor(diff / minute)} 分钟前`
-  if (diff < day) return `${Math.floor(diff / hour)} 小时前`
-  if (diff < month) return `${Math.floor(diff / day)} 天前`
-  if (diff < year) return `${Math.floor(diff / month)} 个月前`
-  return `${Math.floor(diff / year)} 年前`
+  const link = resolveContentClickLink(event, store.activeArticle?.link || '')
+  if (!link) return
+  void store.openLinkedPage(link.href, link.title)
 }
 </script>
 
