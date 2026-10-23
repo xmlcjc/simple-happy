@@ -71,6 +71,9 @@ function readProductName() {
 
 const version = readVersion()
 const productName = readProductName()
+// 版本号分散在 7 个文件里（安装包名与包内版本都由它们决定）。本地打包前先跑一遍
+// 与 CI 相同的校验，避免手工 bump 时漏改某个文件 —— 装出来才发现版本不符。
+run('node', [join(repoRoot, 'scripts', 'check-release-metadata.mjs')])
 console.log(`打包 Simple Happy 桌面版 v${version}（productName: ${productName}）`)
 
 // `ci` rather than `install` so a release build can never drift the lockfile.
