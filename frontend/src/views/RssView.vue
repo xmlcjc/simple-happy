@@ -606,13 +606,21 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
   transition: grid-template-columns var(--duration-normal) var(--ease-out);
 }
 
-/* 宽屏阅读: 收起左侧列表, 正文铺满。 */
+/* 宽屏阅读: 收起左侧列表, 正文铺满。
+ *
+ * 注意: 列表一旦 `display: none`, 它就不再是 grid item, 正文会自动落到**第 1 列**。
+ * 若这里仍保留「0 minmax(0,1fr)」两列写法, 正文就会掉进那条 0 宽的第一列 ——
+ * 表现正是"点了宽屏阅读没反应/内容像消失了"。所以宽屏模式直接改成单列。 */
 .rss-main.wide-reading {
-  grid-template-columns: 0 minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .rss-main.wide-reading .article-list-panel {
   display: none;
+}
+
+.rss-main.wide-reading .article-content-panel {
+  grid-column: 1 / -1;
 }
 
 .article-list-panel,
