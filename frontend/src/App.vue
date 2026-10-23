@@ -46,6 +46,8 @@
       :swapped-from="swappedFrom"
       :sleep-mode="sleepMode"
       :sleep-remaining="sleepRemaining"
+      :favorited="currentFavorited"
+      :collapsed="settings.playerCollapsed"
       @toggle="toggle"
       @next="next"
       @prev="prev"
@@ -60,11 +62,40 @@
       @set-sleep="player.setSleepCountdown"
       @sleep-end="player.setSleepEndOfTrack"
       @cancel-sleep="player.cancelSleep"
+      @open-detail="openNowPlaying"
+      @toggle-favorite="toggleCurrentFavorite"
+      @add-to-playlist="openPlayerPlaylistPicker"
+      @toggle-collapse="togglePlayerCollapsed"
     />
+
+    <!-- 窗口内全屏播放详情页(封面 + 滚动歌词) -->
+    <MusicNowPlaying
+      :model-value="nowPlayingOpen"
+      :current="current"
+      :playing="playing"
+      :loading="loading"
+      :current-time="currentTime"
+      :duration="duration"
+      :lines="lyricLines"
+      :current-index="lyricIndex"
+      :lyric-loading="lyricLoading"
+      :lyric-error="lyricError"
+      :favorited="currentFavorited"
+      @close="nowPlayingOpen = false"
+      @toggle="toggle"
+      @next="next"
+      @prev="prev"
+      @seek="seek"
+      @toggle-favorite="toggleCurrentFavorite"
+      @add-to-playlist="openPlayerPlaylistPicker"
+    />
+
+    <!-- 播放条上的"加入歌单"弹窗 -->
+    <MusicPlaylistPicker v-model="playerPickerOpen" :items="playerPickerItems" />
 
     <!-- 全局歌词面板 -->
     <MusicLyricPanel
-      v-if="lyricOpen && current && route.name !== 'reader' && !isLiveFullscreen"
+      v-if="lyricOpen && current && route.name !== 'reader' && !isLiveFullscreen && !nowPlayingOpen"
       class="global-lyric-panel"
       :lines="lyricLines"
       :current-index="lyricIndex"
@@ -82,7 +113,7 @@
 
     <!-- 全局队列面板 -->
     <MusicQueuePanel
-      v-if="queueOpen && route.name !== 'reader' && !isLiveFullscreen"
+      v-if="queueOpen && route.name !== 'reader' && !isLiveFullscreen && !nowPlayingOpen"
       class="global-queue-panel"
       :items="queue"
       :current-index="queueIndex"
@@ -119,6 +150,7 @@ import { useAppStore } from './stores/app'
 import { useReaderStore } from './stores/reader'
 import { useMusicPlayer } from './composables/useMusicPlayer'
 import { useMusicLyric } from './composables/useMusicLyric'
+import { useMusicLibraryStore } from './stores/musicLibrary'
 import { nextPlaybackRate, LYRIC_FONT_SIZE_OPTIONS, useMusicSettingsStore, type MusicQuality, type MusicQualityOrder } from './stores/musicSettings'
 import AppTopBar from './components/AppTopBar.vue'
 import SettingsDrawer from './components/SettingsDrawer.vue'
@@ -129,8 +161,11 @@ import ConfirmDialog from './components/ConfirmDialog.vue'
 import ContextMenu from './components/ContextMenu.vue'
 import TitleBar from './components/TitleBar.vue'
 import MusicPlayerBar from './components/music/MusicPlayerBar.vue'
+import MusicNowPlaying from './components/music/MusicNowPlaying.vue'
+import MusicPlaylistPicker from './components/music/MusicPlaylistPicker.vue'
 import MusicLyricPanel from './components/music/MusicLyricPanel.vue'
 import MusicQueuePanel from './components/music/MusicQueuePanel.vue'
+import type { MusicItem } from './api/music'
 import { resolveWindowClose } from './utils/windowClose'
 import { resolveShellBackgroundImage } from './utils/readerColor'
 
@@ -154,6 +189,42 @@ const setQualityOrder = (order: MusicQualityOrder) => settings.setQualityOrder(o
 // 歌词/队列全局面板状态
 const lyricOpen = ref(false)
 const queueOpen = ref(false)
+// 窗口内全屏播放详情页
+const nowPlayingOpen = ref(false)
+// 播放条"加入歌单"弹窗
+const playerPickerOpen = ref(false)
+const playerPickerItems = ref<MusicItem[]>([])
+const libraryStore = useMusicLibraryStore()
+const currentFavorited = computed(() =>
+  current.value ? libraryStore.isFavorite(current.value) : false,
+)
+
+function openNowPlaying() {
+  if (!current.value) return
+  lyricOpen.value = false
+  queueOpen.value = false
+  nowPlayingOpen.value = true
+}
+
+async function toggleCurrentFavorite() {
+  if (!current.value) return
+  try {
+    await libraryStore.toggleFavorite(current.value)
+  } catch (error) {
+    appStore.showToast((error as Error).message || '收藏失败', 'error')
+  }
+}
+
+function openPlayerPlaylistPicker() {
+  if (!current.value) return
+  playerPickerItems.value = [current.value]
+  playerPickerOpen.value = true
+}
+
+function togglePlayerCollapsed() {
+  settings.setPlayerCollapsed(!settings.playerCollapsed)
+}
+
 const { lines: lyricLines, currentIndex: lyricIndex, loading: lyricLoading, error: lyricError } = useMusicLyric(current, currentTime)
 
 const lyricFontOption = computed(
@@ -186,6 +257,11 @@ onMounted(() => {
 })
 
 const showHeader = computed(() => route.name !== 'reader')
+
+// 进入阅读页/直播全屏或播放清空时收起播放详情浮层, 避免遮住关键界面。
+watch([current, isLiveFullscreen, () => route.name], ([item, full, name]) => {
+  if (!item || full || name === 'reader') nowPlayingOpen.value = false
+})
 const titlebarSurface = computed<'settings' | 'reader-panel' | null>(() => {
   if (appStore.showSettingsDrawer) return 'settings'
   if (appStore.showSourceManager || appStore.showWebdavManager || appStore.showLogViewer) return 'settings'
@@ -233,6 +309,8 @@ const stopBackgroundClassSync = watch(showCustomBackground, (active) => {
 onMounted(() => {
   void appStore.applyBossKey().catch(() => undefined)
   void appStore.applyNetworkProxy().catch(() => undefined)
+  // 播放条的收藏状态要在任何页面都准确, 不能等用户进音乐页才加载。
+  void libraryStore.loadFavorites().catch(() => undefined)
 })
 
 let closeUnlisten: (() => void) | undefined

@@ -23,6 +23,17 @@
             <span class="btn-text">管理订阅源</span>
           </button>
           <button
+            v-if="!isMobileLayout"
+            class="ghost-btn icon-btn"
+            :class="{ active: wideReading }"
+            @click="toggleWideReading"
+            :aria-label="wideReading ? '显示文章列表' : '放大阅读区'"
+            :title="wideReading ? '显示文章列表' : '放大阅读区'"
+          >
+            <span class="btn-icon">◱</span>
+            <span class="btn-text">{{ wideReading ? '显示列表' : '宽屏阅读' }}</span>
+          </button>
+          <button
             class="ghost-btn icon-btn"
             :disabled="!store.enabledSources.length"
             @click="store.fetchArticles(true)"
@@ -68,6 +79,7 @@
       class="rss-main"
       :class="{
         'has-active-article': !!store.activeArticle,
+        'wide-reading': wideReading,
       }"
     >
       <aside class="article-list-panel">
@@ -158,11 +170,31 @@
                 <div v-if="store.activeArticle.origin" class="content-head-origin">{{ store.activeArticle.origin }}</div>
               </div>
             </div>
+            <div class="content-head-actions">
+              <button
+                v-if="store.contentHistory.length"
+                class="ghost-btn"
+                @click="store.backToPreviousArticle()"
+              >← 返回上一篇</button>
+              <button
+                class="ghost-btn"
+                :disabled="store.contentLoading"
+                @click="store.refetchContent()"
+              >{{ store.contentLoading ? '抓取中…' : '抓取全文' }}</button>
+            </div>
           </div>
           <div class="panel-scroll content-scroll">
-            <div v-if="store.contentLoading" class="empty-box">正文加载中...</div>
-            <div v-else-if="store.activeContent" class="content-html" v-html="store.activeContent"></div>
+            <div v-if="store.contentLoading && !store.activeContent" class="empty-box">正文加载中...</div>
+            <div
+              v-else-if="store.activeContent"
+              class="content-html"
+              v-html="store.activeContent"
+              @click="handleContentClick"
+            ></div>
             <div v-else class="empty-box">这篇文章暂时没有可显示的正文。</div>
+            <div v-if="store.contentLoading && store.activeContent" class="content-loading-hint">
+              正在抓取完整正文…
+            </div>
           </div>
         </template>
         <div v-else class="content-placeholder">
@@ -188,6 +220,26 @@ const router = useRouter()
 const store = useRssStore()
 const appStore = useAppStore()
 const isMobileLayout = ref(false)
+/** 宽屏阅读: 隐藏左侧文章列表, 把整个宽度让给正文。 */
+const WIDE_READING_KEY = 'rss-wide-reading'
+const wideReading = ref(localStorage.getItem(WIDE_READING_KEY) === 'true')
+
+function toggleWideReading() {
+  wideReading.value = !wideReading.value
+  localStorage.setItem(WIDE_READING_KEY, String(wideReading.value))
+}
+
+/** 正文里的链接一律在应用内打开(外链会命中 Tauri 的 on_navigation 跳系统浏览器)。 */
+function handleContentClick(event: MouseEvent) {
+  const anchor = (event.target as HTMLElement | null)?.closest('a')
+  if (!anchor) return
+  event.preventDefault()
+  event.stopPropagation()
+  const href = anchor.getAttribute('href') || ''
+  if (!/^https?:\/\//i.test(href)) return
+  const title = (anchor.textContent || '').trim() || undefined
+  void store.openLinkedPage(href, title)
+}
 /** 单 URL 源的内嵌网页面板(由后端抓页面后托管)。 */
 const panelRequest = ref<RssSourcePanel | null>(null)
 const panelLoading = ref(false)
@@ -557,6 +609,12 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
   color: var(--color-primary);
 }
 
+.ghost-btn.active {
+  border-color: var(--color-primary-border);
+  background: var(--color-primary-bg);
+  color: var(--color-primary);
+}
+
 .rss-main {
   flex: 1;
   min-height: 0;
@@ -564,6 +622,16 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
   grid-template-columns: 360px minmax(0, 1fr);
   gap: 8px;
   overflow: hidden;
+  transition: grid-template-columns var(--duration-normal) var(--ease-out);
+}
+
+/* 宽屏阅读: 收起左侧列表, 正文铺满。 */
+.rss-main.wide-reading {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.rss-main.wide-reading .article-list-panel {
+  display: none;
 }
 
 .article-list-panel,
@@ -642,6 +710,20 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.content-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.content-loading-hint {
+  padding: 10px 0 4px;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  text-align: center;
 }
 
 .content-head-time,
@@ -761,6 +843,16 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
   margin: 0 auto;
 }
 
+.rss-main.wide-reading .content-html {
+  width: min(920px, 100%);
+}
+
+.content-html :deep(a) {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .content-html :deep(img) {
   max-width: 100%;
   height: auto;
@@ -808,6 +900,11 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
     flex: 1;
     min-height: 0;
     overflow: hidden;
+  }
+
+  /* 窄屏下正文面板不显示, 宽屏开关不应把列表也藏起来。 */
+  .rss-main.wide-reading .article-list-panel {
+    display: block;
   }
 
   .toolbar-top,

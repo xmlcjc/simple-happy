@@ -57,6 +57,7 @@ const QUALITY_ORDER_KEY = 'music-quality-order'
 const ALTERNATIVE_KEY = 'music-alternative-plugin'
 const LYRIC_OFFSET_KEY = 'music-lyric-offset'
 const LYRIC_FONT_SIZE_KEY = 'music-lyric-font-size'
+const PLAYER_COLLAPSED_KEY = 'music-player-collapsed'
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -161,6 +162,8 @@ export const useMusicSettingsStore = defineStore('musicSettings', () => {
   const lyricFontSize = ref<LyricFontSize>(
     readEnum(LYRIC_FONT_SIZE_KEY, ['small', 'standard', 'large', 'xlarge'], 'standard'),
   )
+  /** 底部播放条是否收起成迷你条(给页面内容腾空间)。 */
+  const playerCollapsed = ref(localStorage.getItem(PLAYER_COLLAPSED_KEY) === 'true')
 
   function setPlayMode(mode: MusicPlayMode) {
     playMode.value = mode
@@ -212,6 +215,11 @@ export const useMusicSettingsStore = defineStore('musicSettings', () => {
     localStorage.setItem(LYRIC_FONT_SIZE_KEY, size)
   }
 
+  function setPlayerCollapsed(collapsed: boolean) {
+    playerCollapsed.value = collapsed
+    localStorage.setItem(PLAYER_COLLAPSED_KEY, String(collapsed))
+  }
+
   return {
     playMode,
     playbackRate,
@@ -220,6 +228,7 @@ export const useMusicSettingsStore = defineStore('musicSettings', () => {
     alternativeMap,
     lyricOffsetMs,
     lyricFontSize,
+    playerCollapsed,
     setPlayMode,
     cyclePlayMode,
     setPlaybackRate,
@@ -228,5 +237,6 @@ export const useMusicSettingsStore = defineStore('musicSettings', () => {
     setAlternative,
     setLyricOffsetMs,
     setLyricFontSize,
+    setPlayerCollapsed,
   }
 })

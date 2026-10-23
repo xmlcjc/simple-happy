@@ -19,8 +19,13 @@
         </div>
 
         <div class="article-page-scroll">
-          <div v-if="store.contentLoading" class="empty-box">正文加载中...</div>
-          <div v-else-if="store.activeContent" class="content-html" v-html="store.activeContent"></div>
+          <div v-if="store.contentLoading && !store.activeContent" class="empty-box">正文加载中...</div>
+          <div
+            v-else-if="store.activeContent"
+            class="content-html"
+            v-html="store.activeContent"
+            @click="handleContentClick"
+          ></div>
           <div v-else class="empty-box">这篇文章暂时没有可显示的正文。</div>
         </div>
       </template>
@@ -80,6 +85,16 @@ onMounted(async () => {
 
 function goBack() {
   router.push('/rss')
+}
+
+/** 正文链接在应用内打开, 不交给系统浏览器。 */
+function handleContentClick(event: MouseEvent) {
+  const anchor = (event.target as HTMLElement | null)?.closest('a')
+  if (!anchor) return
+  event.preventDefault()
+  const href = anchor.getAttribute('href') || ''
+  if (!/^https?:\/\//i.test(href)) return
+  void store.openLinkedPage(href, (anchor.textContent || '').trim() || undefined)
 }
 
 function formatRelativeTime(value?: string) {

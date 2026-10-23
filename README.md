@@ -21,9 +21,9 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 | 模块 | 能力 |
 |------|------|
 | 📖 **小说** | Legado 书源 + 本地 TXT/EPUB/PDF、书源导入/编辑/测试、多源搜索、章节缓存、主题/排版、WebDAV 同步；左侧栏一键切换「小说 / 历史」视图，历史页含统计卡片、**16 周阅读热力图**与搜索；**本地划线**（选区菜单一键划线/取消）、**听书句高亮 + 从本段听 + 章末续读**；顶部导航顺序为 小说 / RSS / 音乐 / 直播 |
-| 🎬 **直播** | B 站 / 虎牙 / 斗鱼 / 抖音 四平台、分区列表/搜索/房间详情、WebView2 + hls.js / flv.js 播放、实时弹幕 + 飘屏弹幕层、多线路容灾自动切换、**断流自愈（指数退避重连 + 同画质线路切换 + FLV 卡顿重建）**、**B 站扫码登录 + 原画/蓝光等登录清晰度**、**虎牙蓝光8M/4M 多档清晰度**、弹幕关键词/正则屏蔽、醒目留言横幅、观看历史、直播间链接解析跳转、关注列表定时自动刷新、开播时长显示 |
-| 🎵 **音乐** | MusicFree CJS 插件宿主（每插件独立 OS 线程 + rquickjs）、**随包内置 28 个音源插件（与桌面版选中的音源一致，首启自动安装，覆盖 QQ/网易云/酷狗/酷我/咪咕/汽水/B站/番茄等）**、插件本地批量安装/网络直链安装/`.json` 订阅清单一键更新、插件排序与说明、单曲/专辑/歌手/歌单搜索、榜单与推荐歌单发现页、**全局播放条（跨页面常驻 + 退出后恢复队列与进度）**、播放模式/倍速/播放队列/音质降级换源/定时关闭、歌词同步（偏移/字号可调）、收藏/歌单/播放历史、链接导入、插件用户变量与在线更新、512MB LRU 音乐缓存、本地 mp3/flac/m4a 导入（lofty 元数据）、**B 站多 P 合集自动展开成完整歌单队列** |
-| 📰 **RSS** | Feed 导入与订阅、文章阅读、与小说最近阅读记录统一时间线、**内置 15 条主流订阅源（少数派 / 阮一峰 / V2EX / IT之家 / cnBeta / 机核 / BBC 中文 / 纽约时报中文网 / The Verge 等，均实测可用）** |
+| 🎬 **直播** | B 站 / 虎牙 / 斗鱼 / 抖音 四平台、分区列表/搜索/房间详情、WebView2 + hls.js / flv.js 播放、实时弹幕 + **飘屏弹幕层（开关持久化 + 合成层动画）**、多线路容灾自动切换、**断流自愈（指数退避重连 + 同画质线路切换 + FLV 卡顿重建）**、**B 站扫码登录 + 原画/蓝光等登录清晰度**、**虎牙蓝光8M/4M 多档清晰度**、**后端 `/liveHls` HLS 代理（自动换线路 + 刷新签名，彻底解决虎牙 CDN 随机 403 导致的 10 秒断流）**、**分类页视觉补齐（抖音/虎牙无图标时 HSL 渐变 fallback、稀疏分区合并为"其他分类"）**、弹幕关键词/正则屏蔽、醒目留言横幅、观看历史、直播间链接解析跳转、关注列表定时自动刷新、开播时长显示 |
+| 🎵 **音乐** | MusicFree CJS 插件宿主（每插件独立 OS 线程 + rquickjs）、**随包内置 28 个音源插件（与桌面版选中的音源一致，首启自动安装，覆盖 QQ/网易云/酷狗/酷我/咪咕/汽水/B站/番茄等）**、插件本地批量安装/网络直链安装/`.json` 订阅清单一键更新、插件排序与说明、单曲/专辑/歌手/歌单搜索、榜单与推荐歌单发现页、**全局播放条（跨页面常驻 + 退出后恢复队列与进度 + 可折叠）**、**播放条收藏/加歌单按钮**、**封面点击进入窗口内全屏 Now Playing（旋转封面 + 滚动歌词 + 进度条 + 控制）**、播放模式/倍速/播放队列/音质降级换源/定时关闭、歌词同步（偏移/字号可调）、收藏/歌单/播放历史、链接导入、插件用户变量与在线更新、512MB LRU 音乐缓存、本地 mp3/flac/m4a 导入（lofty 元数据）、**B 站多 P 合集自动展开成完整歌单队列** |
+| 📰 **RSS** | Feed 导入与订阅、文章阅读、与小说最近阅读记录统一时间线、**自动抓取全文**（启发式识别 summary → density-based 容器提取 → 清洗 → 站内链接拦截，不再跳到系统浏览器）、**阅读区宽屏模式**（一键隐藏文章列表、铺满、持久化）、**内置 15 条主流订阅源（少数派 / 阮一峰 / V2EX / IT之家 / cnBeta / 机核 / BBC 中文 / 纽约时报中文网 / The Verge 等，均实测可用）** |
 | 🛠️ **工具** | 备份/恢复（兼容 Legado ZIP + JSON，支持**覆盖 / 合并**两种恢复方式）、净化规则、替换规则、桌面背景、全局老板键、窗口状态持久化、**应用内运行日志**（级别/关键词筛选、复制、导出 TXT、清空）与**加载诊断采样**（正文/直播各阶段耗时、错误码，脱敏写入日志） |
 
 ### 小说界面
@@ -57,7 +57,7 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 | **桌面壳** | Tauri v2（各平台原生 WebView：Windows WebView2 / macOS WKWebView / Linux WebKitGTK） |
 | **前端** | Vue 3 + TypeScript + Pinia + Vue Router + Vite 8 |
 | **媒体** | hls.js / flv.js（直播）、echarts（统计）、pdfjs-dist（PDF）、opencc-js（简繁转换） |
-| **本地核心** | Rust + Tokio + SQLx + SQLite + reqwest（rustls）+ rquickjs（书源/音乐插件 JS）+ quick-xml / scraper / jsonpath_lib（规则解析） |
+| **本地核心** | Rust + Tokio + SQLx + SQLite + reqwest（rustls）+ rquickjs（书源/音乐插件 JS）+ quick-xml / scraper / regex / jsonpath_lib（规则解析 + RSS 正文提取）+ tower-http（HLS 代理路由） |
 | **直播弹幕** | tokio-tungstenite（WebSocket），Windows 斗鱼弹幕单独 native-tls（TLS 套件原因） |
 | **元数据** | lofty（本地音乐 ID3/FLAC 标签）、pdf-extract（PDF 文本提取） |
 | **插件宿主** | 每插件独占 OS 线程（Runtime/Context 非 Send）+ 独立 current-thread tokio runtime 做 HTTP 桥（避免 block_on 挂死） |
@@ -69,7 +69,7 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 | `frontend/` | Vue 3 桌面界面、状态管理、前端单元测试 |
 | `src/api/` | Tauri 命令（book / live / music / rss 等）、自定义协议 `reader://` |
 | `src/app/` | 应用配置、启动流程、窗口状态持久化 |
-| `src/service/` | 书架、直播（四平台适配 + 弹幕）、音乐（插件宿主 + 曲库）、RSS、听书等业务逻辑 |
+| `src/service/` | 书架、直播（四平台适配 + 弹幕 + `/liveHls` 代理）、音乐（插件宿主 + 曲库）、RSS（全文提取）、听书等业务逻辑 |
 | `src/parser/` | CSS / JSONPath / XPath / 正则 / JavaScript 五合一解析引擎 |
 | `src/crawler/` | HTTP 客户端、请求头规则、Cookie 存储 |
 | `src/storage/` | SQLite + sqlx 嵌入迁移（0001~0014）、文件缓存、数据目录 |
@@ -115,11 +115,11 @@ $env:CARGO_BUILD_JOBS = "4"  # 避免杀毒软件并行 race
 ### 测试
 
 ```bash
-cargo test -j 4                   # Rust 库 470+ 单测
+cargo test -j 4                   # Rust 库 489+ 单测
 cargo test -p reader-desktop      # 桌面端便携目录逻辑
 cargo test --test music_plugin    # 音乐插件宿主集成测试（axum mock upstream）
 cargo test --test builtin_music_plugins_smoke -- --ignored   # 内置音源真实可用性巡检（需外网）
-cd frontend && npm test           # 前端 660+ vitest 用例
+cd frontend && npm test           # 前端 670+ vitest 用例
 ```
 
 ---

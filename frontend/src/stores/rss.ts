@@ -64,25 +64,28 @@ export const useRssStore = defineStore('rss', () => {
     const raw = (content || '').trim()
     if (!raw) return ''
 
-    const lowered = raw.toLowerCase()
-    const looksLikeWholePage =
-      lowered.includes('<html') ||
-      lowered.includes('<body') ||
-      lowered.includes('<head') ||
-      lowered.includes('<form') ||
-      lowered.includes('搜索') ||
-      lowered.includes('首页') ||
-      lowered.includes('广告拦截器')
-
-    if (looksLikeWholePage) {
-      return ''
-    }
-
+    // 后端现在只返回正文容器(已去掉导航/脚本/广告), 这里不再按"整页"启发式
+    // 丢弃 —— 正文里出现"首页/搜索"字样是正常的。
     return raw
       .replace(/<script[\s\S]*?<\/script>/gi, '')
       .replace(/<style[\s\S]*?<\/style>/gi, '')
       .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
       .trim()
+  }
+
+  /** 正文是否是"摘要/被截断"(只有摘要或带"查看全文"链接)。 */
+  function isTruncatedContent(content?: string | null) {
+    const raw = (content || '').trim()
+    if (!raw) return true
+    const text = raw
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!text) return true
+    if (text.length < 400) return true
+    return /阅读全文|查看全文|继续阅读|点击阅读|read\s*more|全文\s*»/i.test(text)
   }
 
   function sourceGroups(source: RssSource) {
@@ -205,14 +208,29 @@ export const useRssStore = defineStore('rss', () => {
     }
   }
 
-  async function openArticle(article: ScopedArticle) {
+  /** 阅读区内的"链接跳转"历史: 支持从站内打开的页面退回上一篇。 */
+  const contentHistory = ref<ScopedArticle[]>([])
+
+  async function openArticle(
+    article: ScopedArticle,
+    options: { keepHistory?: boolean; skipRecord?: boolean } = {},
+  ) {
     const sourceUrl = article.variable || activeSourceUrl.value
     if (!sourceUrl) return
+    if (
+      !options.keepHistory &&
+      activeArticle.value &&
+      (activeArticle.value.link !== article.link ||
+        activeArticle.value.variable !== article.variable)
+    ) {
+      contentHistory.value = [...contentHistory.value, activeArticle.value].slice(-20)
+    }
     activeArticle.value = article
     const inlineContent = normalizeRssContent(article.content, article.description)
-    if (inlineContent) {
-      activeContent.value = inlineContent
-      contentLoading.value = false
+    activeContent.value = inlineContent
+    contentLoading.value = false
+
+    if (!options.skipRecord) {
       saveRecentReadBook({
         name: article.title || 'RSS 文章',
         author: article.origin || 'RSS',
@@ -231,37 +249,79 @@ export const useRssStore = defineStore('rss', () => {
         link: article.link,
         pubDate: article.pubDate,
       })
-      return
     }
-    contentLoading.value = true
+
+    // 摘要/被截断的正文自动抓原网页全文; 已完整的内嵌正文不再发请求。
+    if (!isTruncatedContent(inlineContent)) return
+    contentLoading.value = !inlineContent
     try {
-      const fetchedContent = await getRssContent({
-        sourceUrl,
-        link: article.link,
-        origin: article.origin || sourceUrl,
-      })
-      activeContent.value = normalizeFetchedContent(fetchedContent) || inlineContent || ''
-      saveRecentReadBook({
-        name: article.title || 'RSS 文章',
-        author: article.origin || 'RSS',
-        bookUrl: article.link,
-        origin: `rss:${sourceUrl}`,
-        intro: article.description,
-        durChapterTime: Date.now(),
-        recentKind: 'rss',
-        rssSourceUrl: sourceUrl,
-        rssLink: article.link,
-        rssPubDate: article.pubDate,
-      })
-      recordRssRead({
-        title: article.title || 'RSS 文章',
-        sourceUrl,
-        link: article.link,
-        pubDate: article.pubDate,
-      })
+      const fetchedContent = normalizeFetchedContent(
+        await getRssContent({
+          sourceUrl,
+          link: article.link,
+          origin: article.origin || sourceUrl,
+        }),
+      )
+      // 抓到的全文才替换; 抓取失败时保留原来的摘要, 不让阅读区变空。
+      if (fetchedContent && activeArticle.value?.link === article.link) {
+        activeContent.value = fetchedContent
+      }
+    } catch {
+      // 抓取失败保留内嵌摘要。
     } finally {
       contentLoading.value = false
     }
+  }
+
+  /** 重新抓取当前文章的全文(手动兜底)。 */
+  async function refetchContent() {
+    const article = activeArticle.value
+    if (!article) return
+    const sourceUrl = article.variable || activeSourceUrl.value
+    if (!sourceUrl) return
+    contentLoading.value = true
+    try {
+      const fetchedContent = normalizeFetchedContent(
+        await getRssContent({
+          sourceUrl,
+          link: article.link,
+          origin: article.origin || sourceUrl,
+        }),
+      )
+      if (fetchedContent) activeContent.value = fetchedContent
+    } finally {
+      contentLoading.value = false
+    }
+  }
+
+  /** 正文里的链接: 在应用内阅读区打开, 绝不交给系统浏览器。 */
+  async function openLinkedPage(url: string, title?: string) {
+    if (!/^https?:\/\//i.test(url)) return
+    const sourceUrl = activeSourceUrl.value
+    if (!sourceUrl) return
+    const article: ScopedArticle = {
+      origin: activeArticle.value?.origin || '链接',
+      sort: '',
+      title: title || url,
+      order: 0,
+      link: url,
+      pubDate: '',
+      variable: sourceUrl,
+    }
+    await openArticle(article, { skipRecord: true })
+  }
+
+  /** 返回上一篇(从正文里的链接退回)。 */
+  async function backToPreviousArticle() {
+    const previous = contentHistory.value[contentHistory.value.length - 1]
+    if (!previous) return
+    contentHistory.value = contentHistory.value.slice(0, -1)
+    await openArticle(previous, { keepHistory: true, skipRecord: true })
+  }
+
+  /** 清空"链接跳转"历史(切换源/范围时)。 */
+  function clearContentHistory() {
+    contentHistory.value = []
   }
 
   async function setSource(url: string) {
@@ -270,6 +330,7 @@ export const useRssStore = defineStore('rss', () => {
     activeGroupName.value = ''
     activeArticle.value = null
     activeContent.value = ''
+    contentHistory.value = []
     await fetchArticles(true)
   }
 
@@ -278,6 +339,7 @@ export const useRssStore = defineStore('rss', () => {
     activeGroupName.value = name
     activeArticle.value = null
     activeContent.value = ''
+    contentHistory.value = []
     await fetchArticles(true)
   }
 
@@ -286,6 +348,7 @@ export const useRssStore = defineStore('rss', () => {
     activeGroupName.value = ''
     activeArticle.value = null
     activeContent.value = ''
+    contentHistory.value = []
     await fetchArticles(true)
   }
 
@@ -304,6 +367,7 @@ export const useRssStore = defineStore('rss', () => {
     contentLoading,
     activeArticle,
     activeContent,
+    contentHistory,
     singleUrlMode,
     singleUrlResolved,
     fetchSources,
@@ -312,6 +376,10 @@ export const useRssStore = defineStore('rss', () => {
     removeSources,
     fetchArticles,
     openArticle,
+    openLinkedPage,
+    backToPreviousArticle,
+    refetchContent,
+    clearContentHistory,
     setSource,
     setGroup,
     setAllSources,

@@ -12,6 +12,7 @@ import { ref } from 'vue'
  * - danmakuSpeed: 飘屏弹幕滚过画面的持续秒数（4 ~ 16，越小越快）。
  */
 const DANMAKU_ON_KEY = 'live-danmaku-on'
+const DANMAKU_FLOATING_KEY = 'live-danmaku-floating'
 const DANMAKU_AREA_KEY = 'live-danmaku-area'
 const DANMAKU_OPACITY_KEY = 'live-danmaku-opacity'
 const DANMAKU_FONT_SIZE_KEY = 'live-danmaku-font-size'
@@ -64,6 +65,8 @@ function readNumber(key: string, fallback: number) {
 
 export const useLiveSettingsStore = defineStore('liveSettings', () => {
   const danmakuOn = ref(localStorage.getItem(DANMAKU_ON_KEY) !== 'false')
+  /** 画面飘屏(弹幕滚过视频) vs 仅聊天列表; 与 danmakuOn 一样持久化。 */
+  const danmakuFloating = ref(localStorage.getItem(DANMAKU_FLOATING_KEY) !== 'false')
   // 参考主流直播全屏的弹幕: 默认只占画面上部约 1/4, 字号略小、速度稍快。
   const danmakuArea = ref(clamp(readNumber(DANMAKU_AREA_KEY, 25), 25, 100))
   const danmakuOpacity = ref(
@@ -85,6 +88,11 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
   function setDanmakuOn(value: boolean) {
     danmakuOn.value = value
     localStorage.setItem(DANMAKU_ON_KEY, String(value))
+  }
+
+  function setDanmakuFloating(value: boolean) {
+    danmakuFloating.value = value
+    localStorage.setItem(DANMAKU_FLOATING_KEY, String(value))
   }
 
   function setDanmakuArea(value: number) {
@@ -132,6 +140,7 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
 
   return {
     danmakuOn,
+    danmakuFloating,
     danmakuArea,
     danmakuOpacity,
     danmakuFontSize,
@@ -140,6 +149,7 @@ export const useLiveSettingsStore = defineStore('liveSettings', () => {
     followRefreshInterval,
     bilibiliCookie,
     setDanmakuOn,
+    setDanmakuFloating,
     setDanmakuArea,
     setDanmakuOpacity,
     setDanmakuFontSize,

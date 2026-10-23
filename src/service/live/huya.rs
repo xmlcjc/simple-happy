@@ -5,11 +5,11 @@
 //! - 房间列表: `www.huya.com/cache.php?m=LiveList&do=getLiveListByPage`
 //! - 房间详情 + 取流: `mp.huya.com/cache.php?m=Live&do=profileRoom`
 //!
-//! 取流返回的 HLS 地址带时效签名(`wsSecret`), 直接可用; 但虎牙有多条 CDN,
-//! 其中 AL 线经常 502, 因此这里会按顺序探测, 只返回真正能拉到的地址。
+//! 取流返回的 HLS 地址带时效签名(`wsSecret`), 直接可用; 但同一地址在 CDN 上
+//! 会**随机 403**(实测约一半请求被拒), 所以这里只给候选线路, 由
+//! `hls_proxy` 在真正取清单/分片时重试与换线。
 
 use serde_json::Value;
-use std::time::Duration;
 
 use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
@@ -108,22 +108,20 @@ impl Huya {
             if candidates.is_empty() {
                 candidates = candidate_hls_urls(&value);
             }
-            // 多线路容灾: 虎牙有多条 CDN(AL 线经常 502), 最多收集 3 条真正能拉的,
-            // 播放失败时前端可以自动换下一条。
-            for url in candidates {
-                if streams.len() >= 3 {
-                    break;
-                }
-                if self.is_reachable(&url).await {
-                    streams.push(LiveStream {
-                        format: "hls".to_string(),
-                        quality: target
-                            .as_ref()
-                            .map(|quality| quality.name.clone())
-                            .unwrap_or_else(|| "原画".to_string()),
-                        url,
-                    });
-                }
+            // 多线路容灾: 虎牙有多条 CDN(AL 线经常 403), 最多给 3 条候选。
+            //
+            // 这里**不再**逐条探测可达性: 虎牙 CDN 对同一地址会随机 403
+            // (实测约一半请求被拒), 探测本身也会被拒, 反而会把可用线路筛掉。
+            // 可达性交给 `hls_proxy` 在真正取清单时重试/换线。
+            for url in candidates.into_iter().take(3) {
+                streams.push(LiveStream {
+                    format: "hls".to_string(),
+                    quality: target
+                        .as_ref()
+                        .map(|quality| quality.name.clone())
+                        .unwrap_or_else(|| "原画".to_string()),
+                    url,
+                });
             }
         }
         Ok(LiveStreamInfo {
@@ -159,19 +157,6 @@ impl Huya {
                 text(&value, "message")
             ))),
         }
-    }
-
-    /// 只取响应头, 判断该 CDN 线路是否真的可用。
-    async fn is_reachable(&self, url: &str) -> bool {
-        let request = self
-            .http
-            .client()
-            .get(url)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .header(reqwest::header::REFERER, "https://www.huya.com/")
-            .timeout(Duration::from_secs(6))
-            .send();
-        matches!(request.await, Ok(response) if response.status().is_success())
     }
 }
 
@@ -353,7 +338,9 @@ pub fn parse_qualities(value: &Value) -> Vec<LiveQuality> {
                 raw.as_i64()
                     .or_else(|| raw.as_str().and_then(|text| text.parse().ok()))
             })?;
-            if name.is_empty() || rate <= 0 || name.contains("HDR") {
+            // `iBitRate=0` 是虎牙的"超清/默认"档 —— 此时地址里自带的 ratio 已可用,
+            // 不能把它当成无效档位丢掉(否则默认只能播最低码率)。
+            if name.is_empty() || rate < 0 || name.contains("HDR") {
                 return None;
             }
             Some(LiveQuality { qn: rate, name })
@@ -379,7 +366,12 @@ pub fn hls_urls_for_quality(value: &Value, bit_rate: i64) -> Vec<String> {
             }
             Some((
                 number(item, "webPriorityRate"),
-                with_ratio(&upgrade_https(&url), bit_rate),
+                // rate <= 0 = 默认档: 保留接口下发的 ratio, 不强行替换。
+                if bit_rate > 0 {
+                    with_ratio(&upgrade_https(&url), bit_rate)
+                } else {
+                    upgrade_https(&url)
+                },
             ))
         })
         .collect();

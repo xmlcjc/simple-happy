@@ -1,27 +1,52 @@
 <template>
-  <div class="player-bar" :class="{ empty: !current }">
+  <div class="player-bar" :class="{ empty: !current, collapsed }">
     <div class="player-now">
-      <img
-        v-if="current?.artwork"
-        class="now-cover"
-        :src="current.artwork"
-        :alt="current.title"
-        referrerpolicy="no-referrer"
-      />
-      <span v-else class="now-cover placeholder">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <path d="M9 18V6l10-2v12" />
-          <circle cx="6" cy="18" r="3" />
-          <circle cx="16" cy="16" r="3" />
-        </svg>
-      </span>
-      <span class="now-text">
+      <button
+        type="button"
+        class="cover-btn"
+        :disabled="!current"
+        :title="current ? '打开播放详情' : ''"
+        @click="emit('open-detail')"
+      >
+        <img
+          v-if="current?.artwork"
+          class="now-cover"
+          :src="current.artwork"
+          :alt="current.title"
+          referrerpolicy="no-referrer"
+        />
+        <span v-else class="now-cover placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M9 18V6l10-2v12" />
+            <circle cx="6" cy="18" r="3" />
+            <circle cx="16" cy="16" r="3" />
+          </svg>
+        </span>
+      </button>
+      <span class="now-text" :title="current ? '打开播放详情' : ''" @click="current && emit('open-detail')">
         <strong>{{ current?.title || '未在播放' }}</strong>
         <small>{{ current?.artist || '从搜索结果里选一首歌' }}<template v-if="swappedFrom"> · 已从 {{ swappedFrom }} 换源</template></small>
       </span>
+      <div class="now-actions">
+        <button
+          type="button"
+          class="now-icon"
+          :class="{ active: favorited }"
+          :disabled="!current"
+          :title="favorited ? '取消收藏' : '收藏'"
+          @click="emit('toggle-favorite')"
+        >{{ favorited ? '♥' : '♡' }}</button>
+        <button
+          type="button"
+          class="now-icon"
+          :disabled="!current"
+          title="加入歌单"
+          @click="emit('add-to-playlist')"
+        >＋</button>
+      </div>
     </div>
 
-    <div class="player-center">
+    <div v-if="!collapsed" class="player-center">
       <div class="player-controls">
         <button
           type="button"
@@ -66,7 +91,7 @@
       </div>
     </div>
 
-    <div class="player-extra">
+    <div v-if="!collapsed" class="player-extra">
       <div class="quality-wrap">
         <button
           type="button"
@@ -159,6 +184,32 @@
         aria-label="音量"
         @input="emit('volume', Number(($event.target as HTMLInputElement).value))"
       />
+      <button
+        type="button"
+        class="mini-btn collapse-btn"
+        title="收起播放器"
+        @click="emit('toggle-collapse')"
+      >⌄</button>
+    </div>
+
+    <!-- 收起态: 只留播放/暂停与展开, 给页面内容腾出空间。 -->
+    <div v-else class="player-compact-actions">
+      <button
+        type="button"
+        class="ctrl-btn primary"
+        :title="playing ? '暂停' : '播放'"
+        :disabled="!current || loading"
+        @click="emit('toggle')"
+      >
+        <svg v-if="loading" class="spinning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12a9 9 0 1 0-3 6.7" />
+        </svg>
+        <svg v-else-if="playing" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z" /></svg>
+        <svg v-else viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+      </button>
+      <button type="button" class="mini-btn collapse-btn" title="展开播放器" @click="emit('toggle-collapse')">
+        ⌃ 展开
+      </button>
     </div>
 
     <p v-if="errorText" class="player-error">{{ errorText }}</p>
@@ -195,6 +246,10 @@ const props = defineProps<{
   swappedFrom: string
   sleepMode: 'off' | 'countdown' | 'end-of-track'
   sleepRemaining: number
+  /** 当前歌曲是否已收藏。 */
+  favorited: boolean
+  /** 收起态: 只显示封面/歌名/播放控制。 */
+  collapsed: boolean
 }>()
 
 const emit = defineEmits<{
@@ -212,6 +267,11 @@ const emit = defineEmits<{
   'set-sleep': [minutes: number]
   'sleep-end': []
   'cancel-sleep': []
+  /** 点封面/歌名进入播放详情页。 */
+  'open-detail': []
+  'toggle-favorite': []
+  'add-to-playlist': []
+  'toggle-collapse': []
 }>()
 
 const qualityOpen = ref(false)
@@ -270,6 +330,60 @@ function formatTime(seconds: number) {
   min-width: 0;
 }
 
+/* 封面即"进入播放详情"的入口(主流播放器都是点封面进 Now Playing)。 */
+.cover-btn {
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  display: inline-flex;
+  transition: transform var(--duration-fast) var(--ease-out);
+}
+
+.cover-btn:hover:not(:disabled) {
+  transform: scale(1.05);
+}
+
+.cover-btn:disabled {
+  cursor: default;
+}
+
+.now-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.now-icon {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--color-text-tertiary);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.now-icon:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.now-icon.active {
+  color: var(--color-primary);
+}
+
+.now-icon:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 .now-cover {
   width: 42px;
   height: 42px;
@@ -296,6 +410,8 @@ function formatTime(seconds: number) {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  flex: 1;
+  cursor: pointer;
 }
 
 .now-text strong,
@@ -483,6 +599,32 @@ function formatTime(seconds: number) {
 
 .mode-btn {
   min-width: 38px;
+}
+
+/* 收起态: 单行迷你条。 */
+.player-bar.collapsed {
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 6px var(--space-4);
+}
+
+/* 收起时只保留必要入口, 收藏/歌单等留给展开态和详情页。 */
+.player-bar.collapsed .now-actions {
+  display: none;
+}
+
+.player-bar.collapsed .now-cover {
+  width: 34px;
+  height: 34px;
+}
+
+.player-compact-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.collapse-btn {
+  flex-shrink: 0;
 }
 
 .quality-wrap {

@@ -1,3 +1,65 @@
+# Simple Happy v1.4.2
+
+虎牙断流根治 + RSS 全文 + 音乐播放条升级 + 分类页视觉对齐。
+
+## 🎯 本版本亮点
+
+### 🎬 虎牙 HLS 代理 — 彻底解决 10 秒断流
+- 新增后端 `/liveHls` 路由（`src/service/live/hls_proxy.rs`），由 Rust 侧代理 HLS playlist 与 segment 请求
+- **根因修复**：虎牙 CDN 在同一条线路上约 50% 概率随机返回 403，前端 hls.js 不会自动重试 4xx，导致 10 秒左右断流
+- **代理策略**：manifest 重写相对路径为绝对路径后再包成 `/liveHls?seg=...`，每条线路重试 2 次后自动切下一条，3 条线路 × 2 轮覆盖 al/tx/hs
+- **manifest 缓存**：per-room LRU 缓存，wsSecret 有效期超过 1 小时，stale manifest 也能兜底
+- **质量解析修复**：`parse_qualities` 不再丢弃 `iBitRate=0` 的默认档位，`hls_urls_for_quality` 对 bit_rate≤0 不再错误替换 `ratio=`
+- 前端 LiveRoomView 自动检测虎牙平台，把 stream 地址包装成 `${readerOrigin}/liveHls?platform=huya&...` 交给 Tauri 本地服务
+
+### 🎬 分类页视觉对齐
+- **抖音分区**：API 返回 JSON 字符串（含转义引号），首页 `categoryData` 已正确解析；各平台无可用图标时用 **HSL 哈希渐变**（稳定 deterministic 色值，不再显示空白）
+- **虎牙分区**：图标 CDN 从 `yuba.huya.com` 改为 `i0.hdslb.com` 同级可靠源
+- **稀疏分组合并**：分组下只有 1 个子分区时合并进「其他分类」，避免 4 个孤零零的卡片占位
+- **卡片重绘**：60px 圆角方形 tile + 渐变图标 + 子分区数量 chip + 主标题/副标题两层文字
+
+### 🎵 音乐播放条升级
+- **可折叠**：右侧新增折叠按钮，收起后只剩封面缩略图 + 当前状态行 + 小尺寸播放控件（持久化到 localStorage）
+- **收藏 / 加歌单**：播放条新增 ♡ + ＋ 按钮，一键收藏当前曲目或选择歌单加入
+- **封面 → Now Playing**：点击播放条封面打开**窗口内全屏 Now Playing 详情页**（不再依赖系统弹窗）
+  - 240px 旋转圆形封面 + 背景模糊
+  - 自动滚动歌词（当前行高亮）
+  - 可拖动进度滑块 + 播放/上一首/下一首控制
+  - Esc 或点击遮罩关闭
+  - 当前曲目或路由切换时自动关闭
+
+### 🎵 弹幕飘屏层
+- **开关持久化**：`liveSettings.danmakuFloating` 写入 localStorage（`live-danmaku-floating`），重启不丢失
+- **合成层修复**：弹幕层加 `transform: translateZ(0)`，避免 WebView2 下被 `<video>` 层级盖住
+
+### 📰 RSS 自动抓取全文
+- **后端**：新增 `src/service/rss_article.rs`，`extract_article` 实现完整正文提取
+  - H1→title，density-based 容器打分（候选节点正文密度 + 文本比例 + 链接密度）
+  - scraper 清洗 + 正则去噪（noscript/iframe/script/style/广告锚点）
+  - 相对 URL 转绝对、`javascript:` / `on*` 链接拒绝、`data-src` 懒加载处理
+  - 3 个单元测试 + 真实网络 smoke test（阮一峰博客）
+- **前端**：RSS 文章阅读页检测 summary（<400 字或含"阅读全文/查看全文/read more"）时自动请求原文，不再弹系统浏览器
+- **站内链接拦截**：`.content-html` 上拦截所有 `<a>` 点击，走 `openLinkedPage` 进入应用内浏览器，返回上一篇按钮 + 手动重新抓取按钮
+
+### 📰 RSS 阅读区宽屏按钮
+- 顶栏新增「宽屏阅读」开关（localStorage `rss-wide-reading` 持久化）
+- 开启时隐藏左侧文章列表面板，正文铺满整个阅读区
+
+## 📦 产物
+
+| 文件 | 说明 |
+|------|------|
+| `Simple Happy_1.4.2_x64-setup.exe` | NSIS 安装包（首启写入 1373 条书源 + 15 条 RSS + 安装 28 个音源） |
+| `simple-happy-portable-v1.4.2-win-x64.zip` | 便携包（解压即运行，自带种子数据库与内置音源目录） |
+
+## 🔧 升级说明
+
+- 安装包直接覆盖安装、便携包解压覆盖即可，书架、书源、阅读进度与设置均保留。
+- 虎牙直播体验升级最明显：1.4.1 时代 ~10 秒必断流，1.4.2 后端 HLS 代理后换线自动 + manifest 缓存，不再跳系统浏览器。
+- 旧版本备份可直接恢复；若想保留本地新增数据，恢复时选择「合并」。
+
+---
+
 # Simple Happy v1.4.1
 
 可观测性与阅读体验版本：导航重排、运行日志、划线、合并恢复。

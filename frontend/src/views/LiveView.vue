@@ -161,35 +161,38 @@
       <template v-else-if="store.view === 'category'">
         <div v-if="store.loading" class="live-state"><p>正在加载分区…</p></div>
         <div v-else class="category-groups">
-          <section v-for="group in store.categories" :key="group.id" class="category-group">
-            <h2>{{ group.name }}</h2>
+          <section v-for="section in categorySections" :key="section.id" class="category-group">
+            <h2>
+              {{ section.name }}
+              <span class="category-count">{{ section.tiles.length }}</span>
+            </h2>
             <div class="category-grid">
               <button
-                v-for="area in visibleAreas(group)"
-                :key="area.id"
+                v-for="tile in visibleAreas(section)"
+                :key="tile.id"
                 class="category-tile"
-                :title="area.name"
-                @click="openArea(group.id, area.id)"
+                :title="tile.name"
+                @click="openArea(tile.groupId, tile.id)"
               >
-                <span class="category-icon">
+                <span class="category-icon" :style="tile.icon ? undefined : fallbackTint(tile.name)">
                   <img
-                    v-if="area.icon"
-                    :src="area.icon"
-                    :alt="area.name"
+                    v-if="tile.icon"
+                    :src="tile.icon"
+                    :alt="tile.name"
                     loading="lazy"
                     referrerpolicy="no-referrer"
                   />
-                  <span v-else class="category-icon-fallback">{{ area.name.slice(0, 1) }}</span>
+                  <span v-else class="category-icon-fallback">{{ tile.name.slice(0, 1) }}</span>
                 </span>
-                <span class="category-name">{{ area.name }}</span>
+                <span class="category-name">{{ tile.name }}</span>
               </button>
             </div>
             <button
-              v-if="group.children.length > CATEGORY_PREVIEW"
+              v-if="section.tiles.length > CATEGORY_PREVIEW"
               class="show-all"
-              @click="toggleGroup(group.id)"
+              @click="toggleGroup(section.id)"
             >
-              {{ expandedGroups[group.id] ? '收起' : '显示全部' }}
+              {{ expandedGroups[section.id] ? '收起' : '显示全部' }}
             </button>
           </section>
         </div>
@@ -232,7 +235,7 @@ import LiveRoomGrid from '../components/live/LiveRoomGrid.vue'
 import { parseLiveLink } from '../utils/liveLink'
 import type { LiveFollow } from '../api/liveFollow'
 import type { LiveHistoryEntry } from '../api/liveHistory'
-import type { LiveRoomSummary, LiveCategory, LiveCategoryGroup } from '../api/live'
+import type { LiveRoomSummary, LiveCategory } from '../api/live'
 import { getLiveStatsDaily, getLiveStatsSummary } from '../api/liveStats'
 
 const store = useLiveStore()
@@ -294,8 +297,54 @@ watch(
 const CATEGORY_PREVIEW = 12
 const expandedGroups = ref<Record<string, boolean>>({})
 
-function visibleAreas(group: LiveCategoryGroup): LiveCategory[] {
-  return expandedGroups.value[group.id] ? group.children : group.children.slice(0, CATEGORY_PREVIEW)
+interface CategorySection {
+  id: string
+  name: string
+  /** 每个瓦片带上原始一级分区 id: 合并展示后仍要按正确 parent 拉房间。 */
+  tiles: Array<LiveCategory & { groupId: string }>
+}
+
+/**
+ * 分类页展示模型。
+ *
+ * 抖音这类平台的接口只给"一级分区"本身(没有二级子分类), 如果按原样分组会
+ * 出现一排只有 1 个瓦片的空卡片。这里把这类稀疏分组合并成「其他分类」,
+ * 游戏等真正有子分类的分组仍独立成卡片, 观感与斗鱼接近。
+ */
+const categorySections = computed<CategorySection[]>(() => {
+  const rich: CategorySection[] = []
+  const thin: CategorySection[] = []
+  for (const group of store.categories) {
+    const section: CategorySection = {
+      id: group.id,
+      name: group.name,
+      tiles: group.children.map((area) => ({ ...area, groupId: group.id })),
+    }
+    if (group.children.length > 1) rich.push(section)
+    else thin.push(section)
+  }
+  if (thin.length > 1) {
+    return [
+      ...rich,
+      { id: '__other__', name: '其他分类', tiles: thin.flatMap((section) => section.tiles) },
+    ]
+  }
+  return [...rich, ...thin]
+})
+
+function visibleAreas(section: CategorySection): CategorySection['tiles'] {
+  return expandedGroups.value[section.id]
+    ? section.tiles
+    : section.tiles.slice(0, CATEGORY_PREVIEW)
+}
+
+/** 没有平台图标的分类(抖音等): 用名称哈希出稳定的主题色渐变, 比灰块更像"分类图标"。 */
+function fallbackTint(name: string) {
+  let hash = 0
+  for (const char of name) hash = (hash * 31 + (char.codePointAt(0) ?? 0)) % 360
+  return {
+    '--cat-hue': String(hash),
+  } as Record<string, string>
 }
 
 function toggleGroup(groupId: string) {
@@ -701,14 +750,34 @@ onBeforeUnmount(() => {
 .category-groups {
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
+  gap: var(--space-4);
+}
+
+/* 每个一级分区一张卡片, 与斗鱼分类页的"分组 + 图标墙"观感一致。 */
+.category-group {
+  padding: 16px 18px;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-elevated);
 }
 
 .category-group h2 {
-  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
   font-size: 15px;
   font-weight: 650;
   color: var(--color-text);
+}
+
+.category-count {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--color-bg-sunken);
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  font-weight: 500;
 }
 
 .category-chips {
@@ -719,8 +788,8 @@ onBeforeUnmount(() => {
 
 .category-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
-  gap: 14px 10px;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 16px 12px;
 }
 
 .category-tile {
@@ -733,14 +802,20 @@ onBeforeUnmount(() => {
 }
 
 .category-icon {
-  width: 52px;
-  height: 52px;
-  border-radius: var(--radius-lg);
+  width: 60px;
+  height: 60px;
+  border-radius: 18px;
   overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--color-bg-sunken);
+  /* 无图标分类用名称哈希的色相做渐变, 有图标时会被 img 完全盖住。 */
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, hsl(var(--cat-hue, 30) 62% 58%) 18%, var(--color-bg-elevated)),
+      color-mix(in srgb, hsl(calc(var(--cat-hue, 30) + 28) 62% 58%) 30%, var(--color-bg-elevated))
+    );
   border: 1px solid var(--color-border-light);
   transition: transform var(--duration-fast) var(--ease-out), border-color var(--duration-fast);
 }
@@ -753,8 +828,8 @@ onBeforeUnmount(() => {
 }
 
 .category-icon-fallback {
-  color: var(--color-text-tertiary);
-  font-size: 18px;
+  color: color-mix(in srgb, hsl(var(--cat-hue, 30) 62% 38%) 70%, var(--color-text));
+  font-size: 22px;
   font-weight: 600;
 }
 

@@ -8,6 +8,7 @@ pub mod local_pdf_book;
 pub mod local_txt_book;
 pub mod music;
 pub mod reading_stats_service;
+pub mod rss_article;
 pub mod source_browser;
 pub mod source_login;
 pub mod update_service;

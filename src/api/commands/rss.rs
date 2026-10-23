@@ -409,10 +409,24 @@ pub async fn get_rss_content(
         .book_service
         .http_client()
         .get(&link)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
-    let body = res.text().await.map_err(|e| AppError::Internal(e.into()))?;
+    // 跟随重定向后的地址才是解析相对链接的基准。
+    let final_url = res.url().to_string();
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = res.bytes().await.map_err(|e| AppError::Internal(e.into()))?;
+    let html = crate::crawler::fetcher::decode_body(&bytes, None, content_type.as_deref());
+    // 只返回正文容器, 不再把整页导航/广告丢给前端(前端会把它当成"整页"丢弃)。
+    let (_, body) = crate::service::rss_article::extract_article(&html, &final_url);
     Ok(ApiResponse::ok(Value::String(body)))
 }
 

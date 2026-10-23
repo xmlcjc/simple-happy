@@ -404,6 +404,7 @@ import {
 import { addLiveStats } from '../api/liveStats'
 import { addLiveHistory } from '../api/liveHistory'
 import { getLiveSuperChatHistory } from '../api/live'
+import { readerOrigin } from '../api/scheme'
 import { startLiveDanmaku, stopLiveDanmaku, type DanmakuMessage } from '../api/liveDanmaku'
 import type { LiveQuality, LiveRoomDetail, LiveStream } from '../api/live'
 import { createLoadTrace, type LoadTrace } from '../utils/diagnostics'
@@ -470,7 +471,11 @@ const danmakuOn = computed({
   get: () => liveSettings.danmakuOn,
   set: (value: boolean) => liveSettings.setDanmakuOn(value),
 })
-const floatingDanmaku = ref(true)
+/** 画面飘屏开关持久化在 liveSettings store, 刷新/重进房间都保持用户选择。 */
+const floatingDanmaku = computed({
+  get: () => liveSettings.danmakuFloating,
+  set: (value: boolean) => liveSettings.setDanmakuFloating(value),
+})
 const danmakuError = ref('')
 const danmakuAreaOptions = DANMAKU_AREA_OPTIONS
 const danmakuOpacityRange = DANMAKU_OPACITY_RANGE
@@ -1269,6 +1274,23 @@ function tryNextStream(reason: string) {
   errorMsg.value = reason
 }
 
+/** 真正交给播放器的地址。
+ *
+ *  虎牙 CDN 对同一签名地址会间歇性返回 403(实测 8 次里 6 次), hls.js 又不对
+ *  4xx 重试, 于是每几秒就致命错误一次。统一走 Rust 的 `/liveHls` 代理, 由后端
+ *  重试/换线路/刷新签名; 其它平台直连。 */
+function streamPlaybackUrl(stream: LiveStream): string {
+  if (platform !== 'huya') return stream.url
+  const qn = qualities.value.find((item) => item.name === stream.quality)?.qn ?? 0
+  const params = new URLSearchParams({
+    platform,
+    roomId,
+    qn: String(qn),
+    u: stream.url,
+  })
+  return `${readerOrigin}/liveHls?${params.toString()}`
+}
+
 function playCurrent() {
   const stream = streams.value[activeIndex.value]
   const video = videoRef.value
@@ -1279,14 +1301,16 @@ function playCurrent() {
   clearReconnectTimer()
   status.value = 'loading'
 
+  const url = streamPlaybackUrl(stream)
+
   if (stream.format === 'flv') {
-    playFlv(stream.url, video)
+    playFlv(url, video)
     return
   }
 
   if (Hls.isSupported()) {
     const instance = new Hls({
-      lowLatencyMode: true,
+      lowLatencyMode: false,
       liveSyncDurationCount: 3,
       enableWorker: true,
     })
@@ -1300,13 +1324,13 @@ function playCurrent() {
       // 致命错误: 先自愈, 超过上限再切线路
       hlsRecover(instance, data)
     })
-    instance.loadSource(stream.url)
+    instance.loadSource(url)
     instance.attachMedia(video)
     return
   }
 
   if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = stream.url
+    video.src = url
     video.play().catch(() => undefined)
     return
   }
@@ -1742,13 +1766,16 @@ onBeforeUnmount(() => {
   transition: transform var(--duration-fast) var(--ease-out);
 }
 
-/* 弹幕层：绝对定位在画面上，只做 left 动画，且不吃鼠标事件。 */
+/* 弹幕层：绝对定位在画面上，只做 left 动画，且不吃鼠标事件。
+ * `transform: translateZ(0)` 把覆盖层提升为独立合成层 —— WebView2 里
+ * <video> 也是独立合成层, 没有这一条时弹幕可能被 video 盖住(用户反馈"看不到飘屏")。 */
 .danmaku-layer {
   position: absolute;
   inset: 0;
   overflow: hidden;
   pointer-events: none;
   z-index: 2;
+  transform: translateZ(0);
 }
 
 .danmaku-item {
