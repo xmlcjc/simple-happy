@@ -56,8 +56,8 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 |----|------|
 | **桌面壳** | Tauri v2（各平台原生 WebView：Windows WebView2 / macOS WKWebView / Linux WebKitGTK） |
 | **前端** | Vue 3 + TypeScript + Pinia + Vue Router + Vite 8 |
-| **媒体** | hls.js / flv.js（直播）、echarts（统计）、pdfjs-dist（PDF）、opencc-js（简繁转换） |
-| **本地核心** | Rust + Tokio + SQLx + SQLite + reqwest（rustls）+ rquickjs（书源/音乐插件 JS）+ quick-xml / scraper / regex / jsonpath_lib（规则解析 + RSS 正文提取）+ tower-http（HLS 代理路由） |
+| **媒体** | hls.js / flv.js（直播）、pdfjs-dist（PDF）、opencc-js（简繁转换） |
+| **本地核心** | Rust + Tokio + SQLx + SQLite + reqwest（rustls）+ rquickjs（书源/音乐插件 JS）+ quick-xml / scraper / regex / jsonpath_lib（规则解析 + RSS 正文提取） |
 | **直播弹幕** | tokio-tungstenite（WebSocket），Windows 斗鱼弹幕单独 native-tls（TLS 套件原因） |
 | **元数据** | lofty（本地音乐 ID3/FLAC 标签）、pdf-extract（PDF 文本提取） |
 | **插件宿主** | 每插件独占 OS 线程（Runtime/Context 非 Send）+ 独立 current-thread tokio runtime 做 HTTP 桥（避免 block_on 挂死） |
@@ -69,7 +69,7 @@ Simple Happy 基于 Rust + Tauri v2 + Vue 3 构建，支持 Windows、macOS、Li
 | `frontend/` | Vue 3 桌面界面、状态管理、前端单元测试 |
 | `src/api/` | Tauri 命令（book / live / music / rss 等）、自定义协议 `reader://` |
 | `src/app/` | 应用配置、启动流程、窗口状态持久化 |
-| `src/service/` | 书架、直播（四平台适配 + 弹幕 + `/liveHls` 代理）、音乐（插件宿主 + 曲库）、RSS（全文提取）、听书等业务逻辑 |
+| `src/service/` | 书架、直播（四平台适配 + 弹幕）、音乐（插件宿主 + 曲库）、RSS（全文提取）、听书等业务逻辑 |
 | `src/parser/` | CSS / JSONPath / XPath / 正则 / JavaScript 五合一解析引擎 |
 | `src/crawler/` | HTTP 客户端、请求头规则、Cookie 存储 |
 | `src/storage/` | SQLite + sqlx 嵌入迁移（0001~0014）、文件缓存、数据目录 |
