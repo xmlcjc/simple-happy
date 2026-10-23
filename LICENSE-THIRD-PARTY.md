@@ -74,7 +74,6 @@
 | `compression-codecs` | 0.4.37 | MIT OR Apache-2.0 |
 | `compression-core` | 0.4.31 | MIT OR Apache-2.0 |
 | `concurrent-queue` | 2.5.0 | Apache-2.0 OR MIT |
-| `config` | 0.14.1 | MIT OR Apache-2.0 |
 | `const-oid` | 0.9.6 | Apache-2.0 OR MIT |
 | `const-random` | 0.1.18 | MIT OR Apache-2.0 |
 | `const-random-macro` | 0.1.16 | MIT OR Apache-2.0 |

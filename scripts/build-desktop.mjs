@@ -71,9 +71,18 @@ function readProductName() {
 
 const version = readVersion()
 const productName = readProductName()
+const seedDb = join(repoRoot, 'seed', 'reader.db')
 // 版本号分散在 7 个文件里（安装包名与包内版本都由它们决定）。本地打包前先跑一遍
 // 与 CI 相同的校验，避免手工 bump 时漏改某个文件 —— 装出来才发现版本不符。
 run('node', [join(repoRoot, 'scripts', 'check-release-metadata.mjs')])
+// 种子库被 gitignore，只存在于打包机上。缺失时若静默跳过，会产出"能装但零书源"
+// 的便携包，构建日志里还看不出异常 —— 所以在这里直接失败，而不是等到打包结束。
+if (!existsSync(seedDb)) {
+  throw new Error(
+    `未找到书源种子: ${seedDb}\n` +
+      '便携包会缺少书源与 RSS 订阅；请先把 seed/reader.db 放到种子目录再重新打包。',
+  )
+}
 console.log(`打包 Simple Happy 桌面版 v${version}（productName: ${productName}）`)
 
 // `ci` rather than `install` so a release build can never drift the lockfile.
@@ -120,13 +129,11 @@ if (existsSync(builtinPlugins)) {
 }
 // 便携版预置书源/RSS 种子：首次启动即带本地书源与订阅源。
 // 安装版仍由用户在应用内导入，避免把第三方书源写进系统目录。
-const seedDb = join(repoRoot, 'seed', 'reader.db')
+// 种子在上方启动时已被校验存在，这里直接复制。
 rmSync(join(stageDir, 'data'), { recursive: true, force: true })
-if (existsSync(seedDb)) {
-  mkdirSync(join(stageDir, 'data'), { recursive: true })
-  cpSync(seedDb, join(stageDir, 'data', 'reader.db'))
-  console.log('已加入书源种子: seed/reader.db')
-}
+mkdirSync(join(stageDir, 'data'), { recursive: true })
+cpSync(seedDb, join(stageDir, 'data', 'reader.db'))
+console.log('已加入书源种子: seed/reader.db')
 
 const zipPath = join(outRoot, `simple-happy-portable-v${version}-win-x64.zip`)
 rmSync(zipPath, { force: true })

@@ -112,6 +112,25 @@ $env:CARGO_BUILD_JOBS = "4"  # 避免杀毒软件并行 race
 - `<productName>_<ver>_x64-setup.exe` —— NSIS 安装包
 - `simple-happy-portable-v<ver>-win-x64.zip` —— 便携包（含种子数据库与内置音源目录）
 
+### 发布（Release）
+
+发布由本地手动完成，仓库不使用 GitHub Actions 自动发布（原 `release.yml` 已移除）。
+`npm run build` 在开始前会校验 7 个文件的版本号一致、且 `seed/reader.db` 存在，任一不满足直接中止。
+
+```bash
+# 1. 统一修改版本号后打包（产物在 desktop/dist/）
+cd desktop && npm run build
+
+# 2. 打 tag 并推送
+git tag -a v<ver> -m "v<ver>"
+git push origin main v<ver>
+
+# 3. 创建 Release 并上传两个产物
+gh release create v<ver> --title "v<ver>" --notes-file release-notes.md
+gh release upload v<ver> "desktop/dist/Simple Happy_<ver>_x64-setup.exe" \
+  "desktop/dist/simple-happy-portable-v<ver>-win-x64.zip"
+```
+
 ### 测试
 
 ```bash
