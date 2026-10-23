@@ -231,14 +231,31 @@ function toggleWideReading() {
 
 /** 正文里的链接一律在应用内打开(外链会命中 Tauri 的 on_navigation 跳系统浏览器)。 */
 function handleContentClick(event: MouseEvent) {
+  // 窗口级捕获监听与容器上的 @click 都会进来, 只处理一次。
+  if (event.defaultPrevented) return
   const anchor = (event.target as HTMLElement | null)?.closest('a')
   if (!anchor) return
+  // 先拦下默认导航: 否则 WebView2 会把请求交给 Tauri 的 on_navigation,
+  // 非白名单域名一律丢给系统浏览器 —— 这正是"点查看全文跳浏览器"的来源。
   event.preventDefault()
   event.stopPropagation()
-  const href = anchor.getAttribute('href') || ''
-  if (!/^https?:\/\//i.test(href)) return
+  const href = resolveContentLink(anchor.getAttribute('href'))
+  if (!href) return
   const title = (anchor.textContent || '').trim() || undefined
   void store.openLinkedPage(href, title)
+}
+
+/** 正文里的 `href` 可能是相对地址(甚至只有一个路径), 按当前文章链接补全。 */
+function resolveContentLink(raw: string | null): string {
+  const value = (raw || '').trim()
+  if (!value || value.startsWith('#') || /^javascript:/i.test(value)) return ''
+  if (/^https?:\/\//i.test(value)) return value
+  const base = store.activeArticle?.link || ''
+  try {
+    return new URL(value, base).toString()
+  } catch {
+    return ''
+  }
 }
 /** 单 URL 源的内嵌网页面板(由后端抓页面后托管)。 */
 const panelRequest = ref<RssSourcePanel | null>(null)
@@ -249,6 +266,9 @@ const panelFallbackUrl = ref('')
 onMounted(async () => {
   syncViewportMode()
   window.addEventListener('resize', syncViewportMode)
+  // 捕获阶段兜底: RSS 页面里的任何 <a>(含正文 v-html 注入的)都不允许导航出去,
+  // 统一转成站内阅读, 避免落到 Tauri on_navigation 打开系统浏览器。
+  window.addEventListener('click', handleContentClick, true)
   await store.fetchSources()
   if (!store.activeSourceUrl && store.enabledSources.length) {
     await store.setSource(store.enabledSources[0]!.sourceUrl)
@@ -265,6 +285,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', syncViewportMode)
+  window.removeEventListener('click', handleContentClick, true)
 })
 
 /** 面板对应的源; 用于列表项高亮与切换判断。 */

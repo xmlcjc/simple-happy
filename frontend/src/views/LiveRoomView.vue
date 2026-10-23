@@ -68,17 +68,12 @@
               v-for="item in floatingItems"
               :key="item.id"
               class="danmaku-item"
-              :class="item.kind"
               :style="{
                 top: `${item.track * danmakuLaneHeight}px`,
                 color: item.color || undefined,
                 animationDuration: `${liveSettings.danmakuSpeed}s`,
               }"
-            >
-              <template v-if="item.kind === 'chat'">{{ item.content }}</template>
-              <template v-else-if="item.kind === 'enter'">{{ item.user }} 进入直播间</template>
-              <template v-else>{{ item.user }} {{ item.content }}</template>
-            </span>
+            >{{ item.content }}</span>
           </div>
 
           <div v-if="status !== 'playing'" class="player-overlay">
@@ -404,7 +399,6 @@ import {
 import { addLiveStats } from '../api/liveStats'
 import { addLiveHistory } from '../api/liveHistory'
 import { getLiveSuperChatHistory } from '../api/live'
-import { readerOrigin } from '../api/scheme'
 import { startLiveDanmaku, stopLiveDanmaku, type DanmakuMessage } from '../api/liveDanmaku'
 import type { LiveQuality, LiveRoomDetail, LiveStream } from '../api/live'
 import { createLoadTrace, type LoadTrace } from '../utils/diagnostics'
@@ -448,6 +442,10 @@ let lastReconnectTimer: number | undefined
 let flvStallTimer: number | undefined
 let lastMediaTime = 0
 
+/** 虎牙 FLV 的连接轮次: 同一线路会随机 403, 全线试完后允许再走一轮。 */
+const MAX_FLV_ROUNDS = 3
+let flvRound = 0
+
 /** 观看时长上报：播放中用固定间隔累加，离开页面/暂停时补一次。 */
 let watchTimer: number | undefined
 let watchTickAt = 0
@@ -460,7 +458,13 @@ const DANMAKU_MAX_LANES = 8
 const danmakuLaneCount = ref(6)
 const CHAT_LIMIT = 160
 let danmakuSeq = 0
-let danmakuLane = 0
+/** 每条轨道「可以放下一条」的时刻(performance.now 毫秒)。
+ *
+ *  来自 canvas_danmaku 的做法: 上一条弹幕尾部完全进场之前, 同轨道不再放新弹幕,
+ *  否则同一行的两条弹幕会叠在一起。 */
+let laneFreeAt: number[] = []
+/** 同轨道相邻两条弹幕之间留的像素空隙。 */
+const DANMAKU_LANE_GAP_PX = 40
 /** 画面上飘的弹幕(短生命周期)。 */
 const floatingItems = ref<DanmakuItem[]>([])
 /** 右侧聊天列表(长生命周期, 上限 CHAT_LIMIT)。 */
@@ -686,6 +690,47 @@ function updateDanmakuLanes() {
   )
 }
 
+/** 估算弹幕宽度(只用于轨道排布): 中日韩字符按 1 字宽, 其余按 0.55。 */
+function estimateDanmakuWidth(text: string): number {
+  const fontSize = liveSettings.danmakuFontSize
+  let units = 0
+  for (const char of text) {
+    units += /[\u2e80-\u9fff\uff00-\uffef]/.test(char) ? 1 : 0.55
+  }
+  return Math.max(fontSize, units * fontSize)
+}
+
+/** 挑一条不重叠的轨道: 上一条的尾部完全进场后该轨道才可复用。
+ *
+ *  估算像素速度 = (容器宽 + 弹幕自身宽) ÷ 滚动时长, 与 CSS 动画
+ *  (`left: 100% → -100%`) 的实际位移一致。所有轨道都在忙时塞进最早释放的
+ *  那条 —— 允许轻微重叠, 总比丢弹幕好(与 canvas_danmaku 的取舍一致)。 */
+function pickDanmakuLane(text: string): number {
+  const lanes = Math.max(1, danmakuLaneCount.value)
+  if (laneFreeAt.length !== lanes) laneFreeAt = new Array<number>(lanes).fill(0)
+  const now = performance.now()
+  const width = playerShellRef.value?.clientWidth || 1
+  const textWidth = estimateDanmakuWidth(text)
+  const duration = Math.max(1, liveSettings.danmakuSpeed) * 1000
+  const pxPerMs = (width + textWidth) / duration
+  const busyMs = (textWidth + DANMAKU_LANE_GAP_PX) / pxPerMs
+  let earliest = 0
+  for (let index = 0; index < lanes; index += 1) {
+    if ((laneFreeAt[index] ?? 0) <= now) {
+      laneFreeAt[index] = now + busyMs
+      return index
+    }
+    if ((laneFreeAt[index] ?? 0) < (laneFreeAt[earliest] ?? 0)) earliest = index
+  }
+  laneFreeAt[earliest] = (laneFreeAt[earliest] ?? now) + busyMs
+  return earliest
+}
+
+/** 轨道状态失效(清屏/换区域/换字号)时重置。 */
+function resetDanmakuLanes() {
+  laneFreeAt = []
+}
+
 const currentQuality = computed(() => streams.value[activeIndex.value]?.quality || '默认')
 
 type QualityOption = { quality: string; qn?: number; index?: number }
@@ -773,7 +818,7 @@ function pushDanmaku(messages: DanmakuMessage[]) {
     const item: DanmakuItem = {
       ...message,
       id: ++danmakuSeq,
-      track: danmakuLane++ % Math.max(1, danmakuLaneCount.value),
+      track: pickDanmakuLane(message.content),
     }
     // SC 同步进播放器上方的卡片横幅, 按 duration 倒计时。
     if (message.kind === 'superchat') {
@@ -792,7 +837,10 @@ function pushDanmaku(messages: DanmakuMessage[]) {
     if (chatMessages.value.length > CHAT_LIMIT) {
       chatMessages.value = chatMessages.value.slice(-CHAT_LIMIT)
     }
-    if (danmakuOn.value && floatingDanmaku.value) {
+    // 只有普通聊天弹幕上飘屏。礼物/进房/SC 不进画面(与 simple_live 一致):
+    // B 站热门房的进房消息每秒好几条, 全塞进轨道会把真正的聊天挤掉;
+    // SC 另有顶部横幅, 礼物/进房保留在右侧列表里。
+    if (danmakuOn.value && floatingDanmaku.value && message.kind === 'chat') {
       floatingItems.value.push(item)
       if (floatingItems.value.length > 40) {
         floatingItems.value = floatingItems.value.slice(-40)
@@ -839,6 +887,7 @@ function clearDanmaku() {
   danmakuTimers.clear()
   floatingItems.value = []
   chatMessages.value = []
+  resetDanmakuLanes()
 }
 
 function toggleDanmaku() {
@@ -860,13 +909,17 @@ watch(
     }
     stopDanmaku()
     floatingItems.value = []
+    resetDanmakuLanes()
   },
 )
 
 // 显示区域/字号变化会改变可用轨道数; 全屏切换则由播放器尺寸的 ResizeObserver 触发。
 watch(
   [() => liveSettings.danmakuArea, () => liveSettings.danmakuFontSize],
-  () => void nextTick(updateDanmakuLanes),
+  () => {
+    resetDanmakuLanes()
+    void nextTick(updateDanmakuLanes)
+  },
 )
 
 function togglePlay() {
@@ -992,6 +1045,32 @@ function hlsRecover(instance: Hls, data: { type: string; details: string }) {
       tryNextStream(`自愈异常（${data.type}: ${data.details}）`)
     }
   }, delay)
+}
+
+/** FLV 连接失败(虎牙 CDN 随机 403): 立刻换下一条未试过的线路。
+ *
+ *  全部线路都试过时再走一轮(仍失败才提示错误) —— 403 是按请求随机的,
+ *  同一地址重连下一轮大概率就通了。 */
+function flvSwitchLine(reason: string) {
+  liveTrace?.stage('switchLine')
+  stopFlvStallMonitor()
+  const current = activeIndex.value
+  const next = streams.value.findIndex(
+    (stream, index) => index !== current && !triedIndexes.has(index) && stream.url !== streams.value[current]?.url,
+  )
+  if (next >= 0) {
+    activeIndex.value = next
+    playCurrent()
+    return
+  }
+  if (flvRound < MAX_FLV_ROUNDS) {
+    flvRound += 1
+    triedIndexes.clear()
+    activeIndex.value = 0
+    playCurrent()
+    return
+  }
+  tryNextStream(reason)
 }
 
 /** FLV 致命错误自愈：指数退避重建播放器。 */
@@ -1140,6 +1219,7 @@ async function load() {
   superchatSeen = new Set()
   superchats.value = []
   reconnectCount.value = 0
+  flvRound = 0
   clearReconnectTimer()
   // 先对齐平台, 再用 store 里的取流/详情方法(它们读的是 store.platform)。
   if (store.platform !== platform) store.platform = platform
@@ -1163,7 +1243,9 @@ async function load() {
     void loadSuperchatHistory()
     /**
      * 只有部分平台的流能在 WebView 里直接播:
-     * - 虎牙/哔哩哔哩的 flv 校验 Referer(浏览器禁止脚本改这个头) → 只用 hls;
+     * - 虎牙 HLS 对 Web 端已恒定 403, 但 FLV 可用且 CDN 回了
+     *   `Access-Control-Allow-Origin: *`(不校验 Referer), 因此改走 flv.js;
+     * - 哔哩哔哩的 flv 校验 Referer(浏览器禁止脚本改这个头) → 只用 hls;
      * - 斗鱼只给 flv, 但其 CDN 不校验 Referer 且回了 `Access-Control-Allow-Origin: *`,
      *   交给 flv.js 播; 抖音的 flv 地址自带鉴权参数, 同样不校验 Referer。
      */
@@ -1181,9 +1263,15 @@ async function load() {
     if (canPickQuality && target && streams.value[0]?.quality !== target.name) {
       await fetchQualityStreams(target.qn, false)
     }
-    activeIndex.value = qualities.value.length
-      ? 0
-      : pickQualityIndex(streams.value.length, liveSettings.qualityLevel)
+    // 有独立清晰度列表(B 站/虎牙)时取流已按 qn 过滤, 第 0 条就是目标档;
+    // 斗鱼/抖音没有 qualities, streams 混着多档, 要按偏好落到「该档第一条线路」。
+    const options = qualityOptions.value
+    if (qualities.value.length || !options.length) {
+      activeIndex.value = 0
+    } else {
+      const picked = options[pickQualityIndex(options.length, liveSettings.qualityLevel)]
+      activeIndex.value = picked?.index ?? 0
+    }
     qualitySheetOpen.value = false
     await nextTick()
     liveTrace?.stage('quality')
@@ -1199,10 +1287,9 @@ async function load() {
 
 /** 只保留 WebView 能直接播放的封装。 */
 function playableStreams(list: LiveStream[]) {
+  const flvPlatforms = ['huya', 'douyu', 'douyin']
   return list.filter(
-    (item) =>
-      item.format === 'hls' ||
-      ((platform === 'douyu' || platform === 'douyin') && item.format === 'flv'),
+    (item) => item.format === 'hls' || (flvPlatforms.includes(platform) && item.format === 'flv'),
   )
 }
 
@@ -1276,21 +1363,8 @@ function tryNextStream(reason: string) {
 
 /** 真正交给播放器的地址。
  *
- *  虎牙 CDN 对同一签名地址会间歇性返回 403(实测 8 次里 6 次), hls.js 又不对
- *  4xx 重试, 于是每几秒就致命错误一次。统一走 Rust 的 `/liveHls` 代理, 由后端
- *  重试/换线路/刷新签名; 其它平台直连。 */
-function streamPlaybackUrl(stream: LiveStream): string {
-  if (platform !== 'huya') return stream.url
-  const qn = qualities.value.find((item) => item.name === stream.quality)?.qn ?? 0
-  const params = new URLSearchParams({
-    platform,
-    roomId,
-    qn: String(qn),
-    u: stream.url,
-  })
-  return `${readerOrigin}/liveHls?${params.toString()}`
-}
-
+ *  虎牙改走 FLV 直连(CDN 已回 `Access-Control-Allow-Origin: *`), 同一线路会
+ *  随机 403, 由下面的多线路切换处理; 其它平台同样直连。 */
 function playCurrent() {
   const stream = streams.value[activeIndex.value]
   const video = videoRef.value
@@ -1301,7 +1375,7 @@ function playCurrent() {
   clearReconnectTimer()
   status.value = 'loading'
 
-  const url = streamPlaybackUrl(stream)
+  const url = stream.url
 
   if (stream.format === 'flv') {
     playFlv(url, video)
@@ -1353,7 +1427,12 @@ function playFlv(url: string, video: HTMLVideoElement) {
   )
   flv = player
   player.on(flvjs.Events.ERROR, (type: string, detail: string) => {
-    // FLV 致命错误: 自愈 1-2-4 秒退避, 上限 MAX_RECONNECT 次
+    // 虎牙 CDN 对同一线路随机 403: 网络类错误直接换下一条线路, 比同地址
+    // 指数退避重试快得多; 媒体类错误才走自愈重建。
+    if (type === flvjs.ErrorTypes.NETWORK_ERROR) {
+      flvSwitchLine(`播放中断（${type}: ${detail}）`)
+      return
+    }
     flvRecover(`播放中断（${type}: ${detail}）`, url, video)
   })
   player.attachMediaElement(video)
@@ -1790,19 +1869,6 @@ onBeforeUnmount(() => {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 0, 0, 0.9);
   animation: danmaku-run 9s linear forwards;
   will-change: left;
-}
-
-.danmaku-item.gift,
-.danmaku-item.superchat {
-  padding: 1px 8px;
-  border-radius: var(--radius-full);
-  background: rgba(197, 111, 53, 0.85);
-  font-weight: 600;
-}
-
-.danmaku-item.enter {
-  color: rgba(255, 255, 255, 0.6);
-  font-size: calc(var(--danmaku-font-size, 14px) * 0.8);
 }
 
 @keyframes danmaku-run {

@@ -5,9 +5,11 @@
 //! - 房间列表: `www.huya.com/cache.php?m=LiveList&do=getLiveListByPage`
 //! - 房间详情 + 取流: `mp.huya.com/cache.php?m=Live&do=profileRoom`
 //!
-//! 取流返回的 HLS 地址带时效签名(`wsSecret`), 直接可用; 但同一地址在 CDN 上
-//! 会**随机 403**(实测约一半请求被拒), 所以这里只给候选线路, 由
-//! `hls_proxy` 在真正取清单/分片时重试与换线。
+//! **播放一律走 FLV**: 虎牙的 HLS 地址(`*.hls.huya.com`)对 Web 端已恒定 403
+//! (各种 UA/Referer 实测全部被拒), 而 `baseSteamInfoList` 里的 FLV 地址可用,
+//! 且 CDN 回了 `Access-Control-Allow-Origin: *`, 浏览器里可以直接交给 flv.js
+//! (simple_live / dart_simple_live 也是这么做的)。同一条线路的 FLV 请求会随机
+//! 返回 403(约一半), 所以这里给出全部线路, 由前端在连接失败时立刻换下一条。
 
 use serde_json::Value;
 
@@ -101,25 +103,16 @@ impl Huya {
             let target = qn
                 .and_then(|rate| qualities.iter().find(|item| item.qn == rate).cloned())
                 .or_else(|| qualities.first().cloned());
-            let mut candidates = target
+            let bit_rate = target.as_ref().map(|quality| quality.qn).unwrap_or(0);
+            let quality_name = target
                 .as_ref()
-                .map(|quality| hls_urls_for_quality(&value, quality.qn))
-                .unwrap_or_default();
-            if candidates.is_empty() {
-                candidates = candidate_hls_urls(&value);
-            }
-            // 多线路容灾: 虎牙有多条 CDN(AL 线经常 403), 最多给 3 条候选。
-            //
-            // 这里**不再**逐条探测可达性: 虎牙 CDN 对同一地址会随机 403
-            // (实测约一半请求被拒), 探测本身也会被拒, 反而会把可用线路筛掉。
-            // 可达性交给 `hls_proxy` 在真正取清单时重试/换线。
-            for url in candidates.into_iter().take(3) {
+                .map(|quality| quality.name.clone())
+                .unwrap_or_else(|| "原画".to_string());
+            // 全部线路都给出去: 同一线路会随机 403, 只给一条会让前端反复重连。
+            for url in flv_urls(&value, bit_rate) {
                 streams.push(LiveStream {
-                    format: "hls".to_string(),
-                    quality: target
-                        .as_ref()
-                        .map(|quality| quality.name.clone())
-                        .unwrap_or_else(|| "原画".to_string()),
+                    format: "flv".to_string(),
+                    quality: quality_name.clone(),
                     url,
                 });
             }
@@ -348,90 +341,51 @@ pub fn parse_qualities(value: &Value) -> Vec<LiveQuality> {
         .collect()
 }
 
-/// 指定码率的 HLS 线路。接口在 `multiLine[].url` 里已带 `ratio=<默认码率>`,
-/// 这里替换成目标码率; 线路按 `webPriorityRate` 从高到低排序。
-pub fn hls_urls_for_quality(value: &Value, bit_rate: i64) -> Vec<String> {
+/// FLV 播放线路, 按 `iWebPriorityRate` 从高到低排序。
+///
+/// 地址形如 `{sFlvUrl}/{sStreamName}.{sFlvUrlSuffix}?{sFlvAntiCode}`; 指定码率时
+/// 追加 `ratio=<码率>`。`sFlvAntiCode` 已含 `wsSecret/wsTime/fm/ctype/fs/t`,
+/// 直接可用, 不必自己算签名。
+pub fn flv_urls(value: &Value, bit_rate: i64) -> Vec<String> {
     let Some(lines) = value
-        .pointer("/data/stream/hls/multiLine")
+        .pointer("/data/stream/baseSteamInfoList")
         .and_then(Value::as_array)
     else {
         return Vec::new();
     };
-    let mut entries: Vec<(u64, String)> = lines
-        .iter()
-        .filter_map(|item| {
-            let url = text(item, "url");
-            if url.is_empty() {
-                return None;
-            }
-            Some((
-                number(item, "webPriorityRate"),
-                // rate <= 0 = 默认档: 保留接口下发的 ratio, 不强行替换。
-                if bit_rate > 0 {
-                    with_ratio(&upgrade_https(&url), bit_rate)
-                } else {
-                    upgrade_https(&url)
-                },
-            ))
-        })
-        .collect();
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
-    entries.into_iter().map(|(_, url)| url).collect()
-}
-
-/// 替换 URL 里的 `ratio=` 参数值; 没有该参数时追加。
-fn with_ratio(url: &str, bit_rate: i64) -> String {
-    if let Some(pos) = url.find("ratio=") {
-        let value_start = pos + "ratio=".len();
-        let value_end = url[value_start..]
-            .find('&')
-            .map(|index| value_start + index)
-            .unwrap_or(url.len());
-        return format!("{}ratio={}{}", &url[..pos], bit_rate, &url[value_end..]);
-    }
-    if url.contains('?') {
-        format!("{url}&ratio={bit_rate}")
-    } else {
-        format!("{url}?ratio={bit_rate}")
-    }
-}
-
-fn upgrade_https(raw: &str) -> String {
-    match raw.strip_prefix("http://") {
-        Some(rest) => format!("https://{rest}"),
-        None => raw.to_string(),
-    }
-}
-
-/// 由 `baseSteamInfoList` 拼出候选 HLS 地址, 按线路优先级排序。
-/// 优先 https, 其次 http; 同一线路的两种协议都会给出, 由 `is_reachable` 决定。
-pub fn candidate_hls_urls(value: &Value) -> Vec<String> {
-    let Some(items) = value.pointer("/data/stream/baseSteamInfoList").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut urls = Vec::new();
-    for item in items {
-        let host = text(item, "sHlsUrl");
+    let mut entries: Vec<(u64, String)> = Vec::new();
+    for item in lines {
+        let host = text(item, "sFlvUrl");
         let name = text(item, "sStreamName");
-        let suffix = text(item, "sHlsUrlSuffix");
-        let anti = text(item, "sHlsAntiCode");
-        if host.is_empty() || name.is_empty() || suffix.is_empty() {
+        let anti = text(item, "sFlvAntiCode");
+        if host.is_empty() || name.is_empty() {
             continue;
         }
-        let base = format!("{host}/{name}.{suffix}");
-        let https = base
-            .strip_prefix("http://")
-            .map(|rest| format!("https://{rest}"))
-            .unwrap_or_else(|| base.clone());
-        if anti.is_empty() {
-            urls.push(https);
-            urls.push(base);
-        } else {
-            urls.push(format!("{https}?{anti}"));
-            urls.push(format!("{base}?{anti}"));
+        let suffix = match text(item, "sFlvUrlSuffix") {
+            empty if empty.is_empty() => "flv".to_string(),
+            value => value,
+        };
+        let mut url = format!("{host}/{name}.{suffix}");
+        let mut query = anti;
+        if bit_rate > 0 {
+            query = if query.is_empty() {
+                format!("ratio={bit_rate}")
+            } else {
+                format!("{query}&ratio={bit_rate}")
+            };
         }
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query);
+        }
+        // 同一地址可能被接口重复下发(不同码率的同名线路)。
+        if entries.iter().any(|(_, existing)| existing == &url) {
+            continue;
+        }
+        entries.push((number(item, "iWebPriorityRate"), url));
     }
-    urls
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.into_iter().map(|(_, url)| url).collect()
 }
 
 #[cfg(test)]
@@ -509,17 +463,45 @@ mod tests {
     }
 
     #[test]
-    fn builds_candidate_urls_with_https_first() {
+    fn builds_flv_urls_with_priority_and_ratio() {
         let value = serde_json::json!({
             "data": { "stream": { "baseSteamInfoList": [
-                { "sHlsUrl": "http://al.hls.huya.com/src", "sStreamName": "a-b-c",
-                  "sHlsUrlSuffix": "m3u8", "sHlsAntiCode": "wsSecret=1&wsTime=2" }
+                { "sFlvUrl": "http://al.flv.huya.com/src", "sStreamName": "a-b-c",
+                  "sFlvUrlSuffix": "flv", "sFlvAntiCode": "wsSecret=1&wsTime=2",
+                  "iWebPriorityRate": -1 },
+                { "sFlvUrl": "http://hs.flv.huya.com/src", "sStreamName": "a-b-c",
+                  "sFlvUrlSuffix": "flv", "sFlvAntiCode": "wsSecret=1&wsTime=2",
+                  "iWebPriorityRate": 50 },
+                // 重复线路应被去重
+                { "sFlvUrl": "http://hs.flv.huya.com/src", "sStreamName": "a-b-c",
+                  "sFlvUrlSuffix": "flv", "sFlvAntiCode": "wsSecret=1&wsTime=2",
+                  "iWebPriorityRate": 50 }
             ]}}
         });
-        let urls = candidate_hls_urls(&value);
+        let urls = flv_urls(&value, 8000);
         assert_eq!(urls.len(), 2);
-        assert_eq!(urls[0], "https://al.hls.huya.com/src/a-b-c.m3u8?wsSecret=1&wsTime=2");
-        assert_eq!(urls[1], "http://al.hls.huya.com/src/a-b-c.m3u8?wsSecret=1&wsTime=2");
+        // 优先级高的 HS 在前, 且都追加了目标码率。
+        assert_eq!(
+            urls[0],
+            "http://hs.flv.huya.com/src/a-b-c.flv?wsSecret=1&wsTime=2&ratio=8000"
+        );
+        assert_eq!(
+            urls[1],
+            "http://al.flv.huya.com/src/a-b-c.flv?wsSecret=1&wsTime=2&ratio=8000"
+        );
+    }
+
+    #[test]
+    fn flv_urls_defaults_suffix_and_skips_ratio_for_zero() {
+        let value = serde_json::json!({
+            "data": { "stream": { "baseSteamInfoList": [
+                { "sFlvUrl": "http://tx.flv.huya.com/src", "sStreamName": "s",
+                  "sFlvUrlSuffix": "", "sFlvAntiCode": "wsSecret=1" },
+                { "sFlvUrl": "", "sStreamName": "ignored", "sFlvAntiCode": "x" }
+            ]}}
+        });
+        let urls = flv_urls(&value, 0);
+        assert_eq!(urls, vec!["http://tx.flv.huya.com/src/s.flv?wsSecret=1"]);
     }
 
     #[test]
@@ -541,32 +523,43 @@ mod tests {
         assert_eq!(qualities[2].qn, 2000);
     }
 
-    #[test]
-    fn builds_quality_urls_with_ratio_and_priority() {
-        let value = serde_json::json!({
-            "data": { "stream": { "hls": { "multiLine": [
-                { "url": "http://al.hls.huya.com/src/a.m3u8?ratio=2000&wsSecret=1",
-                  "webPriorityRate": 10 },
-                { "url": "http://tx.hls.huya.com/src/a.m3u8?ratio=2000&wsSecret=1",
-                  "webPriorityRate": 70 }
-            ]}}}
-        });
-        let urls = hls_urls_for_quality(&value, 8000);
-        assert_eq!(urls.len(), 2);
-        // 优先级高的 TX 线路排在最前, 且 ratio 被替换成目标码率。
-        assert_eq!(urls[0], "https://tx.hls.huya.com/src/a.m3u8?ratio=8000&wsSecret=1");
-        assert_eq!(urls[1], "https://al.hls.huya.com/src/a.m3u8?ratio=8000&wsSecret=1");
-    }
+    /// 真实网络冒烟测试: `cargo test --lib huya -- --ignored`。
+    ///
+    /// 断言取到的是 FLV 线路(虎牙 HLS 对 Web 端已恒定 403), 且至少一条能连上。
+    /// 同一线路会随机 403, 因此每条线路允许重试一次。
+    #[tokio::test]
+    #[ignore]
+    async fn huya_returns_playable_flv_lines() {
+        use crate::crawler::http_client::HttpClient;
+        let http = HttpClient::new(15, None).expect("http client");
+        let huya = Huya::new(http.clone());
+        // 房间号需自行替换为正在直播的房间(998 只是常用测试间)。
+        let info = huya.stream_urls("998", None).await.expect("stream info");
+        assert!(info.is_live, "房间未开播, 请换一个正在直播的房间号");
+        assert!(!info.streams.is_empty(), "没有取到任何线路");
+        assert!(
+            info.streams.iter().all(|item| item.format == "flv"),
+            "虎牙应只下发 FLV"
+        );
 
-    #[test]
-    fn appends_ratio_when_missing() {
-        assert_eq!(
-            with_ratio("https://a.com/live.m3u8?wsSecret=1", 4000),
-            "https://a.com/live.m3u8?wsSecret=1&ratio=4000"
-        );
-        assert_eq!(
-            with_ratio("https://a.com/live.m3u8", 500),
-            "https://a.com/live.m3u8?ratio=500"
-        );
+        let mut connected = false;
+        'outer: for stream in info.streams.iter().take(4) {
+            for _ in 0..2 {
+                if let Ok(response) = http
+                    .client()
+                    .get(&stream.url)
+                    .header(reqwest::header::USER_AGENT, USER_AGENT)
+                    .timeout(std::time::Duration::from_secs(8))
+                    .send()
+                    .await
+                {
+                    if response.status().is_success() {
+                        connected = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert!(connected, "所有 FLV 线路都连不上");
     }
 }

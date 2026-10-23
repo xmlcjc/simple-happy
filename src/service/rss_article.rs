@@ -16,14 +16,22 @@ use url::Url;
 const CANDIDATE_SELECTORS: &[&str] = &[
     "article",
     "[itemprop=articleBody]",
+    // 微信公众号 / 知乎 / 少数派 / IT之家 等常见正文容器。
+    "#js_content",
+    ".Post-RichText",
     ".rich_media_content",
+    ".article__content",
+    ".post_content",
     ".article-content",
     ".article_content",
     ".post-content",
     ".entry-content",
+    ".entry",
     ".markdown-body",
     ".blog-content",
     ".article-body",
+    ".news-content",
+    ".detail-content",
     "#article",
     "#content",
     ".content",
@@ -100,17 +108,28 @@ pub fn extract_article(html: &str, page_url: &str) -> (String, String) {
         }
     }
 
-    // 没有命中任何已知容器时退回 body(再靠清洗去掉导航/页脚)。
-    let raw = best.map(|(_, inner)| inner).unwrap_or_else(|| {
-        let body = Selector::parse("body").expect("body selector");
-        document
-            .select(&body)
-            .next()
-            .map(|element| element.inner_html())
-            .unwrap_or_default()
-    });
+    // 正文容器命中但内容偏少(站点把正文包在多层 div / 使用非标准 class)时,
+    // 再拿 body 兜底并取文本更多的一份; 容器本身够长就直接用, 避免把整页导航
+    // 塞进阅读区。
+    let body_html = Selector::parse("body")
+        .ok()
+        .and_then(|selector| {
+            document
+                .select(&selector)
+                .next()
+                .map(|element| element.inner_html())
+        })
+        .unwrap_or_default();
 
-    let cleaned = sanitize(&raw, base.as_ref());
+    let mut cleaned = best
+        .map(|(_, inner)| sanitize(&inner, base.as_ref()))
+        .unwrap_or_default();
+    if plain_text_len(&cleaned) < 300 && !body_html.is_empty() {
+        let from_body = sanitize(&body_html, base.as_ref());
+        if plain_text_len(&from_body) > plain_text_len(&cleaned) {
+            cleaned = from_body;
+        }
+    }
     if plain_text_len(&cleaned) < 60 {
         return (title, String::new());
     }

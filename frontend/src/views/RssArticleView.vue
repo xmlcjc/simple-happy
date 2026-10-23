@@ -35,7 +35,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onBeforeUnmount, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRssStore } from '../stores/rss'
 import { saveRecentReadBook } from '../utils/recentBooks'
@@ -47,6 +47,8 @@ const router = useRouter()
 const store = useRssStore()
 
 onMounted(async () => {
+  // 捕获阶段兜底: 正文里的任何 <a> 都不允许导航出应用。
+  window.addEventListener('click', handleContentClick, true)
   const source = String(route.query.source || '')
   const link = String(route.query.link || '')
   if (!source || !link) return
@@ -87,14 +89,35 @@ function goBack() {
   router.push('/rss')
 }
 
+onBeforeUnmount(() => {
+  window.removeEventListener('click', handleContentClick, true)
+})
+
 /** 正文链接在应用内打开, 不交给系统浏览器。 */
 function handleContentClick(event: MouseEvent) {
+  // 窗口级捕获监听与容器上的 @click 都会进来, 只处理一次。
+  if (event.defaultPrevented) return
   const anchor = (event.target as HTMLElement | null)?.closest('a')
   if (!anchor) return
+  // 先拦下默认导航, 避免 WebView2 把它交给系统浏览器打开。
   event.preventDefault()
-  const href = anchor.getAttribute('href') || ''
-  if (!/^https?:\/\//i.test(href)) return
+  event.stopPropagation()
+  const href = resolveContentLink(anchor.getAttribute('href'))
+  if (!href) return
   void store.openLinkedPage(href, (anchor.textContent || '').trim() || undefined)
+}
+
+/** 正文里的 `href` 可能是相对地址, 按当前文章链接补全后再走站内阅读。 */
+function resolveContentLink(raw: string | null): string {
+  const value = (raw || '').trim()
+  if (!value || value.startsWith('#') || /^javascript:/i.test(value)) return ''
+  if (/^https?:\/\//i.test(value)) return value
+  const base = store.activeArticle?.link || ''
+  try {
+    return new URL(value, base).toString()
+  } catch {
+    return ''
+  }
 }
 
 function formatRelativeTime(value?: string) {

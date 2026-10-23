@@ -5,7 +5,6 @@ pub mod danmaku;
 pub mod douyin;
 pub mod douyu;
 pub mod follow;
-pub mod hls_proxy;
 pub mod history;
 pub mod huya;
 pub mod models;

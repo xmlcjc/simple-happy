@@ -73,8 +73,13 @@ export const useRssStore = defineStore('rss', () => {
       .trim()
   }
 
-  /** 正文是否是"摘要/被截断"(只有摘要或带"查看全文"链接)。 */
-  function isTruncatedContent(content?: string | null) {
+  /** 正文是否是"摘要/被截断"(只有摘要或带"查看全文"链接)。
+   *
+   *  判定不再只看字数与固定文案: 只要正文里的链接指回文章自身, 就说明订阅源
+   *  只给了摘要 + 一个「查看全文」入口(各家文案不同: 阅读全文 / 查看原文 /
+   *  Read more / 全文 »), 一律视为截断并去抓原网页。
+   */
+  function isTruncatedContent(content?: string | null, articleLink?: string | null) {
     const raw = (content || '').trim()
     if (!raw) return true
     const text = raw
@@ -85,7 +90,40 @@ export const useRssStore = defineStore('rss', () => {
       .trim()
     if (!text) return true
     if (text.length < 400) return true
-    return /阅读全文|查看全文|继续阅读|点击阅读|read\s*more|全文\s*»/i.test(text)
+    if (
+      /(?:阅读|查看|继续|点击|显示)\s*(?:全文|原文)|read\s*more|continue\s*reading|full\s*(?:story|article)|全文\s*[»›>]/i.test(
+        text,
+      )
+    ) {
+      return true
+    }
+    return containsSelfLink(raw, articleLink)
+  }
+
+  /** 正文里是否有一个链接指回文章自身(feed 的「查看全文」通常就是这么写的)。 */
+  function containsSelfLink(html: string, articleLink?: string | null) {
+    if (!articleLink) return false
+    const self = comparableUrl(articleLink)
+    if (!self) return false
+    for (const match of html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
+      const href = match[1]
+      if (!href || href.startsWith('#')) continue
+      if (comparableUrl(href) === self) return true
+    }
+    return false
+  }
+
+  /** 去掉协议/末尾斜杠/查询串, 只比对「主机 + 路径」, 相对地址按原样比较路径。 */
+  function comparableUrl(value: string) {
+    const raw = value.trim()
+    if (!raw) return ''
+    try {
+      const parsed = new URL(raw)
+      return `${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`.toLowerCase()
+    } catch {
+      const path = raw.split(/[?#]/)[0] || ''
+      return path.replace(/^\/+|\/+$/g, '').toLowerCase()
+    }
   }
 
   function sourceGroups(source: RssSource) {
@@ -251,8 +289,10 @@ export const useRssStore = defineStore('rss', () => {
       })
     }
 
-    // 摘要/被截断的正文自动抓原网页全文; 已完整的内嵌正文不再发请求。
-    if (!isTruncatedContent(inlineContent)) return
+    // 订阅源只给了 description(没有 content:encoded), 或正文是"摘要 + 查看全文"
+    // 时, 一律去抓原网页全文; 只有内嵌正文足够长且没有指回自身的链接才跳过。
+    const hasFeedContent = Boolean((article.content || '').trim())
+    if (hasFeedContent && !isTruncatedContent(inlineContent, article.link)) return
     contentLoading.value = !inlineContent
     try {
       const fetchedContent = normalizeFetchedContent(

@@ -644,6 +644,9 @@ pub fn parse_play_streams(value: &Value) -> Vec<LiveStream> {
         }
         deduped.push(stream);
     }
+    // `mcdn` 是 B 站的 P2P 线路, 稳定性明显差于普通 CDN; 与 simple_live 一致
+    // 把它整体排到最后(stable sort, 其余线路保持接口下发的顺序)。
+    deduped.sort_by_key(|stream| stream.url.contains("mcdn"));
     deduped
 }
 
@@ -866,6 +869,39 @@ mod tests {
         assert_eq!(info.streams[1].url, "https://ac1.bilivideo.com/live/bvc/1.m3u8&line=2");
         assert_eq!(info.streams[2].format, "flv");
         assert_eq!(info.streams[2].url, "https://cn.bilivideo.com/live/bvc/1.flv?x=1&y=2");
+    }
+
+    /// 多 CDN 线路里 `mcdn`(P2P)必须排到最后, 其余顺序保持不变。
+    #[test]
+    fn sorts_mcdn_lines_last() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": {
+                "live_status": 1,
+                "playurl_info": { "playurl": {
+                    "g_qn_desc": [{ "qn": 10000, "desc": "原画" }],
+                    "stream": [
+                        { "protocol_name": "http_hls", "format": [
+                            { "format_name": "ts", "codec": [
+                                { "codec_name": "avc", "current_qn": 10000,
+                                  "base_url": "/live/bvc/1.m3u8",
+                                  "url_info": [
+                                    { "host": "https://mcdn.bilivideo.com" },
+                                    { "host": "https://d1.bilivideo.com" }
+                                  ] }
+                            ]}
+                        ]}
+                    ]
+                }}
+            }
+        });
+        let urls: Vec<String> = parse_play_streams(&value)
+            .into_iter()
+            .map(|stream| stream.url)
+            .collect();
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].contains("d1.bilivideo.com"), "{urls:?}");
+        assert!(urls[1].contains("mcdn"), "{urls:?}");
     }
 
     #[test]

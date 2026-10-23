@@ -68,8 +68,6 @@ async fn route(
         "/musicStream" => music_stream_route(state, query).await,
         // 本地音乐: 只放行曲库里登记过的路径, 避免任意文件读取。
         "/musicLocal" => music_local_route(state, query).await,
-        // 直播 HLS 代理: 虎牙 CDN 会间歇性 403, 由 Rust 侧重试/换线路/刷新签名。
-        "/liveHls" => live_hls_route(state, query).await,
         // 登录页兜底: 登录 iframe 跑在专属路径空间里, 并**完整保留上游路径**:
         //   http://reader.localhost/__login/<session>/user/me?app=yuedu
         //
@@ -1209,44 +1207,6 @@ async fn book_source_proxy_forward(
     .await
     {
         Ok(response) => response,
-        Err(err) => error_response(502, &err.to_string()),
-    }
-}
-
-/// 直播 HLS 代理: `/liveHls?platform=huya&roomId=..&qn=..&u=<上游地址>`。
-///
-/// - 不带 `seg`: 返回改写后的 m3u8 清单;
-/// - 带 `seg`: 返回分片字节。
-///
-/// 上游 CDN 会间歇性 403, 具体重试/换线路逻辑在 `service::live::hls_proxy`。
-async fn live_hls_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
-    let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .collect();
-    let platform = params.get("platform").map(String::as_str).unwrap_or("huya");
-    let room_id = params.get("roomId").map(String::as_str).unwrap_or("");
-    let qn = params.get("qn").and_then(|value| value.parse::<i64>().ok());
-
-    if let Some(segment) = params.get("seg").map(String::as_str).filter(|v| !v.is_empty()) {
-        return match state.live_service.hls_segment(segment).await {
-            Ok((bytes, content_type)) => bytes_response(bytes, &content_type, Some("no-store")),
-            Err(err) => error_response(502, &err.to_string()),
-        };
-    }
-
-    if room_id.is_empty() {
-        return error_response(400, "missing roomId");
-    }
-    match state
-        .live_service
-        .hls_playlist(platform, room_id, qn, params.get("u").map(String::as_str))
-        .await
-    {
-        Ok(body) => bytes_response(
-            body.into_bytes(),
-            "application/vnd.apple.mpegurl",
-            Some("no-store"),
-        ),
         Err(err) => error_response(502, &err.to_string()),
     }
 }
