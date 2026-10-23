@@ -18,11 +18,17 @@ use crate::storage::{cache::file_cache::FileCache, db, fs::storage_fs::StorageFs
 
 /// Install the global tracing subscriber.
 ///
+/// 日志同时写 stdout 与 `<storage_dir>/logs/app.log`（2 MB 轮换一份历史）。
+/// 落盘失败只会退回控制台，不影响启动。
+///
 /// Safe to call more than once — a second call is ignored instead of panicking,
 /// so an embedding process can install its own subscriber first.
-pub fn init_tracing(log_level: &str) {
+pub fn init_tracing(log_level: &str, storage_dir: &str) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(log_level))
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(crate::util::log_file::LogWriter::new(storage_dir))
         .try_init();
 }
 

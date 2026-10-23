@@ -3,6 +3,7 @@ import { get, post, invokeUpload } from './invoke'
 import { readerOrigin } from './scheme'
 import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
 import type { ApiResponse, Book, BookChapter, BookGroup } from '../types'
+import { createLoadTrace } from '../utils/diagnostics'
 
 export function getBookshelf() {
   return get<Book[]>('/getBookshelf').then((r) => r.data)
@@ -76,14 +77,22 @@ export function getBookContent(params: {
   // 后端命令的 Channel 参数是必需的（Tauri 不支持 Option<Channel>），
   // 所以不关心进度时也要传一个通道，忽略其消息即可。
   const channel = new Channel<{ stage?: ContentLoadStage }>()
+  const trace = createLoadTrace('book-content', { index: params.index ?? 0 })
   if (onStage) {
     channel.onmessage = (payload) => {
-      if (payload?.stage) onStage(payload.stage)
+      if (payload?.stage) {
+        trace.stage(payload.stage)
+        onStage(payload.stage)
+      }
     }
   }
   return invoke<ApiResponse<string>>('get_book_content', { req, onStage: channel }).then((res) => {
     if (!res.isSuccess) throw new Error(res.errorMsg || '加载章节失败')
+    trace.finish('success')
     return res.data as string
+  }).catch((error) => {
+    trace.fail('fetching')
+    throw error
   })
 }
 

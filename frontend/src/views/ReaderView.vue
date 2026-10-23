@@ -325,6 +325,8 @@
       >
         <div class="selection-menu-text">{{ selectionMenu.text }}</div>
         <div class="selection-menu-actions">
+          <button @click="speakFromSelection()">从本段听</button>
+          <button @click="toggleSelectionHighlight()">{{ selectionHighlighted ? '取消划线' : '划线' }}</button>
           <button @click="() => addSelectionBookmark()">加入书签</button>
           <button @click="addSelectionReplaceRule('book')">按本书替换</button>
           <button @click="addSelectionReplaceRule('source')">按书源替换</button>
@@ -464,6 +466,12 @@ import { useHorizontalPaging } from '../composables/useHorizontalPaging'
 import { useContinuousReading } from '../composables/useContinuousReading'
 import { useReaderAutoPlayback } from '../composables/useReaderAutoPlayback'
 import { useSourceImport } from '../composables/useSourceImport'
+import {
+  deleteHighlight,
+  getHighlights,
+  saveHighlight,
+  type BookHighlight,
+} from '../api/highlight'
 
 const ReaderCatalog = defineAsyncComponent(() => import('../components/reader/ReaderCatalog.vue'))
 const ReadSettings = defineAsyncComponent(() => import('../components/reader/ReadSettings.vue'))
@@ -3346,6 +3354,281 @@ function handleTTS() {
   showTTSPanel.value = true
 }
 
+/** 从选中文字所在段落开始朗读（段落菜单 / 选区浮条入口）。 */
+function speakFromSelection() {
+  const selection = window.getSelection?.()
+  if (!selection || selection.rangeCount === 0) return
+  const node = selection.getRangeAt(0).startContainer
+  const element = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as HTMLElement | null)
+  const paragraph = element?.closest('p') as HTMLElement | null
+  hideSelectionMenu()
+  selection.removeAllRanges()
+  if (!paragraph) {
+    appStore.showToast('未找到可朗读的段落', 'warning')
+    return
+  }
+  ttsPanelDismissed.value = false
+  showTTSPanel.value = true
+  startSpeech(paragraph)
+}
+
+const TTS_HIGHLIGHT_NAME = 'simple-happy-tts'
+
+function clearTtsSentenceHighlight() {
+  const css = (window as unknown as { CSS?: { highlights?: Map<string, unknown> } }).CSS
+  css?.highlights?.delete(TTS_HIGHLIGHT_NAME)
+}
+
+/** 把段落内 [start, end) 字符区间映射成 DOM Range。 */
+function rangeFromTextOffsets(element: HTMLElement, start: number, end: number): Range | null {
+  if (typeof document.createTreeWalker !== 'function') return null
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
+  let offset = 0
+  let startNode: Node | null = null
+  let startOffset = 0
+  let endNode: Node | null = null
+  let endOffset = 0
+  let node = walker.nextNode()
+  while (node) {
+    const length = node.nodeValue?.length ?? 0
+    if (!startNode && offset + length >= start) {
+      startNode = node
+      startOffset = Math.max(0, start - offset)
+    }
+    if (!endNode && offset + length >= end) {
+      endNode = node
+      endOffset = Math.max(0, end - offset)
+      break
+    }
+    offset += length
+    node = walker.nextNode()
+  }
+  if (!startNode || !endNode) return null
+  const range = document.createRange()
+  range.setStart(startNode, Math.min(startOffset, startNode.nodeValue?.length ?? 0))
+  range.setEnd(endNode, Math.min(endOffset, endNode.nodeValue?.length ?? 0))
+  return range
+}
+
+/**
+ * 系统朗读推进时给「当前句」上高亮。
+ *
+ * 自动听书已经按段落切分并用 `.reading` 标出当前段落；这里再用 charIndex
+ * 把段落内的句子范围标出来。使用 CSS Custom Highlight API（WebView2 支持），
+ * 不改正文 DOM，因此不会干扰左右分页的快照与页内搜索高亮。
+ */
+function applyTtsSentenceHighlight() {
+  const css = (window as unknown as {
+    CSS?: { highlights?: Map<string, unknown> }
+    Highlight?: new (...ranges: Range[]) => unknown
+  }).CSS
+  const HighlightCtor = (window as unknown as { Highlight?: new (...ranges: Range[]) => unknown }).Highlight
+  if (!css?.highlights || !HighlightCtor) return
+  css.highlights.delete(TTS_HIGHLIGHT_NAME)
+  if (!store.isSpeaking || store.speechConfig.provider !== 'system') return
+  const paragraph = scrollContainerRef.value?.querySelector('.reading') as HTMLElement | null
+  if (!paragraph) return
+
+  const text = (paragraph.textContent || '').trim()
+  if (!text) return
+
+  const index = Math.max(0, Math.min(text.length - 1, store.speechCharIndex))
+  const delimiters = '。！？!?；;\n'
+  let start = index
+  while (start > 0 && !delimiters.includes(text[start - 1])) start -= 1
+  let end = index
+  while (end < text.length && !delimiters.includes(text[end])) end += 1
+  if (end < text.length) end += 1
+  if (end <= start) return
+
+  const range = rangeFromTextOffsets(paragraph, start, end)
+  if (!range) return
+  css.highlights.set(TTS_HIGHLIGHT_NAME, new HighlightCtor(range))
+}
+
+watch(
+  [() => store.isSpeaking, () => store.speechCharIndex, () => store.speechConfig.provider],
+  () => applyTtsSentenceHighlight(),
+)
+watch(() => store.currentIndex, () => clearTtsSentenceHighlight())
+
+/* ─── 本地划线 ─── */
+
+const highlights = ref<BookHighlight[]>([])
+const selectionHighlighted = ref(false)
+
+/** 段落文本归一化：折叠空白，换源/重排后仍能按文本找回位置。 */
+function normalizeHighlightText(text: string) {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function currentChapterIndex(container: HTMLElement | null) {
+  const raw = container?.dataset.chapterIndex
+  const parsed = raw === undefined ? NaN : Number(raw)
+  return Number.isFinite(parsed) ? parsed : store.currentIndex
+}
+
+/**
+ * 段落在整章里的序号。
+ *
+ * 左右分页把一章切成多个 `.horizontal-page-content`，单页内 `p` 的下标会在
+ * 每页重新从 0 开始；直接存页内下标会让两页的第一段互相覆盖。这里按文档顺序
+ * 把前面各页的段落数累加，得到章节级序号。
+ */
+function paragraphBlockIndex(paragraph: HTMLElement): number {
+  const container = paragraph.closest('.chapter-text') as HTMLElement | null
+  if (!container) return -1
+  const localIndex = (Array.from(container.querySelectorAll('p')) as HTMLElement[]).indexOf(paragraph)
+  if (localIndex < 0 || !container.classList.contains('horizontal-page-content')) return localIndex
+
+  const root = scrollContainerRef.value
+  if (!root) return localIndex
+  const chapterIndex = currentChapterIndex(container)
+  const pages = Array.from(root.querySelectorAll('.horizontal-page-content')) as HTMLElement[]
+  let offset = 0
+  for (const page of pages) {
+    if (page === container) break
+    if (currentChapterIndex(page) !== chapterIndex) continue
+    offset += page.querySelectorAll('p').length
+  }
+  return offset + localIndex
+}
+
+function findHighlightForParagraph(paragraph: HTMLElement | null) {
+  if (!paragraph || !store.book) return undefined
+  const container = paragraph.closest('.chapter-text') as HTMLElement | null
+  const index = paragraphBlockIndex(paragraph)
+  const chapterIndex = currentChapterIndex(container)
+  const text = normalizeHighlightText(paragraph.innerText)
+  return highlights.value.find(
+    (item) =>
+      item.bookUrl === store.book!.bookUrl
+      && item.chapterIndex === chapterIndex
+      && (item.text === text || item.blockIndex === index),
+  )
+}
+
+/** 在已渲染正文上标注划线段落；按章节序号 + 文本双重匹配。 */
+function applyHighlightsToDom() {
+  const root = scrollContainerRef.value
+  if (!root) return
+  root.querySelectorAll('.chapter-text p.reader-highlight').forEach((el) => {
+    el.classList.remove('reader-highlight')
+  })
+  if (!highlights.value.length || !store.book) return
+
+  const containers = Array.from(root.querySelectorAll('.chapter-text')) as HTMLElement[]
+  for (const container of containers) {
+    const chapterIndex = currentChapterIndex(container)
+    const paragraphs = Array.from(container.querySelectorAll('p')) as HTMLElement[]
+    for (const paragraph of paragraphs) {
+      const text = normalizeHighlightText(paragraph.innerText)
+      const index = paragraphBlockIndex(paragraph)
+      const hit = highlights.value.some(
+        (item) =>
+          item.bookUrl === store.book!.bookUrl
+          && item.chapterIndex === chapterIndex
+          && (item.text === text || item.blockIndex === index),
+      )
+      paragraph.classList.toggle('reader-highlight', hit)
+    }
+  }
+}
+
+async function loadHighlights() {
+  highlights.value = await getHighlights().catch(() => [])
+  await nextTick()
+  applyHighlightsToDom()
+}
+
+/** 选区所在段落（找不到就返回 null）。 */
+function selectionParagraph(): HTMLElement | null {
+  const selection = window.getSelection?.()
+  if (!selection || selection.rangeCount === 0) return null
+  const node = selection.getRangeAt(0).startContainer
+  const element = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as HTMLElement | null)
+  return (element?.closest('p') as HTMLElement | null) ?? null
+}
+
+async function toggleSelectionHighlight() {
+  const paragraph = selectionParagraph()
+  if (!paragraph || !store.book) {
+    hideSelectionMenu()
+    return
+  }
+  const container = paragraph.closest('.chapter-text') as HTMLElement | null
+  const blockIndex = paragraphBlockIndex(paragraph)
+  const chapterIndex = currentChapterIndex(container)
+  const chapter = store.currentChapter
+  const text = normalizeHighlightText(paragraph.innerText)
+  if (!text || blockIndex < 0) {
+    hideSelectionMenu()
+    return
+  }
+
+  const existing = findHighlightForParagraph(paragraph)
+  const selection = window.getSelection?.()
+  try {
+    if (existing) {
+      await deleteHighlight(existing)
+      highlights.value = highlights.value.filter(
+        (item) =>
+          !(item.bookUrl === existing.bookUrl
+            && item.chapterIndex === existing.chapterIndex
+            && item.blockIndex === existing.blockIndex),
+      )
+      appStore.showToast('已取消划线', 'success')
+    } else {
+      const record: BookHighlight = {
+        bookUrl: store.book.bookUrl,
+        bookName: store.book.name,
+        bookAuthor: store.book.author,
+        chapterIndex,
+        chapterUrl: chapter?.url || '',
+        chapterTitle: chapter?.title || '',
+        blockIndex,
+        text,
+        note: '',
+        createdAt: Date.now(),
+      }
+      await saveHighlight(record)
+      highlights.value = [...highlights.value, record]
+      appStore.showToast('已划线', 'success')
+    }
+    await nextTick()
+    applyHighlightsToDom()
+  } catch (error) {
+    appStore.showToast((error as Error).message || '划线失败', 'error')
+  } finally {
+    selection?.removeAllRanges()
+    hideSelectionMenu()
+  }
+}
+
+watch(
+  [() => selectionMenu.value.visible, () => selectionMenu.value.text],
+  () => {
+    if (!selectionMenu.value.visible) {
+      selectionHighlighted.value = false
+      return
+    }
+    selectionHighlighted.value = Boolean(findHighlightForParagraph(selectionParagraph()))
+  },
+)
+
+watch(
+  [() => store.content, () => store.currentIndex, () => horizontalPages.value.length],
+  () => {
+    void nextTick().then(applyHighlightsToDom)
+  },
+)
+
+watch(() => store.book?.bookUrl, () => void loadHighlights())
+
+onMounted(() => {
+  void loadHighlights()
+})
+
 /** 关闭听书面板 = 结束听书。否则面板消失后朗读还在继续, 而用户已经没有任何
  *  入口回到它(除非再点一次听书), 容易变成"关不掉的声音"。 */
 function closeTTSPanel() {
@@ -4360,6 +4643,18 @@ watch(
   background: rgba(201, 127, 58, 0.12);
   border-radius: 10px;
   box-shadow: inset 0 0 0 1px rgba(201, 127, 58, 0.18);
+}
+
+/* 听书句高亮：CSS Custom Highlight API，不修改正文 DOM。 */
+:global(::highlight(simple-happy-tts)) {
+  background: rgba(250, 204, 21, 0.45);
+  color: inherit;
+}
+
+/* 本地划线：段落级底色，避免影响正文排版与分页快照。 */
+:deep(.chapter-text p.reader-highlight) {
+  background: linear-gradient(transparent 58%, rgba(250, 204, 21, 0.55) 58%);
+  border-radius: 2px;
 }
 
 /* 本地 EPUB: 正文排版以原书 CSS 为准(原书规则随章节内联, 在 DOM 中位于本组件

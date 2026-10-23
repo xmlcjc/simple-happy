@@ -197,6 +197,7 @@ export const useAppStore = defineStore('app', () => {
   const showSourceManager = ref(false)
   const showUserManager = ref(false)
   const showWebdavManager = ref(false)
+  const showLogViewer = ref(false)
   const isOnline = ref(typeof navigator !== 'undefined' ? navigator.onLine : true)
 
   const initialReadingStats = (() => {
@@ -412,7 +413,7 @@ export const useAppStore = defineStore('app', () => {
     legadoWebdavConfig, setLegadoWebdavConfig, legadoSyncEnabled, setLegadoSyncEnabled,
     bossKeyEnabled, bossKeyShortcut, applyBossKey, setBossKeyEnabled, setBossKeyShortcut,
     networkProxyMode, networkProxyUrl, networkProxyStatus, applyNetworkProxy, setNetworkProxy,
-    showLoginModal, showSettingsDrawer, showSourceManager, showUserManager, showWebdavManager,
+    showLoginModal, showSettingsDrawer, showSourceManager, showUserManager, showWebdavManager, showLogViewer,
     isOnline, setOnlineStatus,
     readingStats, readingStatsSummary, startReadingSession, stopReadingSession, setReadingSessionBook, markBookOpened, markChapterRead,
     toasts, showToast, dismissToast,

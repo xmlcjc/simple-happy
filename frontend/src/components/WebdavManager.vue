@@ -31,6 +31,27 @@
             >WebDAV 网盘备份</button>
           </nav>
 
+          <div class="restore-mode-row">
+            <span class="restore-mode-label">恢复方式</span>
+            <div class="restore-mode-tabs" role="group" aria-label="恢复方式">
+              <button
+                type="button"
+                :class="{ active: restoreMode === 'replace' }"
+                @click="restoreMode = 'replace'"
+              >覆盖</button>
+              <button
+                type="button"
+                :class="{ active: restoreMode === 'merge' }"
+                @click="restoreMode = 'merge'"
+              >合并</button>
+            </div>
+            <small>
+              {{ restoreMode === 'merge'
+                ? '保留本地书架与较新的阅读进度，只补充备份中缺失的数据'
+                : '清空当前书架、书源等数据后按备份还原' }}
+            </small>
+          </div>
+
           <div v-if="!webdavAvailable" class="notice warning">
             <strong>{{ unavailableTitle }}</strong>
             <span>{{ unavailableMessage }}</span>
@@ -256,6 +277,8 @@ const emit = defineEmits<{
 const appStore = useAppStore()
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const activeBackupTab = ref<'local' | 'webdav'>('local')
+/** 恢复方式：覆盖（原行为）或合并（保留本地数据，按身份补齐）。 */
+const restoreMode = ref<'replace' | 'merge'>('replace')
 const currentPath = ref('/')
 const entries = ref<EntryRow[]>([])
 const selectedPaths = ref<string[]>([])
@@ -392,7 +415,12 @@ async function downloadRemoteBackup(entry: LegadoWebdavBackupEntry) {
 }
 
 async function restoreRemoteBackup(entry: LegadoWebdavBackupEntry) {
-  const ok = await appStore.confirmDialog(`确定从 ${entry.name} 恢复数据吗？这会覆盖当前数据。`, { title: '恢复数据', danger: true })
+  const ok = await appStore.confirmDialog(
+    restoreMode.value === 'merge'
+      ? `确定把 ${entry.name} 合并到当前数据吗？本地已有条目会保留，缺失的才会补充。`
+      : `确定从 ${entry.name} 恢复数据吗？这会覆盖当前数据。`,
+    { title: '恢复数据', danger: restoreMode.value === 'replace' },
+  )
   if (!ok) return
   remoteWorking.value = true
   remoteAction.value = 'restore'
@@ -406,7 +434,7 @@ async function restoreRemoteBackup(entry: LegadoWebdavBackupEntry) {
     if (warning && !(await appStore.confirmDialog(warning, { title: '数据将被清空', danger: true }))) {
       return
     }
-    await restoreWebdavBackup(result.payload, { onPhase: (p) => { phase = p } })
+    await restoreWebdavBackup(result.payload, { mode: restoreMode.value, onPhase: (p) => { phase = p } })
     const skipMessage = formatSkipReport(result.skipped, result.skippedLocalBooks)
     appStore.showToast(
       `恢复完成${skipMessage}，正在刷新页面`,
@@ -657,7 +685,12 @@ async function removeSelected() {
 }
 
 async function restoreBackup(entry: EntryRow) {
-  const ok = await appStore.confirmDialog(`确定从 ${entry.name} 恢复数据吗？这会覆盖当前书架、书源、RSS、书签和净化规则。`, { title: '恢复数据', danger: true })
+  const ok = await appStore.confirmDialog(
+    restoreMode.value === 'merge'
+      ? `确定把 ${entry.name} 合并到当前数据吗？本地已有条目会保留，缺失的才会补充。`
+      : `确定从 ${entry.name} 恢复数据吗？这会覆盖当前书架、书源、RSS、书签和净化规则。`,
+    { title: '恢复数据', danger: restoreMode.value === 'replace' },
+  )
   if (!ok) {
     return
   }
@@ -679,7 +712,7 @@ async function restoreBackup(entry: EntryRow) {
       working.value = false
       return
     }
-    await restoreWebdavBackup(result.payload, { onPhase: (p) => { phase = p } })
+    await restoreWebdavBackup(result.payload, { mode: restoreMode.value, onPhase: (p) => { phase = p } })
     const skipMessage = formatSkipReport(result.skipped, result.skippedLocalBooks)
     appStore.showToast(
       `恢复完成${skipMessage}，正在刷新页面`,
@@ -724,6 +757,48 @@ async function restoreBackup(entry: EntryRow) {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.restore-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px var(--space-6);
+  border-bottom: 1px solid var(--color-divider);
+}
+
+.restore-mode-label {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.restore-mode-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-full);
+}
+
+.restore-mode-tabs button {
+  padding: 4px 12px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  border-radius: var(--radius-full);
+}
+
+.restore-mode-tabs button.active {
+  color: var(--color-primary);
+  background: var(--color-primary-bg);
+  font-weight: 600;
+}
+
+.restore-mode-row small {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
 }
 
 .backup-tabs {

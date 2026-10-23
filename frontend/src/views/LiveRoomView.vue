@@ -406,6 +406,7 @@ import { addLiveHistory } from '../api/liveHistory'
 import { getLiveSuperChatHistory } from '../api/live'
 import { startLiveDanmaku, stopLiveDanmaku, type DanmakuMessage } from '../api/liveDanmaku'
 import type { LiveQuality, LiveRoomDetail, LiveStream } from '../api/live'
+import { createLoadTrace, type LoadTrace } from '../utils/diagnostics'
 
 type PlayerStatus = 'loading' | 'playing' | 'error' | 'offline' | 'reconnecting'
 
@@ -432,6 +433,8 @@ const muted = ref(true)
 
 let hls: Hls | null = null
 let flv: flvjs.Player | null = null
+/** 本次进房的加载诊断采样；首帧、卸线、失败都会汇总成一行日志。 */
+let liveTrace: LoadTrace | null = null
 /** 本轮播放已试过的线路下标(容灾切换用), 每次 load() 重置。 */
 const triedIndexes = new Set<number>()
 
@@ -939,6 +942,7 @@ function manualSwitchLine() {
 function hlsRecover(instance: Hls, data: { type: string; details: string }) {
   // 已经在自愈中且还没到上限, 不重复累加
   if (status.value === 'reconnecting') return
+  liveTrace?.stage('retry')
 
   const delay = Math.min(1000 * 2 ** reconnectCount.value, 4000)
   reconnectCount.value++
@@ -988,6 +992,7 @@ function hlsRecover(instance: Hls, data: { type: string; details: string }) {
 /** FLV 致命错误自愈：指数退避重建播放器。 */
 function flvRecover(reason: string, url: string, video: HTMLVideoElement) {
   if (status.value === 'reconnecting') return
+  liveTrace?.stage('retry')
   stopFlvStallMonitor()
 
   const delay = Math.min(1000 * 2 ** reconnectCount.value, 4000)
@@ -1052,6 +1057,11 @@ function onPlaying() {
   status.value = 'playing'
   paused.value = false
   startWatchClock()
+  liveTrace?.stage('firstFrame')
+  liveTrace?.finish('firstFrame', {
+    qualityIndex: activeIndex.value + 1,
+    lineCount: streams.value.length,
+  })
 }
 
 function reportWatch(seconds: number, sessions: number) {
@@ -1119,6 +1129,7 @@ async function load() {
   }
   status.value = 'loading'
   errorMsg.value = ''
+  liveTrace = createLoadTrace('live-load', { platform, trigger: 'initial' })
   // 新一轮加载: 容灾重试与 SC 去重都从头计。
   triedIndexes.clear()
   superchatSeen = new Set()
@@ -1132,6 +1143,7 @@ async function load() {
       store.fetchRoomDetail(roomId),
       store.fetchStreamUrls(roomId, { cookie: bilibiliCookie.value || undefined }),
     ])
+    liveTrace?.stage('detail')
     detail.value = roomDetail
     // 进房即记一次观看历史(带封面/头像快照, 未开播也记, 与 simple_live 一致)。
     void addLiveHistory({
@@ -1154,6 +1166,7 @@ async function load() {
     streams.value = playableStreams(streamInfo.streams)
     if (!streamInfo.isLive || !streams.value.length) {
       status.value = 'offline'
+      liveTrace?.finish('offline', { lineCount: streams.value.length })
       return
     }
     // B 站首次请求只会拿到接口给的默认档位; 已登录时按偏好再取一次目标清晰度。
@@ -1168,11 +1181,14 @@ async function load() {
       : pickQualityIndex(streams.value.length, liveSettings.qualityLevel)
     qualitySheetOpen.value = false
     await nextTick()
+    liveTrace?.stage('quality')
+    liveTrace?.stage('player')
     playCurrent()
     void startDanmaku()
   } catch (e) {
     status.value = 'error'
     errorMsg.value = (e as Error).message || '加载直播间失败'
+    liveTrace?.fail('detail', { lineCount: 0 })
   }
 }
 
@@ -1224,6 +1240,7 @@ async function selectQuality(option: QualityOption) {
 
 /** 播放失败时的线路容灾: 优先同画质下一条未试过的线路, 全试完才报错。 */
 function tryNextStream(reason: string) {
+  liveTrace?.stage('switchLine')
   const current = streams.value[activeIndex.value]
   const candidates = streams.value
     .map((stream, index) => ({ stream, index }))

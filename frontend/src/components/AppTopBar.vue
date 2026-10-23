@@ -56,7 +56,7 @@ const theme = computed(() => appStore.theme)
 const allItems: Array<{ key: NavKey; label: string; path: string; paths: string[] }> = [
   {
     key: 'home',
-    label: '书架',
+    label: '小说',
     path: '/',
     paths: ['M4 5.5A2.5 2.5 0 0 1 6.5 3H20', 'M4 5.5V19a2 2 0 0 0 2 2h14', 'M8 7h8', 'M8 11h8', 'M8 15h5'],
   },
@@ -67,12 +67,6 @@ const allItems: Array<{ key: NavKey; label: string; path: string; paths: string[
     paths: ['M4 11a9 9 0 0 1 9 9', 'M4 4a16 16 0 0 1 16 16', 'M5 19h.01'],
   },
   {
-    key: 'live',
-    label: '直播',
-    path: '/live',
-    paths: ['M3 6h18v11H3z', 'M8 21h8', 'M12 17v4', 'M10 10.5v3l3-1.5'],
-  },
-  {
     key: 'music',
     label: '音乐',
     path: '/music',
@@ -81,6 +75,12 @@ const allItems: Array<{ key: NavKey; label: string; path: string; paths: string[
       'M6 15a3 3 0 1 0 0 6a3 3 0 1 0 0-6z',
       'M18 13a3 3 0 1 0 0 6a3 3 0 1 0 0-6z',
     ],
+  },
+  {
+    key: 'live',
+    label: '直播',
+    path: '/live',
+    paths: ['M3 6h18v11H3z', 'M8 21h8', 'M12 17v4', 'M10 10.5v3l3-1.5'],
   },
 ]
 

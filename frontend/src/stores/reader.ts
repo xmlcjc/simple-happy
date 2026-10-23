@@ -997,6 +997,8 @@ export const useReaderStore = defineStore('reader', () => {
   const isSpeechLoading = ref(false)
   const isPaused = ref(false)
   const speechProgress = ref(0)
+  /** 系统朗读当前播到的字符下标（相对本段文本），用于句级高亮。 */
+  const speechCharIndex = ref(0)
   const systemTtsNativeEventsReliable = ref(false)
   const voiceList = ref<SpeechSynthesisVoice[]>([])
   const speechConfig = reactive<SpeechConfig>(loadSpeechConfig())
@@ -1487,6 +1489,7 @@ export const useReaderStore = defineStore('reader', () => {
 
     const utterance = new SpeechSynthesisUtterance(rawText)
     speechProgress.value = 0
+    speechCharIndex.value = 0
     options.onProgress?.(0)
     currentUtterance = utterance
     const safariSpeechFallback = isSafariSpeechFallbackMode() && !systemTtsNativeEventsReliable.value
@@ -1644,6 +1647,7 @@ export const useReaderStore = defineStore('reader', () => {
       sawBoundary = true
       lastProgressAt = Date.now()
       const charIndex = Number.isFinite(event.charIndex) ? event.charIndex : 0
+      speechCharIndex.value = charIndex
       const progress = Math.max(0, Math.min(1, charIndex / Math.max(1, rawText.length)))
       speechProgress.value = progress
       options.onProgress?.(progress)
@@ -1895,6 +1899,7 @@ export const useReaderStore = defineStore('reader', () => {
     isSpeaking.value = false
     isPaused.value = false
     speechProgress.value = 0
+    speechCharIndex.value = 0
     if (resetCallbacks) {
       clearSpeechStopTimer()
     }
@@ -2679,7 +2684,7 @@ export const useReaderStore = defineStore('reader', () => {
     replaceRules, fetchReplaceRules,
     switchSource, preloadNextChapter, preloadAroundChapter, isChapterReady,
     refreshChapters, refreshTocFromSource,
-    isSpeaking, isSpeechLoading, isPaused, speechProgress, startTTS, pauseTTS, stopTTS,
+    isSpeaking, isSpeechLoading, isPaused, speechProgress, speechCharIndex, startTTS, pauseTTS, stopTTS,
     voiceList, speechConfig, speechStopAt, speechProviderLabel, openAISpeechConfigured,
     systemTtsNativeEventsReliable, systemSpeechSupported,
     fetchVoices, setVoiceName, setSpeechProvider, setSpeechRate, setSpeechPitch, setSpeechStopTimer, clearSpeechStopTimer,

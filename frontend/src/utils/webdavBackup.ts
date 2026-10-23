@@ -10,6 +10,7 @@ import {
 } from '../api/bookshelf'
 import { listCustomFonts, deleteCustomFont } from '../api/fonts'
 import { getReplaceRules, deleteReplaceRules, saveReplaceRules } from '../api/replaceRule'
+import { getHighlights, replaceHighlights, saveHighlights, type BookHighlight } from '../api/highlight'
 import { getRssSources, deleteRssSource, saveRssSources } from '../api/rss'
 import {
   deleteAllBookSources,
@@ -81,6 +82,8 @@ export interface WebdavBackupPayload {
   rssSources: RssSource[]
   bookmarks: Bookmark[]
   replaceRules: ReplaceRule[]
+  /** v3: 本地划线。 */
+  highlights?: BookHighlight[]
   localState: Record<string, string>
   /** v2: 本地书内容文件(base64), 恢复时写回存储目录。 */
   localBooks?: LocalBookExportItem[]
@@ -149,13 +152,14 @@ function applyLocalState(localState: Record<string, string> = {}) {
 }
 
 export async function createWebdavBackupPayload(): Promise<WebdavBackupPayload> {
-  const [books, groups, bookSources, rssSources, bookmarks, replaceRules, customFonts, readingStats] = await Promise.all([
+  const [books, groups, bookSources, rssSources, bookmarks, replaceRules, highlights, customFonts, readingStats] = await Promise.all([
     getBookshelf(),
     getBookGroups(),
     getBookSources(),
     getRssSources(),
     getBookmarks(),
     getReplaceRules(),
+    getHighlights().catch(() => [] as BookHighlight[]),
     exportCustomFonts().catch(() => ({ fonts: [], skipped: [], totalBytes: 0 })),
     exportReadingStats().catch(() => ({ daily: [], byBook: [] })),
   ])
@@ -190,6 +194,7 @@ export async function createWebdavBackupPayload(): Promise<WebdavBackupPayload> 
     rssSources,
     bookmarks,
     replaceRules,
+    highlights,
     localState: captureLocalState(),
     // 保持字段存在但为空: 旧版本读取时按"没有本地书"处理, 不需要版本判断。
     localBooks: [],
@@ -243,6 +248,7 @@ export function parseWebdavBackup(raw: string) {
     rssSources: payload.rssSources || [],
     bookmarks: payload.bookmarks || [],
     replaceRules: payload.replaceRules || [],
+    highlights: payload.highlights || [],
     localState: payload.localState || {},
     // v1 备份没有这些字段, 默认为空即可。
     localBooks: payload.localBooks || [],
@@ -406,17 +412,112 @@ function normalizeGroupIds(groups: BookGroup[]): BookGroup[] {
  *  `writing` 布尔量, 在调用前就置位, 于是清理阶段失败也会报"已开始写入"。 */
 export type RestorePhase = 'clear' | 'write'
 
+/** replace: 先清空再写入（原行为）。merge: 保留本地数据，按身份去重合并。 */
+export type RestoreMode = 'replace' | 'merge'
+
 export interface RestoreOptions {
   /** 每次进入新阶段时回调, 让调用方把提示文案对齐到真实进度。 */
   onPhase?: (phase: RestorePhase) => void
+  /** 恢复方式，默认覆盖。 */
+  mode?: RestoreMode
+}
+
+/** 按 bookUrl 合并书架；阅读进度取 durChapterTime 较新的一方，其余字段保留本地。 */
+function mergeBooks(local: Book[], incoming: Book[]): Book[] {
+  const map = new Map(local.map((book) => [book.bookUrl, book]))
+  for (const book of incoming) {
+    const existing = map.get(book.bookUrl)
+    if (!existing) {
+      map.set(book.bookUrl, book)
+      continue
+    }
+    const localTime = existing.durChapterTime || 0
+    const incomingTime = book.durChapterTime || 0
+    const newer = incomingTime > localTime ? book : existing
+    map.set(book.bookUrl, {
+      ...book,
+      ...existing,
+      durChapterIndex: newer.durChapterIndex ?? existing.durChapterIndex,
+      durChapterPos: newer.durChapterPos ?? existing.durChapterPos,
+      durChapterTitle: newer.durChapterTitle ?? existing.durChapterTitle,
+      durChapterTime: newer.durChapterTime ?? existing.durChapterTime,
+    })
+  }
+  return [...map.values()]
+}
+
+/** 分组按 groupId 合并，本地同名/同 id 的分组优先，避免打乱用户已有排序。 */
+function mergeGroups(local: BookGroup[], incoming: BookGroup[]): BookGroup[] {
+  const map = new Map(local.map((group) => [group.groupId, group]))
+  for (const group of incoming) {
+    if (!map.has(group.groupId)) map.set(group.groupId, group)
+  }
+  return [...map.values()]
+}
+
+/** 书源/订阅按地址合并；本地已存在的同源不被备份覆盖（用户可能改过规则）。 */
+function mergeByKey<T>(local: T[], incoming: T[], keyOf: (item: T) => string): T[] {
+  const seen = new Set(local.map(keyOf))
+  const result = [...local]
+  for (const item of incoming) {
+    const key = keyOf(item)
+    if (!seen.has(key)) {
+      seen.add(key)
+      result.push(item)
+    }
+  }
+  return result
+}
+
+function mergeReplaceRules(local: ReplaceRule[], incoming: ReplaceRule[]): ReplaceRule[] {
+  const keyOf = (rule: ReplaceRule) => `${rule.scope || ''}|${rule.pattern}|${rule.isRegex ? 1 : 0}`
+  const seen = new Set(local.map(keyOf))
+  let nextId = Math.max(0, ...local.map((rule) => rule.id || 0)) + 1
+  const result = [...local]
+  for (const rule of incoming) {
+    const key = keyOf(rule)
+    if (seen.has(key)) continue
+    seen.add(key)
+    // 备份里的 id 可能与本地已有规则冲突，冲突时重新分配。
+    const id = result.some((item) => item.id === rule.id) ? nextId++ : rule.id
+    result.push({ ...rule, id })
+  }
+  return result
+}
+
+/** 统计按「日期 / 日期+书」合并，取较大值，避免重复导入把时长叠加成两倍。 */
+function mergeReadingStats(local: ReadingStatsExport, incoming: ReadingStatsExport): ReadingStatsExport {
+  const daily = new Map<string, { date: string; seconds: number; characters: number }>()
+  for (const row of [...local.daily, ...incoming.daily]) {
+    const current = daily.get(row.date)
+    daily.set(row.date, {
+      date: row.date,
+      seconds: Math.max(current?.seconds || 0, row.seconds || 0),
+      characters: Math.max(current?.characters || 0, row.characters || 0),
+    })
+  }
+  const byBook = new Map<string, ReadingStatsExport['byBook'][number]>()
+  for (const row of [...local.byBook, ...incoming.byBook]) {
+    const key = `${row.date}|${row.bookUrl}`
+    const current = byBook.get(key)
+    byBook.set(key, {
+      ...row,
+      seconds: Math.max(current?.seconds || 0, row.seconds || 0),
+      characters: Math.max(current?.characters || 0, row.characters || 0),
+    })
+  }
+  return { daily: [...daily.values()], byBook: [...byBook.values()] }
 }
 
 export async function restoreWebdavBackup(
   payload: WebdavBackupPayload,
   options: RestoreOptions = {},
 ) {
-  options.onPhase?.('clear')
-  await clearCurrentData()
+  const mode = options.mode || 'replace'
+  if (mode === 'replace') {
+    options.onPhase?.('clear')
+    await clearCurrentData()
+  }
 
   options.onPhase?.('write')
 
@@ -425,35 +526,82 @@ export async function restoreWebdavBackup(
     await importLocalBooks(payload.localBooks)
   }
 
-  if (payload.bookSources.length) {
-    await saveBookSources(payload.bookSources)
-  }
-  if (payload.rssSources.length) {
-    await saveRssSources(payload.rssSources)
-  }
-  // 分组用「整表覆盖」写入, 而不是逐个 saveBookGroup: 后者是 upsert, groupId 为 0
-  // 时后端会另分配一个新 id 再 push —— 备份里的 id 与书架 group 位域就对不上了。
-  if (payload.bookshelf.groups.length) {
-    await saveBookGroupOrder(normalizeGroupIds(payload.bookshelf.groups))
-  }
-  if (payload.bookshelf.books.length) {
-    await saveBooks(payload.bookshelf.books)
-  }
-  if (payload.bookmarks.length) {
-    await saveBookmarks(payload.bookmarks)
-  }
-  if (payload.replaceRules.length) {
-    await saveReplaceRules(payload.replaceRules)
-  }
+  if (mode === 'merge') {
+    const [localBooks, localGroups, localSources, localRss, localBookmarks, localRules, localStats] =
+      await Promise.all([
+        getBookshelf(),
+        getBookGroups(),
+        getBookSources(),
+        getRssSources(),
+        getBookmarks(),
+        getReplaceRules(),
+        payload.app !== 'legado'
+          ? exportReadingStats().catch(() => ({ daily: [], byBook: [] }))
+          : Promise.resolve(null),
+      ])
 
-  if (payload.app !== 'legado') {
-    applyLocalState(payload.localState)
-    // 字体与统计恢复失败不阻断整体恢复(书架已就绪), 静默降级。
-    if (payload.customFonts?.length) {
-      await importCustomFonts(payload.customFonts).catch(() => undefined)
+    const books = mergeBooks(localBooks, payload.bookshelf.books)
+    const groups = mergeGroups(localGroups, normalizeGroupIds(payload.bookshelf.groups))
+    if (groups.length) await saveBookGroupOrder(groups)
+    if (books.length) await saveBooks(books)
+    if (payload.bookSources.length) {
+      await saveBookSources(mergeByKey(localSources, payload.bookSources, (item) => item.bookSourceUrl))
     }
-    if (payload.readingStats && (payload.readingStats.daily.length || payload.readingStats.byBook.length)) {
-      await importReadingStats(payload.readingStats).catch(() => undefined)
+    if (payload.rssSources.length) {
+      await saveRssSources(mergeByKey(localRss, payload.rssSources, (item) => item.sourceUrl))
+    }
+    if (payload.bookmarks.length) {
+      await saveBookmarks(mergeByKey(localBookmarks, payload.bookmarks, (item) => `${item.bookName}\u0000${item.bookAuthor}`))
+    }
+    if (payload.replaceRules.length) {
+      await saveReplaceRules(mergeReplaceRules(localRules, payload.replaceRules))
+    }
+    if (payload.highlights?.length) {
+      await saveHighlights(payload.highlights)
+    }
+    if (payload.app !== 'legado') {
+      if (payload.customFonts?.length) {
+        await importCustomFonts(payload.customFonts).catch(() => undefined)
+      }
+      if (localStats && payload.readingStats) {
+        const merged = mergeReadingStats(localStats, payload.readingStats)
+        if (merged.daily.length || merged.byBook.length) {
+          await importReadingStats(merged).catch(() => undefined)
+        }
+      }
+    }
+  } else {
+    if (payload.bookSources.length) {
+      await saveBookSources(payload.bookSources)
+    }
+    if (payload.rssSources.length) {
+      await saveRssSources(payload.rssSources)
+    }
+    // 分组用「整表覆盖」写入, 而不是逐个 saveBookGroup: 后者是 upsert, groupId 为 0
+    // 时后端会另分配一个新 id 再 push —— 备份里的 id 与书架 group 位域就对不上了。
+    if (payload.bookshelf.groups.length) {
+      await saveBookGroupOrder(normalizeGroupIds(payload.bookshelf.groups))
+    }
+    if (payload.bookshelf.books.length) {
+      await saveBooks(payload.bookshelf.books)
+    }
+    if (payload.bookmarks.length) {
+      await saveBookmarks(payload.bookmarks)
+    }
+    if (payload.replaceRules.length) {
+      await saveReplaceRules(payload.replaceRules)
+    }
+    if (payload.app !== 'legado') {
+      // 覆盖模式：用本应用备份里的划线整表替换；Legado 备份不含划线，保持本地不动。
+      await replaceHighlights(payload.highlights || [])
+      applyLocalState(payload.localState)
+      // 字体与统计恢复失败不阻断整体恢复(书架已就绪), 静默降级。
+      if (payload.customFonts?.length) {
+        await importCustomFonts(payload.customFonts).catch(() => undefined)
+      }
+      if (payload.readingStats && (payload.readingStats.daily.length || payload.readingStats.byBook.length)) {
+        await importReadingStats(payload.readingStats).catch(() => undefined)
+      }
     }
   }
 

@@ -20,6 +20,7 @@
     <SettingsDrawer v-model="appStore.showSettingsDrawer" />
     <SourceManager v-model="appStore.showSourceManager" />
     <WebdavManager v-model="appStore.showWebdavManager" />
+    <LogViewerModal v-model="appStore.showLogViewer" />
     <ConfirmDialog />
     <ContextMenu />
 
@@ -123,6 +124,7 @@ import AppTopBar from './components/AppTopBar.vue'
 import SettingsDrawer from './components/SettingsDrawer.vue'
 import SourceManager from './components/SourceManager.vue'
 import WebdavManager from './components/WebdavManager.vue'
+import LogViewerModal from './components/LogViewerModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ContextMenu from './components/ContextMenu.vue'
 import TitleBar from './components/TitleBar.vue'
@@ -186,7 +188,7 @@ onMounted(() => {
 const showHeader = computed(() => route.name !== 'reader')
 const titlebarSurface = computed<'settings' | 'reader-panel' | null>(() => {
   if (appStore.showSettingsDrawer) return 'settings'
-  if (appStore.showSourceManager || appStore.showWebdavManager) return 'settings'
+  if (appStore.showSourceManager || appStore.showWebdavManager || appStore.showLogViewer) return 'settings'
   if (route.name === 'reader' && readerStore.activePanel) return 'reader-panel'
   return null
 })

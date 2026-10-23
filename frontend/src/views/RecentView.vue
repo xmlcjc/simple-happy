@@ -36,6 +36,8 @@
         </div>
       </div>
 
+      <ReadingHeatmap :daily="heatmapDays" :weeks="16" />
+
       <div class="recent-search-row">
         <input
           v-model.trim="searchText"
@@ -68,6 +70,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import BookDetailModal from '../components/BookDetailModal.vue'
 import BookGrid from '../components/BookGrid.vue'
+import ReadingHeatmap from '../components/ReadingHeatmap.vue'
 import { showContextMenu } from '../composables/useContextMenu'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
@@ -91,6 +94,9 @@ const stats = ref({
   totalCharacters: 0,
 })
 
+/** 热力图取最近 16 周（112 天）的按日数据；总览卡片仍只看近 30 天。 */
+const heatmapDays = ref<Array<{ date: string; seconds: number }>>([])
+
 function dateStr(offsetDays: number) {
   const date = new Date()
   date.setDate(date.getDate() - offsetDays)
@@ -99,14 +105,18 @@ function dateStr(offsetDays: number) {
 
 async function loadStats() {
   const end = dateStr(0)
-  const start = dateStr(29)
+  const start = dateStr(111)
+  const monthStart = dateStr(29)
   const [daily, summary] = await Promise.all([
     getReadingStatsDaily(start, end),
     getReadingStatsSummary(),
   ])
+  heatmapDays.value = daily
   stats.value = {
     todaySeconds: daily.find((item) => item.date === end)?.seconds ?? 0,
-    monthSeconds: daily.reduce((total, item) => total + item.seconds, 0),
+    monthSeconds: daily
+      .filter((item) => item.date >= monthStart)
+      .reduce((total, item) => total + item.seconds, 0),
     totalSeconds: summary.totalSeconds,
     totalCharacters: summary.totalCharacters,
   }

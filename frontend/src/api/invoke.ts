@@ -8,6 +8,7 @@
 
 import { invoke } from '@tauri-apps/api/core'
 import type { ApiResponse } from '../types'
+import { requestGate, stableKey } from './requestGate'
 
 const COMMAND_BY_PATH: Record<string, string> = {
   '/reader3/getBookSources': 'get_book_sources',
@@ -131,9 +132,16 @@ async function call<T>(path: string, payload: unknown): Promise<T> {
   }
 }
 
-/** GET with query params → command args. */
+/** GET with query params → command args.
+ *
+ * 所有只读请求都经过 requestGate：同一命令 + 同一参数在飞行中时直接复用，
+ * 同时最多 16 个请求进入命令层。写操作走 post，不参与合并。 */
 export function get<T>(path: string, opts?: { params?: Record<string, unknown> }): Promise<{ data: T }> {
-  return call<T>(path, opts?.params).then((data) => ({ data }))
+  const fullPath = path.startsWith('/reader3') ? path : `/reader3${path}`
+  const key = `${fullPath}#${stableKey(opts?.params)}`
+  return requestGate
+    .run(key, () => call<T>(path, opts?.params))
+    .then((data) => ({ data }))
 }
 
 /** POST with a JSON body → command `req` arg. */

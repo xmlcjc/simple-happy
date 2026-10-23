@@ -306,7 +306,7 @@ fn start(app: &mut App) -> anyhow::Result<()> {
         assets_dir: paths.assets.to_string_lossy().into_owned(),
         ..AppConfig::default()
     };
-    bootstrap::init_tracing(&cfg.log_level);
+    bootstrap::init_tracing(&cfg.log_level, &cfg.storage_dir);
 
     let state = tauri::async_runtime::block_on(bootstrap::build_state(&cfg))?;
     // 内置音源在后台安装（不阻塞首屏），装完用事件通知前端刷新插件列表。

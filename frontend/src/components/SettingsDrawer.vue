@@ -107,6 +107,15 @@
               <span>{{ appVersion }}</span>
               <small>当前应用版本</small>
             </div>
+            <div class="log-entry-row">
+              <div class="setting-switch-copy">
+                <span>运行日志</span>
+                <small>查看书源、直播、插件最近的操作与错误，可导出给开发者排查</small>
+              </div>
+              <button class="action-btn" type="button" @click="appStore.showLogViewer = true">
+                查看日志
+              </button>
+            </div>
             <div v-if="isDesktopApp" class="setting-switch-row">
               <div class="setting-switch-copy">
                 <span>关闭时隐藏到系统托盘</span>
@@ -1828,6 +1837,23 @@ function removeBackgroundImage() {
   border: 1px solid var(--color-border-light);
   border-radius: var(--radius-lg);
   background: var(--color-bg);
+}
+
+/* 运行日志入口：与开关行同规格，右侧是按钮而非开关。 */
+.log-entry-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+}
+
+.log-entry-row .action-btn {
+  flex: none;
 }
 
 .setting-switch-copy {

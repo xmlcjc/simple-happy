@@ -1,12 +1,12 @@
 <template>
   <div class="home-view">
     <!-- 左侧功能栏 -->
-    <aside class="shelf-rail" aria-label="书架功能">
+    <aside class="shelf-rail" aria-label="小说功能">
       <button
         type="button"
         class="rail-item"
         :class="{ active: view === 'shelf' }"
-        title="书架"
+        title="小说"
         @click="view = 'shelf'"
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -14,7 +14,7 @@
           <path d="M4 5.5V19a2 2 0 0 0 2 2h14" />
           <path d="M8 7h8M8 11h8M8 15h5" />
         </svg>
-        <span>书架</span>
+        <span>小说</span>
       </button>
 
       <button
@@ -158,7 +158,7 @@
         <!-- Shelf Header：标题 + 常驻搜索框 + 分组管理 -->
         <div class="shelf-header">
           <h1 class="shelf-title">
-            书架
+            小说
             <span class="book-count">({{ shelfStore.filteredBooks.length }})</span>
           </h1>
           <div class="shelf-header-actions">
@@ -254,7 +254,7 @@
             :selected-urls="shelfStore.selectedBookUrls"
             :loading="shelfStore.loading"
             :sortable="sortable"
-            empty-text="书架空空如也，搜索添加新书吧"
+            empty-text="这里还没有小说，搜索添加新书吧"
             @click="handleBookClick"
             @info="handleBookInfo"
             @delete="handleDeleteBook"
