@@ -49,25 +49,37 @@ pub fn handle_reader_scheme(
     });
 }
 
-async fn route(
-    state: &AppState,
-    path: &str,
-    query: &str,
-    request: tauri::http::Request<Vec<u8>>,
-) -> tauri::http::Response<Vec<u8>> {
+/// 协议层的路由分类。
+///
+/// 单独抽出来是为了能在不构造 `AppState` 的前提下断言"每个已知路径都注册了
+/// 处理器" —— 拆分本文件时漏掉一条路由，测试会立刻发现，而不是等用户点开
+/// 封面/PDF 时才发现 404。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteKind {
+    BookSourceProxy,
+    SourcePanelBridge,
+    SourcePanel,
+    Cover,
+    Epub,
+    Pdf,
+    Files,
+    MusicStream,
+    MusicLocal,
+    LoginProxy,
+    Fallback,
+}
+
+fn classify_route(path: &str) -> RouteKind {
     match path {
-        "/bookSourceProxy" => book_source_proxy_route(state, query, &request).await,
-        "/sourcePanelBridge" => source_panel_bridge_route(state, query, &request).await,
-        "/sourcePanel" => source_panel_route(state, query, &request).await,
-        "/cover" => cover_route(state, query).await,
-        "/epub" => epub_route(state, query).await,
-        "/pdf" => pdf_route(state, query).await,
-        "/files" => files_route(state, query).await,
-        // 音乐取流: 插件播放地址常要求 Referer/UA, 由 Rust 侧带上头部取回字节,
-        // 前端再转 Blob 播放。具体逻辑留在 service::music, 这里只做协议适配。
-        "/musicStream" => music_stream_route(state, query).await,
-        // 本地音乐: 只放行曲库里登记过的路径, 避免任意文件读取。
-        "/musicLocal" => music_local_route(state, query).await,
+        "/bookSourceProxy" => RouteKind::BookSourceProxy,
+        "/sourcePanelBridge" => RouteKind::SourcePanelBridge,
+        "/sourcePanel" => RouteKind::SourcePanel,
+        "/cover" => RouteKind::Cover,
+        "/epub" => RouteKind::Epub,
+        "/pdf" => RouteKind::Pdf,
+        "/files" => RouteKind::Files,
+        "/musicStream" => RouteKind::MusicStream,
+        "/musicLocal" => RouteKind::MusicLocal,
         // 登录页兜底: 登录 iframe 跑在专属路径空间里, 并**完整保留上游路径**:
         //   http://reader.localhost/__login/<session>/user/me?app=yuedu
         //
@@ -77,10 +89,32 @@ async fn route(
         //    这些绝对路径全部 404, 应用永远挂载不起来(纯白页)。
         // 2. WebView2 在自定义协议下**不给子资源发 Cookie, Referer 也是空串**
         //    (实测), 因此会话只能编码进路径, 让每个分片请求天然带着它。
-        p if p.starts_with(SESSION_PATH_PREFIX) => {
-            source_login_proxy_route(state, p, query, &request).await
-        }
-        p => source_login_fallback_route(state, p, query, &request)
+        p if p.starts_with(SESSION_PATH_PREFIX) => RouteKind::LoginProxy,
+        _ => RouteKind::Fallback,
+    }
+}
+
+async fn route(
+    state: &AppState,
+    path: &str,
+    query: &str,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    match classify_route(path) {
+        RouteKind::BookSourceProxy => book_source_proxy_route(state, query, &request).await,
+        RouteKind::SourcePanelBridge => source_panel_bridge_route(state, query, &request).await,
+        RouteKind::SourcePanel => source_panel_route(state, query, &request).await,
+        RouteKind::Cover => cover_route(state, query).await,
+        RouteKind::Epub => epub_route(state, query).await,
+        RouteKind::Pdf => pdf_route(state, query).await,
+        RouteKind::Files => files_route(state, query).await,
+        // 音乐取流: 插件播放地址常要求 Referer/UA, 由 Rust 侧带上头部取回字节,
+        // 前端再转 Blob 播放。具体逻辑留在 service::music, 这里只做协议适配。
+        RouteKind::MusicStream => music_stream_route(state, query).await,
+        // 本地音乐: 只放行曲库里登记过的路径, 避免任意文件读取。
+        RouteKind::MusicLocal => music_local_route(state, query).await,
+        RouteKind::LoginProxy => source_login_proxy_route(state, path, query, &request).await,
+        RouteKind::Fallback => source_login_fallback_route(state, path, query, &request)
             .await
             .unwrap_or_else(|| {
                 http::Response::builder()
@@ -2333,6 +2367,31 @@ fn registrable_domain_from_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 路由表的静态断言：拆分/移动本文件时，任何一个已知路径漏注册都会在这里失败。
+    #[test]
+    fn every_known_protocol_path_has_its_own_route() {
+        let cases = [
+            ("/bookSourceProxy", RouteKind::BookSourceProxy),
+            ("/sourcePanelBridge", RouteKind::SourcePanelBridge),
+            ("/sourcePanel", RouteKind::SourcePanel),
+            ("/cover", RouteKind::Cover),
+            ("/epub", RouteKind::Epub),
+            ("/pdf", RouteKind::Pdf),
+            ("/files", RouteKind::Files),
+            ("/musicStream", RouteKind::MusicStream),
+            ("/musicLocal", RouteKind::MusicLocal),
+            ("/__login/abc123/user/me", RouteKind::LoginProxy),
+            ("/__login/", RouteKind::LoginProxy),
+            // 前缀必须带上结尾斜杠: `/__log` 不属于登录页空间。
+            ("/__log", RouteKind::Fallback),
+            ("/", RouteKind::Fallback),
+            ("/unknown/path", RouteKind::Fallback),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(classify_route(path), expected, "path = {path}");
+        }
+    }
 
     #[tokio::test]
     #[ignore = "reads an explicitly supplied source export and its public registration page"]
