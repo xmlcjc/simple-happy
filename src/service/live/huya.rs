@@ -10,8 +10,17 @@
 //! 且 CDN 回了 `Access-Control-Allow-Origin: *`, 浏览器里可以直接交给 flv.js
 //! (simple_live / dart_simple_live 也是这么做的)。同一条线路的 FLV 请求会随机
 //! 返回 403(约一半), 所以这里给出全部线路, 由前端在连接失败时立刻换下一条。
+//!
+//! **`sFlvAntiCode` 不能直接拼进地址**: 它只是签名原料(`fm/wsTime/ctype/t/fs`),
+//! 里面的 `wsSecret` 绑定的是接口下发时那一次的 `seqid`。直接拿来请求, CDN 只回
+//! 一小段缓冲数据(~0.4–1.9 MB, 约半秒)就断连 —— 实测: 原样请求 20 秒只能拿到
+//! 451 KB 后 EOF; 按当前时间重算 `seqid`/`wsSecret` 后同一地址可连续拉满 20 秒
+//! (8.65 MB)。前端于是每隔十来秒就判一次"断流"并重连。这里按 dart_simple_live
+//! 的 `buildAntiCode` 在每次取流时重新签名。
 
 use serde_json::Value;
+
+use base64::Engine as _;
 
 use crate::crawler::http_client::HttpClient;
 use crate::error::error::AppError;
@@ -343,9 +352,9 @@ pub fn parse_qualities(value: &Value) -> Vec<LiveQuality> {
 
 /// FLV 播放线路, 按 `iWebPriorityRate` 从高到低排序。
 ///
-/// 地址形如 `{sFlvUrl}/{sStreamName}.{sFlvUrlSuffix}?{sFlvAntiCode}`; 指定码率时
-/// 追加 `ratio=<码率>`。`sFlvAntiCode` 已含 `wsSecret/wsTime/fm/ctype/fs/t`,
-/// 直接可用, 不必自己算签名。
+/// 地址形如 `{sFlvUrl}/{sStreamName}.{sFlvUrlSuffix}?{签名}`; 指定码率时追加
+/// `ratio=<码率>`。接口下发的 `sFlvAntiCode` 只当原料用, 每次取流都按当前时间
+/// 重新签名(见 `build_anti_code`), 否则 CDN 只给一小段数据就断连。
 pub fn flv_urls(value: &Value, bit_rate: i64) -> Vec<String> {
     let Some(lines) = value
         .pointer("/data/stream/baseSteamInfoList")
@@ -353,6 +362,13 @@ pub fn flv_urls(value: &Value, bit_rate: i64) -> Vec<String> {
     else {
         return Vec::new();
     };
+    let uid = value
+        .pointer("/data/liveData/uid")
+        .and_then(|raw| {
+            raw.as_i64()
+                .or_else(|| raw.as_str().and_then(|text| text.parse().ok()))
+        })
+        .unwrap_or(0);
     let mut entries: Vec<(u64, String)> = Vec::new();
     for item in lines {
         let host = text(item, "sFlvUrl");
@@ -366,7 +382,7 @@ pub fn flv_urls(value: &Value, bit_rate: i64) -> Vec<String> {
             value => value,
         };
         let mut url = format!("{host}/{name}.{suffix}");
-        let mut query = anti;
+        let mut query = build_anti_code(&name, uid, &anti);
         if bit_rate > 0 {
             query = if query.is_empty() {
                 format!("ratio={bit_rate}")
@@ -386,6 +402,87 @@ pub fn flv_urls(value: &Value, bit_rate: i64) -> Vec<String> {
     }
     entries.sort_by(|a, b| b.0.cmp(&a.0));
     entries.into_iter().map(|(_, url)| url).collect()
+}
+
+/// 按当前时间重算虎牙 FLV 的 anti-code(对应 dart_simple_live 的 `buildAntiCode`)。
+///
+/// 接口下发的串里 `fm` 是 base64 的密钥前缀材料, `wsTime/ctype/t/fs` 是固定参数;
+/// 真正请求时 `seqid` 必须接近当前时间(毫秒), `wsSecret` 则由
+/// `md5("{prefix}_{rotl64(uid)}_{stream}_{md5(seqid|ctype|t)}_{wsTime}")` 算出。
+/// 缺 `fm` 的旧格式串无法重签, 原样返回(保持与历史行为一致)。
+pub fn build_anti_code(stream: &str, presenter_uid: i64, base_anti: &str) -> String {
+    build_anti_code_at(stream, presenter_uid, base_anti, now_millis())
+}
+
+/// 与 [`build_anti_code`] 相同, 但 `seqid` 的时间基准由调用方给出(便于用例固定输入)。
+fn build_anti_code_at(
+    stream: &str,
+    presenter_uid: i64,
+    base_anti: &str,
+    seq_millis: i64,
+) -> String {
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(base_anti.as_bytes())
+        .into_owned()
+        .collect();
+    let param = |key: &str| {
+        pairs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let Some(fm) = param("fm") else {
+        return base_anti.to_string();
+    };
+    let ctype = param("ctype").unwrap_or_else(|| "huya_pc_exe".to_string());
+    let platform_id: i64 = param("t")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let ws_time = param("wsTime").unwrap_or_default();
+    let fs = param("fs").unwrap_or_default();
+    let fm_raw = match base64::engine::general_purpose::STANDARD.decode(fm.as_bytes()) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => return base_anti.to_string(),
+    };
+    let Some(secret_prefix) = fm_raw.split('_').next().filter(|item| !item.is_empty()) else {
+        return base_anti.to_string();
+    };
+
+    let seq_id = presenter_uid + seq_millis;
+    let secret_hash = crate::util::hash::md5_hex(&format!("{seq_id}|{ctype}|{platform_id}"));
+    let convert_uid = rotate_left_64(presenter_uid);
+    // 平台 id 103 是 WAP 端: 直接带原 uid; 其余(102=移动 Tars, 100=Web)带旋转后的 uid。
+    let calc_uid = if platform_id == 103 {
+        presenter_uid
+    } else {
+        convert_uid
+    };
+    let secret = format!("{secret_prefix}_{calc_uid}_{stream}_{secret_hash}_{ws_time}");
+    let ws_secret = crate::util::hash::md5_hex(&secret);
+
+    let mut query = format!(
+        "wsSecret={ws_secret}&wsTime={ws_time}&seqid={seq_id}&ctype={ctype}&ver=1&fs={fs}&fm={}&t={platform_id}&u={convert_uid}",
+        urlencoding::encode(&fm)
+    );
+    if !query.is_empty() {
+        query.push_str("&codec=264");
+    }
+    query
+}
+
+/// 虎牙 `u` 参数: 低 32 位循环左移 8 位, 高位保持不变。
+fn rotate_left_64(value: i64) -> i64 {
+    const LOW_MASK: u64 = 0xFFFF_FFFF;
+    let bits = value as u64;
+    let low = bits & LOW_MASK;
+    let rotated = ((low << 8) | (low >> 24)) & LOW_MASK;
+    (bits & !LOW_MASK) as i64 | rotated as i64
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| span.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -502,6 +599,57 @@ mod tests {
         });
         let urls = flv_urls(&value, 0);
         assert_eq!(urls, vec!["http://tx.flv.huya.com/src/s.flv?wsSecret=1"]);
+    }
+
+    /// 固定输入下的签名结果: 防止 `build_anti_code` 被改动后悄悄换掉算法。
+    /// 期望值由 dart_simple_live `buildAntiCode` 的同一套算法独立算出。
+    #[test]
+    fn resigns_anti_code_to_reference_vector() {
+        let query = build_anti_code_at(
+            "2367547387-2367547387-10168538598895255552-4735218230-10057-A-0-1-imgplus",
+            2367547387,
+            "wsSecret=8f2a&wsTime=6adcc546&fm=RFdxOEJjSjNoNkRKdDZUWV8kMF8kMV8kMl8kMw%3D%3D&ctype=tars_mp&fs=bgct&t=102",
+            1_700_000_000_000,
+        );
+        assert_eq!(
+            query,
+            "wsSecret=701b14f0bdd7620bea0be9f1a14871b0&wsTime=6adcc546&seqid=1702367547387\
+&ctype=tars_mp&ver=1&fs=bgct&fm=RFdxOEJjSjNoNkRKdDZUWV8kMF8kMV8kMl8kMw%3D%3D&t=102\
+&u=501742477&codec=264"
+        );
+    }
+
+    #[test]
+    fn flv_urls_uses_signed_query_from_live_uid() {
+        let value = serde_json::json!({
+            "data": {
+                "liveData": { "uid": 2367547387i64 },
+                "stream": { "baseSteamInfoList": [{
+                    "sFlvUrl": "http://hs.flv.huya.com/src",
+                    "sStreamName": "a-b-c",
+                    "sFlvUrlSuffix": "flv",
+                    "sFlvAntiCode": "wsSecret=old&wsTime=6adcc546&fm=RFdxOEJjSjNoNkRKdDZUWV8kMF8kMV8kMl8kMw%3D%3D&ctype=tars_mp&fs=bgct&t=102",
+                    "iWebPriorityRate": 100
+                }]}
+            }
+        });
+        let urls = flv_urls(&value, 8000);
+        assert_eq!(urls.len(), 1);
+        let url = &urls[0];
+        // 原件里的 wsSecret 必须被换掉, 且带上新 seqid / u / ratio。
+        assert!(!url.contains("wsSecret=old"), "{url}");
+        assert!(url.contains("&seqid="), "{url}");
+        assert!(url.contains("&u=501742477"), "{url}");
+        assert!(url.ends_with("&codec=264&ratio=8000"), "{url}");
+    }
+
+    #[test]
+    fn rotate_left_64_rotates_low_word_only() {
+        assert_eq!(rotate_left_64(2367547387), 501742477);
+        assert_eq!(rotate_left_64(1), 256);
+        assert_eq!(rotate_left_64(0), 0);
+        // 高位保持原样(uid 超过 32 位时)。
+        assert_eq!(rotate_left_64(1_i64 << 32), 1_i64 << 32);
     }
 
     #[test]

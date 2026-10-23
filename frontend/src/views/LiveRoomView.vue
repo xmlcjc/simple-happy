@@ -438,13 +438,14 @@ const MAX_RECONNECT = 3
 const reconnectCount = ref(0)
 let lastReconnectTimer: number | undefined
 
-/** FLV stalled 检测: currentTime 停滞超 3s 视为断流。 */
+/** FLV stalled 检测: currentTime 连续 3 个采样点(约 3s)不推进才视为断流。 */
 let flvStallTimer: number | undefined
 let lastMediaTime = 0
-
-/** 虎牙 FLV 的连接轮次: 同一线路会随机 403, 全线试完后允许再走一轮。 */
-const MAX_FLV_ROUNDS = 3
-let flvRound = 0
+let stalledTicks = 0
+/** 正在向后台重新取流(新签名地址)时, 避免重入。 */
+let flvRefreshing = false
+/** 上一次 FLV 连接正常结束的时间, 用来识别"连上就断"的恶性循环。 */
+let lastFlvCompleteAt = 0
 
 /** 观看时长上报：播放中用固定间隔累加，离开页面/暂停时补一次。 */
 let watchTimer: number | undefined
@@ -1047,32 +1048,6 @@ function hlsRecover(instance: Hls, data: { type: string; details: string }) {
   }, delay)
 }
 
-/** FLV 连接失败(虎牙 CDN 随机 403): 立刻换下一条未试过的线路。
- *
- *  全部线路都试过时再走一轮(仍失败才提示错误) —— 403 是按请求随机的,
- *  同一地址重连下一轮大概率就通了。 */
-function flvSwitchLine(reason: string) {
-  liveTrace?.stage('switchLine')
-  stopFlvStallMonitor()
-  const current = activeIndex.value
-  const next = streams.value.findIndex(
-    (stream, index) => index !== current && !triedIndexes.has(index) && stream.url !== streams.value[current]?.url,
-  )
-  if (next >= 0) {
-    activeIndex.value = next
-    playCurrent()
-    return
-  }
-  if (flvRound < MAX_FLV_ROUNDS) {
-    flvRound += 1
-    triedIndexes.clear()
-    activeIndex.value = 0
-    playCurrent()
-    return
-  }
-  tryNextStream(reason)
-}
-
 /** FLV 致命错误自愈：指数退避重建播放器。 */
 function flvRecover(reason: string, url: string, video: HTMLVideoElement) {
   if (status.value === 'reconnecting') return
@@ -1107,22 +1082,67 @@ function flvRecover(reason: string, url: string, video: HTMLVideoElement) {
     player.attachMediaElement(video)
     player.load()
     player.play()
-    startFlvStallMonitor(url, video)
+    startFlvStallMonitor(video)
   }, delay)
 }
 
-/** FLV stalled 检测: currentTime 停滞超 3s → 重建播放器。 */
-function startFlvStallMonitor(url: string, video: HTMLVideoElement) {
+/** 向后台重新取流并重建 FLV 播放器。
+ *
+ *  虎牙的 anti-code 与下发的 `seqid` 绑定: 直接复用旧地址时, CDN 只回一小段
+ *  缓冲数据(~0.5s)就断连 —— 表现为每隔十来秒"重连中"。所以断流后必须重新
+ *  取流(后台会按当前时间重新签名), 而不是拿旧地址重试。其它 FLV 平台同理,
+ *  地址即取即用。失败才退回旧的自愈路径。
+ *
+ *  `advanceLine`: 网络类错误(某条 CDN 线路 403/被重置)时换下一条, 否则一直
+ *  重取同一条线路会原地打转。 */
+async function refreshFlvStream(reason: string, video: HTMLVideoElement, advanceLine = false) {
+  if (flvRefreshing) return
+  if (status.value === 'error' || status.value === 'offline') return
+  flvRefreshing = true
+  stopFlvStallMonitor()
+  try {
+    const qn = qualities.value.find((item) => item.name === activeQuality.value)?.qn
+    const info = await store.fetchStreamUrls(roomId, {
+      cookie: bilibiliCookie.value || undefined,
+      qn,
+    })
+    const list = playableStreams(info.streams)
+    if (!list.length) throw new Error('没有可用线路')
+    qualities.value = info.qualities?.length ? info.qualities : qualities.value
+    streams.value = list
+    const current = Math.min(activeIndex.value, list.length - 1)
+    activeIndex.value = advanceLine && list.length > 1 ? (current + 1) % list.length : current
+    triedIndexes.clear()
+    reconnectCount.value = 0
+    status.value = 'loading'
+    playCurrent()
+  } catch {
+    flvRecover(reason, streams.value[activeIndex.value]?.url || '', video)
+  } finally {
+    flvRefreshing = false
+  }
+}
+
+/** FLV stalled 检测: currentTime 连续 3 个采样点(约 3s)不推进才重连。 */
+function startFlvStallMonitor(video: HTMLVideoElement) {
   stopFlvStallMonitor()
   lastMediaTime = video.currentTime
+  stalledTicks = 0
   flvStallTimer = window.setInterval(() => {
     if (video.currentTime > lastMediaTime + 0.1) {
       lastMediaTime = video.currentTime
+      stalledTicks = 0
       return // 正常推进
     }
     // currentTime 停滞
-    if (status.value !== 'playing') return // 已经在处理了
-    flvRecover('播放卡顿（currentTime 停滞）', url, video)
+    if (status.value !== 'playing') {
+      stalledTicks = 0
+      return // 已经在处理了
+    }
+    stalledTicks += 1
+    if (stalledTicks < 3) return
+    stalledTicks = 0
+    void refreshFlvStream('播放卡顿（currentTime 停滞）', video)
   }, 1000)
 }
 
@@ -1219,7 +1239,6 @@ async function load() {
   superchatSeen = new Set()
   superchats.value = []
   reconnectCount.value = 0
-  flvRound = 0
   clearReconnectTimer()
   // 先对齐平台, 再用 store 里的取流/详情方法(它们读的是 store.platform)。
   if (store.platform !== platform) store.platform = platform
@@ -1427,19 +1446,33 @@ function playFlv(url: string, video: HTMLVideoElement) {
   )
   flv = player
   player.on(flvjs.Events.ERROR, (type: string, detail: string) => {
-    // 虎牙 CDN 对同一线路随机 403: 网络类错误直接换下一条线路, 比同地址
-    // 指数退避重试快得多; 媒体类错误才走自愈重建。
+    if (flv !== player) return
+    // 网络类错误(虎牙随机 403 / 连接被重置)与"连接正常结束"都走重新取流:
+    // 新地址由后台按当前时间重新签名, 复用旧地址只会再断一次。
     if (type === flvjs.ErrorTypes.NETWORK_ERROR) {
-      flvSwitchLine(`播放中断（${type}: ${detail}）`)
+      void refreshFlvStream(`播放中断（${type}: ${detail}）`, video, true)
       return
     }
     flvRecover(`播放中断（${type}: ${detail}）`, url, video)
   })
+  // 虎牙 FLV 是短连接: 服务端发完当前缓冲就正常关闭, 这时要立刻重新取流续播。
+  // 若两次结束间隔过短(签名/线路持续不可用), 退回指数退避, 避免空转。
+  player.on(flvjs.Events.LOADING_COMPLETE, () => {
+    if (flv !== player || status.value !== 'playing') return
+    const now = Date.now()
+    const tooFast = now - lastFlvCompleteAt < 1500
+    lastFlvCompleteAt = now
+    if (tooFast) {
+      flvRecover('播放流结束（重连过快）', url, video)
+      return
+    }
+    void refreshFlvStream('播放流结束', video)
+  })
   player.attachMediaElement(video)
   player.load()
   player.play()
-  // FLV stalled 检测: currentTime 停滞超 3s 重建播放器
-  startFlvStallMonitor(url, video)
+  // FLV stalled 检测: currentTime 停滞超 3s 重连
+  startFlvStallMonitor(video)
 }
 
 function switchStream(index: number) {
